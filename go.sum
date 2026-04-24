@@ -1,0 +1,4 @@
+github.com/airlockrun/goai v0.1.0 h1:gCV5N9Hvh+71d6km4wFcU16/oTDBV1cCffkvxaL1lsg=
+github.com/airlockrun/goai v0.1.0/go.mod h1:m/0M/15g3qBWLhhRQLqYlFW3qGpfdFwipE1WALx8UeM=
+golang.org/x/net v0.49.0 h1:eeHFmOGUTtaaPSGNmjBKpbng9MulQsJURQUAfUwY++o=
+golang.org/x/net v0.49.0/go.mod h1:/ysNB2EvaqvesRkuLAyjI1ycPZlQHM3q01F02UY/MV8=
