@@ -4,6 +4,9 @@ Minimal LLM agent loop in Go — embeddable as a library, usable as a CLI utilit
 
 The core agent loop is derived from [opencode](https://github.com/anomalyco/opencode) (see [NOTICE](NOTICE) for attribution), but sol's scope is different: opencode is an interactive coding TUI, sol is a building block — something you call from your own Go code or stitch into shell pipelines.
 
+> [!WARNING]
+> **Alpha software.** Both the library API and the CLI flags may change between 0.x releases. Production use is supported but expect breaking changes until 1.0.
+
 ## Install
 
 As a library:
