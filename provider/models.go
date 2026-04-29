@@ -52,8 +52,14 @@ type ModelInfo struct {
 	Modalities   *ModelModalities `json:"modalities,omitempty"`
 	Cost         *ModelCost       `json:"cost,omitempty"`
 	Limit        *ModelLimit      `json:"limit,omitempty"`
-	Status       string           `json:"status,omitempty"` // alpha, beta, deprecated
-	Experimental bool             `json:"experimental,omitempty"`
+	Status string `json:"status,omitempty"` // alpha, beta, deprecated
+	// models.dev's `experimental` field was historically a bool but now
+	// ships as an object (or absent) depending on the model. We don't
+	// currently consume it; capturing it as RawMessage keeps the struct
+	// schema-flexible — future consumers can json.Unmarshal it into
+	// whatever typed shape they need without breaking the catalog parse
+	// when upstream changes the wire shape again.
+	Experimental json.RawMessage `json:"experimental,omitempty"`
 }
 
 // ModelModalities describes what input/output types a model supports.
