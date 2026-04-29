@@ -48,15 +48,17 @@ func TestAllProvidersMergesOverlay(t *testing.T) {
 		t.Error("AllProviders() returned shared cache pointer for openai — overlay merge must clone")
 	}
 
-	// Capability union: openai should have STT + TTS (from overlay models)
-	// and Search (from overlay ExtraCapabilities → Responses API web_search).
+	// Capability union: openai should have Transcription + Speech (from
+	// goai-supplied gpt-4o-transcribe / tts-1 entries that AllProviders
+	// synthesizes) and Search (from overlay ExtraCapabilities → Responses
+	// API web_search).
 	ov := Overlay["openai"]
 	caps := ProviderCapabilities(openai, ov.ExtraCapabilities)
-	if !caps.STT {
-		t.Error("post-merge openai should have STT capability (from gpt-4o-transcribe)")
+	if !caps.Transcription {
+		t.Error("post-merge openai should have Transcription capability (from gpt-4o-transcribe / whisper-1)")
 	}
-	if !caps.TTS {
-		t.Error("post-merge openai should have TTS capability (from tts-1)")
+	if !caps.Speech {
+		t.Error("post-merge openai should have Speech capability (from tts-1)")
 	}
 	if !caps.Search {
 		t.Error("post-merge openai should have Search capability (overlay Responses API web_search)")

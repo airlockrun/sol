@@ -29,10 +29,16 @@ type ModelsDevProvider struct {
 	Models map[string]ModelInfo `json:"models"`
 }
 
-// ModelInfo represents a model from models.dev
+// ModelInfo represents a model from models.dev, optionally enriched with
+// goai-supplied Kind classification by AllProviders().
 type ModelInfo struct {
-	ID           string           `json:"id"`
-	Name         string           `json:"name"`
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	// Kind classifies the model's primary purpose. Set by AllProviders()
+	// from goai's typed lists (EmbeddingModels / ImageModels /
+	// SpeechModels / TranscriptionModels / RerankingModels). Empty when
+	// goai has no entry — clients treat empty as KindLanguage.
+	Kind         ModelKind        `json:"kind,omitempty"`
 	Family       string           `json:"family,omitempty"`
 	ReleaseDate  string           `json:"release_date,omitempty"`
 	Attachment   bool             `json:"attachment,omitempty"`

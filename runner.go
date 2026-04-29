@@ -61,6 +61,12 @@ type Runner struct {
 	compactionState *CompactionState           // set if compaction happened
 	retryStatus     session.RetryStatus
 	doomDetector    *session.DoomLoopDetector
+
+	// exitState is the optional "must call exit" hook. When non-nil the
+	// step loops break with RunExited as soon as ExitState.Called() turns
+	// true. NewRunner also injects the exit tool into r.toolSet when the
+	// caller hasn't pre-registered one.
+	exitState *tools.ExitState
 }
 
 // RunnerOptions configures a new runner.
@@ -107,6 +113,17 @@ type RunnerOptions struct {
 	// Model overrides the model instance. If nil, created from Agent.Model + APIKey.
 	// Used for testing with mock models.
 	Model stream.Model
+
+	// ExitState, when set, opts the runner into "agent must call exit"
+	// semantics. After every step the runner checks ExitState.Called() and,
+	// if true, breaks the loop with RunResult.Status = RunExited. The exit
+	// tool itself is auto-injected into the agent's tool set if not
+	// already present, so callers only need to set this field.
+	//
+	// Intended for autonomous/non-interactive runs (CI, builds, sol-CLI).
+	// Use RunUntilExit if you also want the runner to nudge the model when
+	// it stops without calling exit.
+	ExitState *tools.ExitState
 }
 
 // NewRunner creates a new agent runner.
@@ -133,6 +150,21 @@ func NewRunner(opts RunnerOptions) *Runner {
 		b = bus.New()
 	}
 
+	// Auto-inject the exit tool when the caller opted into ExitState but
+	// didn't pre-register one. Copy the agent's tool map so we never
+	// mutate the caller's struct (Agent is shared across runs in CLI use).
+	toolSet := opts.Agent.Tools
+	if opts.ExitState != nil {
+		if _, hasExit := toolSet["exit"]; !hasExit {
+			cloned := make(tool.Set, len(toolSet)+1)
+			for k, v := range toolSet {
+				cloned[k] = v
+			}
+			cloned["exit"] = tools.ExitTool(opts.ExitState)
+			toolSet = cloned
+		}
+	}
+
 	r := &Runner{
 		agent:           opts.Agent,
 		providerID:      providerID,
@@ -142,7 +174,7 @@ func NewRunner(opts RunnerOptions) *Runner {
 		workDir:         opts.WorkDir,
 		quiet:           opts.Quiet,
 		model:           model,
-		toolSet:         opts.Agent.Tools,
+		toolSet:         toolSet,
 		executor:        opts.Executor,
 		initialMessages: opts.InitialMessages,
 		store:            opts.SessionStore,
@@ -151,6 +183,7 @@ func NewRunner(opts RunnerOptions) *Runner {
 		bus:             b,
 		permissionMgr:   bus.NewPermissionManager(b),
 		questionMgr:     bus.NewQuestionManager(b),
+		exitState:       opts.ExitState,
 	}
 
 	return r
@@ -373,6 +406,19 @@ func (r *Runner) Run(ctx context.Context, prompt string) (*RunResult, error) {
 				r.log("[%s] Context compacted, continuing...\n", r.agent.Name)
 				continue
 			}
+		}
+
+		// Check if the agent invoked the exit tool. Done before the
+		// FinishReason check because the LLM commonly replies with a final
+		// "I'm done" text after the exit tool call — that text would set
+		// FinishReason to Stop and exit the loop the regular way, but we
+		// want RunExited specifically so callers can distinguish.
+		if r.exitState != nil && r.exitState.Called() {
+			result.Status = RunExited
+			result.Messages = r.copyMessages()
+			result.NewMessages = r.copyNewMessages()
+			result.CompactionState = r.compactionState
+			return result, nil
 		}
 
 		// Check if we should stop
@@ -621,6 +667,14 @@ func (r *Runner) Continue(ctx context.Context, prompt string) (*RunResult, error
 				r.log("[%s] Context compacted, continuing...\n", r.agent.Name)
 				continue
 			}
+		}
+
+		if r.exitState != nil && r.exitState.Called() {
+			result.Status = RunExited
+			result.Messages = r.copyMessages()
+			result.NewMessages = r.copyNewMessages()
+			result.CompactionState = r.compactionState
+			return result, nil
 		}
 
 		if stepResult.FinishReason != stream.FinishReasonToolCalls {
@@ -1228,6 +1282,106 @@ func generateSessionID() string {
 	return "ses_" + encoded
 }
 
+// RunUntilExitOptions configures the auto-nudge loop in RunUntilExit.
+type RunUntilExitOptions struct {
+	// MaxNudges caps how many times the runner re-drives the agent with
+	// a reminder when it stops without calling exit. Default 2 when zero.
+	MaxNudges int
+
+	// NudgeMessage is the user message appended on each nudge. A sane
+	// default is used when empty.
+	NudgeMessage string
+}
+
+const defaultNudgeMessage = "You did not call the `exit` tool. Call it now with `{status: \"success\", message: \"<summary>\"}` if the task is complete, or `{status: \"error\", message: \"<reason>\"}` if you cannot complete it. Do not output any text after this — just call the tool."
+
+// ExitedRunResult bundles the underlying RunResult with the agent-reported
+// exit state and the number of nudges sent. Returned by RunUntilExit.
+type ExitedRunResult struct {
+	*RunResult
+
+	// Exit holds whatever the agent passed to the exit tool. When the run
+	// terminated for any other reason (provider error, ctx cancel, max
+	// nudges exceeded), Exit.Called() returns false and the result-level
+	// Status indicates the actual outcome.
+	Exit *tools.ExitState
+
+	// Nudges is the count of "you must call exit" re-drives sent before
+	// the run terminated. 0 means the agent called exit (or errored) on
+	// the first attempt.
+	Nudges int
+}
+
+// ExitCode maps an ExitedRunResult onto a stable process exit code,
+// suitable for sol-CLI / CI consumers that pipe sol invocations and want
+// machine-readable outcomes.
+//
+//	0 — success: agent called exit{status:"success"}
+//	1 — error:   agent called exit{status:"error"} (LLM-reported failure)
+//	2 — no-exit: agent stopped without calling exit after all nudges
+//	3 — run-failure: provider error, model panic, validation, etc.
+//	4 — cancelled: ctx cancellation propagated
+//
+// Stable wire contract — do not renumber.
+func (r *ExitedRunResult) ExitCode() int {
+	if r.Exit != nil && r.Exit.Called() {
+		status, _ := r.Exit.Result()
+		if status == "success" {
+			return 0
+		}
+		return 1
+	}
+	switch r.Status {
+	case RunCancelled:
+		return 4
+	case RunFailed:
+		return 3
+	default:
+		return 2
+	}
+}
+
+// RunUntilExit runs the agent and re-drives it with a reminder if it
+// stops without calling the exit tool. RunnerOptions.ExitState must have
+// been set when constructing the runner. Errors (provider failures, ctx
+// cancellation) surface immediately — only RunCompleted-without-exit
+// triggers a nudge.
+//
+// Intended for autonomous, non-interactive runs where the caller wants
+// a structured outcome rather than parsing the model's text.
+func (r *Runner) RunUntilExit(ctx context.Context, prompt string, opts RunUntilExitOptions) (*ExitedRunResult, error) {
+	if r.exitState == nil {
+		return nil, errors.New("RunUntilExit requires RunnerOptions.ExitState to be set")
+	}
+	if opts.MaxNudges == 0 {
+		opts.MaxNudges = 2
+	}
+	nudgeMsg := opts.NudgeMessage
+	if nudgeMsg == "" {
+		nudgeMsg = defaultNudgeMessage
+	}
+
+	result, err := r.Run(ctx, prompt)
+	out := &ExitedRunResult{RunResult: result, Exit: r.exitState}
+	if err != nil {
+		return out, err
+	}
+
+	// Re-drive only when the underlying run terminated normally without
+	// the agent calling exit. Failures, cancellations, and suspensions
+	// pass through unchanged.
+	for nudge := 0; nudge < opts.MaxNudges && result != nil && result.Status == RunCompleted && !r.exitState.Called(); nudge++ {
+		out.Nudges = nudge + 1
+		result, err = r.Continue(ctx, nudgeMsg)
+		out.RunResult = result
+		if err != nil {
+			return out, err
+		}
+	}
+
+	return out, nil
+}
+
 // RunStatus represents the outcome of a run.
 type RunStatus string
 
@@ -1236,6 +1390,11 @@ const (
 	RunSuspended RunStatus = "suspended"
 	RunFailed    RunStatus = "failed"
 	RunCancelled RunStatus = "cancelled"
+	// RunExited is set when the agent invoked the exit tool. The caller
+	// reads RunnerOptions.ExitState to learn the agent-reported status
+	// (success/error) and the accompanying message. Only emitted when the
+	// runner was constructed with a non-nil ExitState.
+	RunExited RunStatus = "exited"
 )
 
 // SuspensionContext captures state when a run is suspended.

@@ -43,56 +43,13 @@ type ProviderOverlay struct {
 // used in models.dev (and by the providers table in Airlock).
 var Overlay = map[string]ProviderOverlay{
 	"openai": {
-		ExtraModels: []ModelInfo{
-			{
-				ID:   "whisper-1",
-				Name: "Whisper",
-				Modalities: &ModelModalities{
-					Input:  []string{"audio"},
-					Output: []string{"text"},
-				},
-			},
-			{
-				ID:   "gpt-4o-mini-transcribe",
-				Name: "GPT-4o mini Transcribe",
-				Modalities: &ModelModalities{
-					Input:  []string{"audio"},
-					Output: []string{"text"},
-				},
-			},
-			{
-				ID:   "gpt-4o-transcribe",
-				Name: "GPT-4o Transcribe",
-				Modalities: &ModelModalities{
-					Input:  []string{"audio"},
-					Output: []string{"text"},
-				},
-			},
-			{
-				ID:   "gpt-4o-transcribe-diarize",
-				Name: "GPT-4o Transcribe (Diarize)",
-				Modalities: &ModelModalities{
-					Input:  []string{"audio"},
-					Output: []string{"text"},
-				},
-			},
-			{
-				ID:   "tts-1",
-				Name: "TTS-1",
-				Modalities: &ModelModalities{
-					Input:  []string{"text"},
-					Output: []string{"audio"},
-				},
-			},
-			{
-				ID:   "tts-1-hd",
-				Name: "TTS-1 HD",
-				Modalities: &ModelModalities{
-					Input:  []string{"text"},
-					Output: []string{"audio"},
-				},
-			},
-		},
+		// STT/TTS lineup (whisper-1, gpt-4o-transcribe*, tts-1*) used to
+		// live in ExtraModels here as a workaround for models.dev not
+		// listing them. Goai now exposes them via TranscriptionModels()
+		// and SpeechModels(), and AllProviders()'s goai merge synthesizes
+		// proper ModelInfo entries with Kind set, so the override is
+		// redundant. Keep the slot empty rather than removing the entry —
+		// search backends still apply.
 		ExtraCapabilities: []string{"search"},
 		SearchBackend:     "openai", // web_search tool on the Responses API
 	},
