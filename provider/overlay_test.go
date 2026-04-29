@@ -2,41 +2,17 @@ package provider
 
 import "testing"
 
-// TestOverlayOpenAIExtras locks in the expected OpenAI STT/TTS entries so a
-// refactor can't silently delete them.
-func TestOverlayOpenAIExtras(t *testing.T) {
+// TestOverlayOpenAISearch locks in the openai search-backend declaration.
+// The STT/TTS ExtraModels block this test used to enforce moved to
+// goai_kinds.go's typed-list merge — see TestAllProvidersGoaiKindMerge.
+func TestOverlayOpenAISearch(t *testing.T) {
 	ov, ok := Overlay["openai"]
 	if !ok {
 		t.Fatal("Overlay[\"openai\"] missing")
 	}
-
-	wantModels := map[string]CapabilitySet{
-		"whisper-1":                 {STT: true},
-		"gpt-4o-mini-transcribe":    {STT: true},
-		"gpt-4o-transcribe":         {STT: true},
-		"gpt-4o-transcribe-diarize": {STT: true},
-		"tts-1":                     {TTS: true},
-		"tts-1-hd":                  {TTS: true},
+	if len(ov.ExtraModels) != 0 {
+		t.Errorf("openai overlay ExtraModels should be empty (goai supplies STT/TTS), got %d entries", len(ov.ExtraModels))
 	}
-
-	got := map[string]bool{}
-	for _, m := range ov.ExtraModels {
-		got[m.ID] = true
-		want, ok := wantModels[m.ID]
-		if !ok {
-			t.Errorf("unexpected extra model %q in openai overlay", m.ID)
-			continue
-		}
-		if c := CapabilitiesFromModel(m); c != want {
-			t.Errorf("openai/%s capabilities = %+v, want %+v", m.ID, c, want)
-		}
-	}
-	for id := range wantModels {
-		if !got[id] {
-			t.Errorf("openai overlay missing expected model %q", id)
-		}
-	}
-
 	if !containsStr(ov.ExtraCapabilities, CapSearch) {
 		t.Error("openai overlay should declare search (Responses API web_search tool)")
 	}

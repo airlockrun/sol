@@ -1,42 +1,73 @@
 package provider
 
+// ModelKind classifies a model by its primary purpose. Sourced from goai's
+// per-provider typed lists (Models / EmbeddingModels / ImageModels /
+// SpeechModels / TranscriptionModels / RerankingModels). Empty means sol
+// has no goai typed-list coverage for the provider — currently true for
+// the openai-compat bucket (groq, xai, cerebras, fireworks, deepseek,
+// perplexity, togetherai, etc.), all of which ship language models, so
+// callers can safely treat empty as KindLanguage when filtering.
+type ModelKind string
+
+const (
+	KindLanguage      ModelKind = "language"
+	KindEmbedding     ModelKind = "embedding"
+	KindImage         ModelKind = "image"
+	KindSpeech        ModelKind = "speech"        // text-to-speech
+	KindTranscription ModelKind = "transcription" // speech-to-text
+	KindReranking     ModelKind = "reranking"
+)
+
 // Capability constants. These are the strings exposed over the API and used
 // as keys in the UI capability matrix. Keep them lowercase snake_case.
+//
+// Two axes:
+//   - Kind-derived (CapEmbedding/CapSpeech/CapTranscription/CapReranking,
+//     plus CapText/CapImageGen which double as kinds). True when the
+//     provider has at least one model of that kind.
+//   - Modality-derived (CapVision). True when the provider has at least
+//     one language model that accepts the corresponding extra input
+//     modality.
 const (
-	CapText     = "text"
-	CapVision   = "vision"
-	CapSTT      = "stt"
-	CapTTS      = "tts"
-	CapImageGen = "image_gen"
-	CapSearch   = "search"
+	CapText          = "text"
+	CapVision        = "vision"
+	CapImageGen      = "image_gen"
+	CapSearch        = "search"
+	CapEmbedding     = "embedding"
+	CapSpeech        = "speech"
+	CapTranscription = "transcription"
+	CapReranking     = "reranking"
 )
 
 // CapabilitySet is the set of high-level capabilities a model or provider
-// offers. Derived from models.dev modalities plus the overlay.
+// offers. Derived from models.dev modalities, goai-supplied kind, and the
+// overlay's extras.
 type CapabilitySet struct {
-	Text     bool
-	Vision   bool
-	STT      bool
-	TTS      bool
-	ImageGen bool
-	Search   bool
+	Text          bool
+	Vision        bool
+	ImageGen      bool
+	Search        bool
+	Embedding     bool
+	Speech        bool
+	Transcription bool
+	Reranking     bool
 }
 
 // List returns the set as a sorted slice of capability strings in the
 // canonical UI order.
 func (c CapabilitySet) List() []string {
-	out := make([]string, 0, 6)
+	out := make([]string, 0, 8)
 	if c.Text {
 		out = append(out, CapText)
 	}
 	if c.Vision {
 		out = append(out, CapVision)
 	}
-	if c.STT {
-		out = append(out, CapSTT)
+	if c.Transcription {
+		out = append(out, CapTranscription)
 	}
-	if c.TTS {
-		out = append(out, CapTTS)
+	if c.Speech {
+		out = append(out, CapSpeech)
 	}
 	if c.ImageGen {
 		out = append(out, CapImageGen)
@@ -44,14 +75,42 @@ func (c CapabilitySet) List() []string {
 	if c.Search {
 		out = append(out, CapSearch)
 	}
+	if c.Embedding {
+		out = append(out, CapEmbedding)
+	}
+	if c.Reranking {
+		out = append(out, CapReranking)
+	}
 	return out
 }
 
 // CapabilitiesFromModel derives the capability set for a single model from
-// its modality list. Search is never set at the model level — it's a
-// provider capability (see ProviderCapabilities).
+// its kind (goai-sourced) plus its modality list (models.dev-sourced).
+// Search is never set at the model level — it's a provider capability (see
+// ProviderCapabilities).
+//
+// Kind-derived caps fire whenever Kind is set; modality-derived caps fire
+// independently — a Kind=Language model with image input still gets Vision.
+// Modality-only classification is the fallback for catalog entries from
+// providers without goai typed-list coverage.
 func CapabilitiesFromModel(m ModelInfo) CapabilitySet {
 	var cs CapabilitySet
+
+	switch m.Kind {
+	case KindLanguage:
+		cs.Text = true
+	case KindEmbedding:
+		cs.Embedding = true
+	case KindImage:
+		cs.ImageGen = true
+	case KindSpeech:
+		cs.Speech = true
+	case KindTranscription:
+		cs.Transcription = true
+	case KindReranking:
+		cs.Reranking = true
+	}
+
 	if m.Modalities == nil {
 		return cs
 	}
@@ -69,10 +128,10 @@ func CapabilitiesFromModel(m ModelInfo) CapabilitySet {
 		cs.Vision = true
 	}
 	if inAudio && outText {
-		cs.STT = true
+		cs.Transcription = true
 	}
 	if inText && outAudio {
-		cs.TTS = true
+		cs.Speech = true
 	}
 	if inText && outImage {
 		cs.ImageGen = true
@@ -95,9 +154,11 @@ func ProviderCapabilities(p *ModelsDevProvider, extras []string) CapabilitySet {
 			mc := CapabilitiesFromModel(m)
 			cs.Text = cs.Text || mc.Text
 			cs.Vision = cs.Vision || mc.Vision
-			cs.STT = cs.STT || mc.STT
-			cs.TTS = cs.TTS || mc.TTS
 			cs.ImageGen = cs.ImageGen || mc.ImageGen
+			cs.Embedding = cs.Embedding || mc.Embedding
+			cs.Speech = cs.Speech || mc.Speech
+			cs.Transcription = cs.Transcription || mc.Transcription
+			cs.Reranking = cs.Reranking || mc.Reranking
 		}
 	}
 	for _, cap := range extras {
@@ -106,14 +167,18 @@ func ProviderCapabilities(p *ModelsDevProvider, extras []string) CapabilitySet {
 			cs.Text = true
 		case CapVision:
 			cs.Vision = true
-		case CapSTT:
-			cs.STT = true
-		case CapTTS:
-			cs.TTS = true
 		case CapImageGen:
 			cs.ImageGen = true
 		case CapSearch:
 			cs.Search = true
+		case CapEmbedding:
+			cs.Embedding = true
+		case CapSpeech:
+			cs.Speech = true
+		case CapTranscription:
+			cs.Transcription = true
+		case CapReranking:
+			cs.Reranking = true
 		}
 	}
 	return cs

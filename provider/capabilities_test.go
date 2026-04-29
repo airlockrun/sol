@@ -38,7 +38,7 @@ func TestCapabilitiesFromModel(t *testing.T) {
 				Input:  []string{"text", "image", "audio"},
 				Output: []string{"text", "audio"},
 			}},
-			want: CapabilitySet{Text: true, Vision: true, STT: true, TTS: true},
+			want: CapabilitySet{Text: true, Vision: true, Speech: true, Transcription: true},
 		},
 		{
 			name: "pure STT — audio in, text out",
@@ -46,7 +46,7 @@ func TestCapabilitiesFromModel(t *testing.T) {
 				Input:  []string{"audio"},
 				Output: []string{"text"},
 			}},
-			want: CapabilitySet{STT: true},
+			want: CapabilitySet{Transcription: true},
 		},
 		{
 			name: "pure TTS — text in, audio out",
@@ -54,7 +54,7 @@ func TestCapabilitiesFromModel(t *testing.T) {
 				Input:  []string{"text"},
 				Output: []string{"audio"},
 			}},
-			want: CapabilitySet{TTS: true},
+			want: CapabilitySet{Speech: true},
 		},
 		{
 			name: "image gen — text in, image out",
@@ -71,6 +71,65 @@ func TestCapabilitiesFromModel(t *testing.T) {
 				Output: []string{"text"},
 			}},
 			want: CapabilitySet{Text: true},
+		},
+
+		// Kind-derived cases: a goai-supplied Kind sets the canonical flag
+		// regardless of modalities. Empty modalities (typical for
+		// embedding/reranking models on models.dev) used to leave the set
+		// blank; now Kind alone classifies.
+		{
+			name: "kind=embedding (empty modalities)",
+			in:   ModelInfo{ID: "text-embedding-3-small", Kind: KindEmbedding},
+			want: CapabilitySet{Embedding: true},
+		},
+		{
+			name: "kind=reranking (empty modalities)",
+			in:   ModelInfo{ID: "rerank-3", Kind: KindReranking},
+			want: CapabilitySet{Reranking: true},
+		},
+		{
+			name: "kind=transcription with audio→text modalities",
+			in: ModelInfo{
+				ID:   "whisper-1",
+				Kind: KindTranscription,
+				Modalities: &ModelModalities{
+					Input: []string{"audio"}, Output: []string{"text"},
+				},
+			},
+			want: CapabilitySet{Transcription: true},
+		},
+		{
+			name: "kind=speech with text→audio modalities",
+			in: ModelInfo{
+				ID:   "tts-1",
+				Kind: KindSpeech,
+				Modalities: &ModelModalities{
+					Input: []string{"text"}, Output: []string{"audio"},
+				},
+			},
+			want: CapabilitySet{Speech: true},
+		},
+		{
+			name: "kind=image with text→image modalities",
+			in: ModelInfo{
+				ID:   "dall-e-3",
+				Kind: KindImage,
+				Modalities: &ModelModalities{
+					Input: []string{"text"}, Output: []string{"image"},
+				},
+			},
+			want: CapabilitySet{ImageGen: true},
+		},
+		{
+			name: "kind=language preserves vision modality flag",
+			in: ModelInfo{
+				ID:   "gpt-4o",
+				Kind: KindLanguage,
+				Modalities: &ModelModalities{
+					Input: []string{"text", "image"}, Output: []string{"text"},
+				},
+			},
+			want: CapabilitySet{Text: true, Vision: true},
 		},
 	}
 
@@ -168,8 +227,11 @@ func TestCapabilitySetList(t *testing.T) {
 		{"text only", CapabilitySet{Text: true}, []string{CapText}},
 		{
 			"everything",
-			CapabilitySet{Text: true, Vision: true, STT: true, TTS: true, ImageGen: true, Search: true},
-			[]string{CapText, CapVision, CapSTT, CapTTS, CapImageGen, CapSearch},
+			CapabilitySet{
+				Text: true, Vision: true, ImageGen: true, Search: true,
+				Embedding: true, Speech: true, Transcription: true, Reranking: true,
+			},
+			[]string{CapText, CapVision, CapTranscription, CapSpeech, CapImageGen, CapSearch, CapEmbedding, CapReranking},
 		},
 	}
 	for _, tt := range tests {
