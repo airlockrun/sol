@@ -1,9 +1,11 @@
 package provider
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -15,8 +17,10 @@ const (
 	// ModelsDevURL is the URL for the models.dev API
 	ModelsDevURL = "https://models.dev/api.json"
 
-	// RefreshInterval is how often to refresh the models cache
-	RefreshInterval = 60 * time.Minute
+	// RefreshInterval is the cadence of the background catalog refresh
+	// when StartPeriodicRefresh is in use. Also the freshness window
+	// that the lazy LoadProviders() path uses to skip re-fetching.
+	RefreshInterval = 12 * time.Hour
 )
 
 // ModelsDevProvider represents a provider from models.dev
@@ -92,6 +96,9 @@ type modelsState struct {
 	providers map[string]*ModelsDevProvider
 	loaded    bool
 	lastFetch time.Time
+	// refresherStarted guards StartPeriodicRefresh against multiple
+	// callers spawning duplicate ticker goroutines.
+	refresherStarted bool
 }
 
 var state = &modelsState{}
@@ -219,6 +226,9 @@ func LoadProviders() (map[string]*ModelsDevProvider, error) {
 	// Fetch from models.dev
 	providers, err := fetchFromModelsDev()
 	if err != nil {
+		// Loud log so operators see degraded catalogs instead of
+		// silently running on the empty builtin fallback.
+		log.Printf("sol/provider: models.dev fetch failed (lazy load): %v", err)
 		// If fetch fails and we have no cache, use built-in fallback
 		if !state.loaded {
 			state.providers = getBuiltinProviders()
@@ -235,6 +245,73 @@ func LoadProviders() (map[string]*ModelsDevProvider, error) {
 	go saveToCache(providers)
 
 	return state.providers, nil
+}
+
+// StartPeriodicRefresh launches a background ticker that refreshes the
+// models.dev catalog every RefreshInterval. Idempotent — calling more
+// than once spawns at most one ticker (subsequent calls are no-ops).
+//
+// Pre-flight steps before the ticker runs:
+//
+//  1. LoadProviders() is invoked synchronously so state.providers is
+//     populated from disk cache (or builtin fallback) before the
+//     function returns. Callers can then serve catalog requests
+//     immediately, even while the network fetch below is in flight.
+//
+//  2. A non-blocking refresh kicks off in a goroutine — picks up any
+//     models.dev changes since the on-disk cache was baked. Failures
+//     here are logged but non-fatal: the cache from step 1 stays
+//     authoritative.
+//
+// The ticker honors ctx.Done() and exits cleanly on shutdown.
+func StartPeriodicRefresh(ctx context.Context) {
+	state.mu.Lock()
+	if state.refresherStarted {
+		state.mu.Unlock()
+		return
+	}
+	state.refresherStarted = true
+	state.mu.Unlock()
+
+	// Ensure cached state is populated synchronously so concurrent
+	// catalog requests during the goroutine's first fetch don't see
+	// nil providers.
+	_, _ = LoadProviders()
+
+	go func() {
+		// Immediate refresh on startup.
+		refreshOnce("startup")
+
+		t := time.NewTicker(RefreshInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				refreshOnce("periodic")
+			}
+		}
+	}()
+}
+
+// refreshOnce performs a single fetch + cache swap. Failures are logged
+// with the supplied tag so operators can tell startup from periodic
+// failures in the logs.
+func refreshOnce(tag string) {
+	providers, err := fetchFromModelsDev()
+	if err != nil {
+		log.Printf("sol/provider: models.dev %s refresh failed: %v", tag, err)
+		return
+	}
+	state.mu.Lock()
+	state.providers = providers
+	state.loaded = true
+	state.lastFetch = time.Now()
+	state.mu.Unlock()
+	if err := saveToCache(providers); err != nil {
+		log.Printf("sol/provider: failed to save models cache: %v", err)
+	}
 }
 
 // GetProviderInfo returns provider info from the models.dev data
