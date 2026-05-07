@@ -735,9 +735,15 @@ func (r *Runner) runStep(ctx context.Context) (*StepResult, error) {
 	// Get max output tokens
 	maxTokens := provider.MaxOutputTokens(r.modelID)
 
+	// Apply the agent's Redactor (sensitive-substring stripper)
+	// before the messages leave the agent. agentsdk wires this from
+	// its sensitiveSet. Best-effort; covers system prompt, env prompt,
+	// and history because all three are baked into r.messages.
+	llmMessages := redactMessages(r.messages, r.agent.Redactor)
+
 	input := stream.Input{
 		Model:           r.model,
-		Messages:        r.messages,
+		Messages:        llmMessages,
 		Tools:           r.toolSet,
 		ActiveTools:     activeTools,
 		MaxOutputTokens: &maxTokens,

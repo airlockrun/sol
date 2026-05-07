@@ -37,6 +37,16 @@ type Agent struct {
 	// included when building the LLM context. Zero value includes everything
 	// (matching opencode behavior).
 	HistoryPolicy HistoryPolicy
+
+	// Redactor strips sensitive substrings from any string before it
+	// leaves the agent toward the LLM. Applied to message content,
+	// system prompt, and environment prompt at the input boundary in
+	// runner.go. nil → no redaction. Closure over the live sensitive
+	// set in agentsdk; mutex-guarded by the caller. Best-effort:
+	// substring matching only — defense in depth, not a security
+	// guarantee. See agentsdk.IsLikelySecret for the value-eligibility
+	// heuristic.
+	Redactor func(string) string
 }
 
 // HistoryPolicy controls which message parts from conversation history are

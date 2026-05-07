@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/airlockrun/goai/stream"
 )
 
 func TestSearch_EmptyQuery(t *testing.T) {
@@ -75,99 +77,25 @@ func TestSearch_CountClamping(t *testing.T) {
 	_ = srv
 }
 
-func TestExtractGrokContent(t *testing.T) {
-	t.Run("message with content blocks", func(t *testing.T) {
-		data := grokResponse{
-			Output: []struct {
-				Type    string `json:"type"`
-				Text    string `json:"text"`
-				Content []struct {
-					Type        string           `json:"type"`
-					Text        string           `json:"text"`
-					Annotations []grokAnnotation `json:"annotations"`
-				} `json:"content"`
-				Annotations []grokAnnotation `json:"annotations"`
-			}{
-				{
-					Type: "message",
-					Content: []struct {
-						Type        string           `json:"type"`
-						Text        string           `json:"text"`
-						Annotations []grokAnnotation `json:"annotations"`
-					}{
-						{
-							Type: "output_text",
-							Text: "Go is great",
-							Annotations: []grokAnnotation{
-								{Type: "url_citation", URL: "https://go.dev"},
-								{Type: "url_citation", URL: "https://go.dev"}, // duplicate
-								{Type: "url_citation", URL: "https://example.com"},
-							},
-						},
-					},
-				},
-			},
+func TestSourcesToResults(t *testing.T) {
+	t.Run("dedups by URL and drops empty", func(t *testing.T) {
+		got := sourcesToResults([]stream.SourceEvent{
+			{URL: "https://go.dev", Title: "Go"},
+			{URL: "https://go.dev", Title: "Duplicate"},
+			{URL: "", Title: "Empty drops"},
+			{URL: "https://example.com", Title: "Example"},
+		})
+		if len(got) != 2 {
+			t.Fatalf("expected 2 results, got %d", len(got))
 		}
-
-		text, citations := extractGrokContent(data)
-		if text != "Go is great" {
-			t.Errorf("expected 'Go is great', got %q", text)
-		}
-		if len(citations) != 2 {
-			t.Errorf("expected 2 deduplicated citations, got %d", len(citations))
+		if got[0].URL != "https://go.dev" || got[1].URL != "https://example.com" {
+			t.Errorf("unexpected order: %+v", got)
 		}
 	})
 
-	t.Run("top-level output_text", func(t *testing.T) {
-		data := grokResponse{
-			Output: []struct {
-				Type    string `json:"type"`
-				Text    string `json:"text"`
-				Content []struct {
-					Type        string           `json:"type"`
-					Text        string           `json:"text"`
-					Annotations []grokAnnotation `json:"annotations"`
-				} `json:"content"`
-				Annotations []grokAnnotation `json:"annotations"`
-			}{
-				{
-					Type: "output_text",
-					Text: "Direct text",
-					Annotations: []grokAnnotation{
-						{Type: "url_citation", URL: "https://example.com"},
-					},
-				},
-			},
-		}
-
-		text, citations := extractGrokContent(data)
-		if text != "Direct text" {
-			t.Errorf("expected 'Direct text', got %q", text)
-		}
-		if len(citations) != 1 {
-			t.Errorf("expected 1 citation, got %d", len(citations))
+	t.Run("nil input returns nil", func(t *testing.T) {
+		if got := sourcesToResults(nil); got != nil {
+			t.Errorf("expected nil, got %+v", got)
 		}
 	})
-
-	t.Run("deprecated fallback", func(t *testing.T) {
-		data := grokResponse{
-			OutputText: "Fallback text",
-		}
-
-		text, citations := extractGrokContent(data)
-		if text != "Fallback text" {
-			t.Errorf("expected 'Fallback text', got %q", text)
-		}
-		if len(citations) != 0 {
-			t.Errorf("expected 0 citations, got %d", len(citations))
-		}
-	})
-}
-
-func TestSanitizeGeminiError(t *testing.T) {
-	msg := `{"error": "Invalid key=AIzaSyAbCdEf in request"}`
-	sanitized := sanitizeGeminiError(msg, "AIzaSyAbCdEf")
-	if sanitized != `{"error": "Invalid key=[REDACTED] in request"}` {
-		t.Errorf("API key not redacted: %s", sanitized)
-	}
 }

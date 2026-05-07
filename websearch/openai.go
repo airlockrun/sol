@@ -1,160 +1,78 @@
 package websearch
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
+
+	"github.com/airlockrun/goai"
+	"github.com/airlockrun/goai/message"
+	"github.com/airlockrun/goai/provider"
+	"github.com/airlockrun/goai/provider/openai"
+	"github.com/airlockrun/goai/stream"
+	"github.com/airlockrun/goai/tool"
 )
 
-const (
-	openaiEndpoint    = "https://api.openai.com/v1/responses"
-	defaultOpenAIModel = "gpt-4o-mini"
-)
+// defaultOpenAIModel is the default model for OpenAI web search. We pick
+// gpt-5-nano over gpt-5/gpt-5-mini for latency: web search runs through
+// the Responses API and gpt-5 with default reasoning takes 30-60s on
+// terse queries. Nano returns comparable citation coverage in ~10s,
+// which fits comfortably under public-DM timeouts. Callers that want
+// higher-quality synthesis can override via Options.Model.
+const defaultOpenAIModel = "gpt-5-nano"
 
-type openaiRequest struct {
-	Model      string          `json:"model"`
-	Input      []openaiMessage `json:"input"`
-	Tools      []openaiToolDef `json:"tools"`
-	ToolChoice string          `json:"tool_choice,omitempty"`
-}
-
-type openaiMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-type openaiToolDef struct {
-	Type string `json:"type"` // "web_search"
-}
-
-type openaiResponse struct {
-	Output []struct {
-		Type    string `json:"type"`
-		Text    string `json:"text"`
-		Content []struct {
-			Type        string             `json:"type"`
-			Text        string             `json:"text"`
-			Annotations []openaiAnnotation `json:"annotations"`
-		} `json:"content"`
-		Annotations []openaiAnnotation `json:"annotations"`
-	} `json:"output"`
-	OutputText string `json:"output_text"` // deprecated fallback
-}
-
-type openaiAnnotation struct {
-	Type  string `json:"type"`
-	URL   string `json:"url"`
-	Title string `json:"title"`
-}
-
-// searchOpenAI calls OpenAI's Responses API with the web_search tool enabled
-// and returns the synthesized answer plus citation URLs. Mirrors the grok
-// client — the Responses API shape is similar enough that only the endpoint,
-// default model, and tool name differ.
+// searchOpenAI runs a web-search-grounded generation through goai's
+// OpenAI Responses provider with the openai.web_search hosted tool.
+// Citations are extracted from goai's SourceEvent stream — the same
+// mechanism that surfaces url_citation annotations in ai-sdk's
+// generateText.sources.
 func (c *DirectClient) searchOpenAI(ctx context.Context, req Request) (*Response, error) {
 	model := c.model
 	if model == "" {
 		model = defaultOpenAIModel
 	}
 
-	body := openaiRequest{
-		Model: model,
-		Input: []openaiMessage{
-			{
-				Role:    "system",
-				Content: "You are a web search assistant. Use the web_search tool to answer the user's query with up-to-date information and cite sources.",
-			},
-			{Role: "user", Content: req.Query},
+	p := openai.New(provider.Options{APIKey: c.apiKey})
+
+	tools := tool.Set{}
+	ws := openai.WebSearch()
+	ws.Name = "openai_web_search"
+	tools.Add(ws)
+
+	result, err := goai.GenerateText(ctx, stream.Input{
+		Model:     p.Responses(model),
+		Tools:     tools,
+		Reasoning: stream.ReasoningEffortLow,
+		Messages: []message.Message{
+			message.NewSystemMessage("You are a web search assistant. Use the web_search tool to answer the user's query with up-to-date information and cite sources."),
+			message.NewUserMessage(req.Query),
 		},
-		Tools: []openaiToolDef{{Type: "web_search"}},
-		// Force the model to call the tool — for vague queries like "X Y"
-		// gpt-4o-mini will otherwise ask for clarification instead of
-		// searching.
-		ToolChoice: "required",
-	}
-
-	payload, err := json.Marshal(body)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("websearch/openai: %w", err)
 	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", openaiEndpoint, bytes.NewReader(payload))
-	if err != nil {
-		return nil, fmt.Errorf("websearch/openai: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
-
-	resp, err := c.http.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("websearch/openai: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return nil, fmt.Errorf("websearch/openai: HTTP %d: %s", resp.StatusCode, respBody)
-	}
-
-	var data openaiResponse
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return nil, fmt.Errorf("websearch/openai: %w", err)
-	}
-
-	synthesis, results := extractOpenAIContent(data)
 
 	return &Response{
-		Results:   results,
-		Synthesis: synthesis,
+		Results:   sourcesToResults(result.Sources),
+		Synthesis: result.Text,
 		Provider:  "openai",
 	}, nil
 }
 
-// extractOpenAIContent walks the Responses API output and returns the
-// assistant text plus deduped url_citation annotations.
-func extractOpenAIContent(data openaiResponse) (text string, results []Result) {
-	seen := map[string]bool{}
-
-	appendCitation := func(a openaiAnnotation) {
-		if a.Type != "url_citation" || a.URL == "" || seen[a.URL] {
-			return
-		}
-		seen[a.URL] = true
-		results = append(results, Result{Title: a.Title, URL: a.URL})
+// sourcesToResults adapts goai's stream.SourceEvent (parity with
+// ai-sdk's LanguageModelV4Source) to websearch's Result type. Document
+// sources without a URL are dropped — websearch.Result is URL-shaped.
+func sourcesToResults(sources []stream.SourceEvent) []Result {
+	if len(sources) == 0 {
+		return nil
 	}
-
-	for _, output := range data.Output {
-		// Message type with nested content blocks.
-		if output.Type == "message" {
-			for _, block := range output.Content {
-				if block.Type == "output_text" && block.Text != "" {
-					if text == "" {
-						text = block.Text
-					}
-					for _, a := range block.Annotations {
-						appendCitation(a)
-					}
-				}
-			}
+	seen := make(map[string]bool, len(sources))
+	out := make([]Result, 0, len(sources))
+	for _, s := range sources {
+		if s.URL == "" || seen[s.URL] {
 			continue
 		}
-		// Top-level output_text block (no message wrapper).
-		if output.Type == "output_text" && output.Text != "" {
-			if text == "" {
-				text = output.Text
-			}
-			for _, a := range output.Annotations {
-				appendCitation(a)
-			}
-		}
+		seen[s.URL] = true
+		out = append(out, Result{Title: s.Title, URL: s.URL})
 	}
-
-	// Deprecated fallback.
-	if text == "" {
-		text = data.OutputText
-	}
-	return
+	return out
 }
