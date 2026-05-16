@@ -739,7 +739,7 @@ func (r *Runner) runStep(ctx context.Context) (*StepResult, error) {
 	// before the messages leave the agent. agentsdk wires this from
 	// its sensitiveSet. Best-effort; covers system prompt, env prompt,
 	// and history because all three are baked into r.messages.
-	llmMessages := redactMessages(r.messages, r.agent.Redactor)
+	llmMessages := coalesceConsecutiveUser(redactMessages(r.messages, r.agent.Redactor))
 
 	input := stream.Input{
 		Model:           r.model,
@@ -818,14 +818,23 @@ func (r *Runner) runStep(ctx context.Context) (*StepResult, error) {
 		case stream.ErrorEvent:
 			var permErr *bus.ErrPermissionNeeded
 			var questErr *bus.ErrQuestionNeeded
-			if errors.As(e.Error, &permErr) || errors.As(e.Error, &questErr) {
-				// Partial step — stream didn't complete, so no usage is available.
+			var delErr *bus.ErrDelegatedSuspend
+			if errors.As(e.Error, &permErr) || errors.As(e.Error, &questErr) || errors.As(e.Error, &delErr) {
+				// Partial step — stream didn't complete, so no usage is
+				// available. Persisting here is load-bearing for ALL three
+				// suspension kinds: the assistant message carrying the
+				// suspended tool_call must land in r.messages / the store so
+				// the resume path's tool-result append forms a valid
+				// assistant→tool pair. A delegated suspend that skipped this
+				// left an orphaned tool message → next LLM turn 400s.
 				r.appendPartialStep(ctx, textBuilder.String(), reasoningParts, toolCalls, toolResults, stream.Usage{})
 
-				// Re-publish suspension events on the runner's bus so the
-				// bridge can forward them to the frontend in real-time.
-				// The original event was published on the toolserver's bus
-				// which the bridge doesn't subscribe to.
+				// Re-publish permission/question suspension events on the
+				// runner's bus so the bridge forwards them in real-time (the
+				// original was on the toolserver's bus). Delegated suspends
+				// carry their gate detail in the SuspensionContext instead
+				// (agentsdk busbridge.emitSuspensionEvent synthesizes the
+				// confirmation_required), so there's nothing to republish.
 				if questErr != nil {
 					r.bus.Publish(bus.QuestionAsked, bus.QuestionAskedPayload{
 						Questions: questErr.Questions,
@@ -1163,33 +1172,50 @@ func filterMessageParts(msg goai.Message, policy agent.HistoryPolicy) goai.Messa
 // handleSuspension checks if the error is a permission/question suspension
 // and populates the RunResult accordingly.
 func (r *Runner) handleSuspension(err error, stepResult *StepResult, result *RunResult) (*RunResult, bool) {
-	var permErr *bus.ErrPermissionNeeded
-	var questErr *bus.ErrQuestionNeeded
-	if errors.As(err, &permErr) {
+	// stepResult is populated when a suspension is raised mid-step via
+	// the bus (today's permission/question gates). It is nil when the
+	// suspension is a FatalToolError RETURNED from a tool's Execute
+	// (ErrDelegatedSuspend today; a future top-level question/permission
+	// tool would be the same) — runStep returns (nil, err) there.
+	// Normalize once so every branch is nil-safe by construction rather
+	// than depending on which trigger path produced the error.
+	var pending []stream.ToolCall
+	var completed []stream.ToolResultEvent
+	if stepResult != nil {
+		pending = pendingToolCalls(stepResult.ToolCalls, stepResult.ToolResults)
+		completed = stepResult.ToolResults
+	}
+
+	suspend := func(reason string, data any) (*RunResult, bool) {
 		result.Status = RunSuspended
 		result.Messages = r.copyMessages()
 		result.NewMessages = r.copyNewMessages()
 		result.CompactionState = r.compactionState
 		result.SuspensionContext = &SuspensionContext{
-			Reason:           "permission",
-			Data:             permErr,
-			PendingToolCalls: pendingToolCalls(stepResult.ToolCalls, stepResult.ToolResults),
-			CompletedResults: stepResult.ToolResults,
+			Reason:           reason,
+			Data:             data,
+			PendingToolCalls: pending,
+			CompletedResults: completed,
 		}
 		return result, true
 	}
+
+	var permErr *bus.ErrPermissionNeeded
+	if errors.As(err, &permErr) {
+		return suspend("permission", permErr)
+	}
+	var questErr *bus.ErrQuestionNeeded
 	if errors.As(err, &questErr) {
-		result.Status = RunSuspended
-		result.Messages = r.copyMessages()
-		result.NewMessages = r.copyNewMessages()
-		result.CompactionState = r.compactionState
-		result.SuspensionContext = &SuspensionContext{
-			Reason:           "question",
-			Data:             questErr,
-			PendingToolCalls: pendingToolCalls(stepResult.ToolCalls, stepResult.ToolResults),
-			CompletedResults: stepResult.ToolResults,
-		}
-		return result, true
+		return suspend("question", questErr)
+	}
+	var delErr *bus.ErrDelegatedSuspend
+	if errors.As(err, &delErr) {
+		// A delegated child (Task subagent / A2A sibling) suspended.
+		// The resume dispatcher re-drives the child via
+		// SuspensionContext.Data (keyed by Transport) — it does not
+		// rely on PendingToolCalls, so the nil-stepResult case (empty
+		// pending/completed) is correct, not lossy, here.
+		return suspend("delegated", delErr)
 	}
 	return nil, false
 }
@@ -1272,7 +1298,36 @@ func (r *Runner) SpawnSubagent(ctx context.Context, agentName string, prompt str
 	})
 	subRunner.parent = r
 
-	return subRunner.Run(ctx, prompt)
+	res, err := subRunner.Run(ctx, prompt)
+	if err != nil {
+		return res, err
+	}
+	if res != nil && res.Status == RunSuspended {
+		// The subagent hit a gate. Don't swallow it as a (partial)
+		// result — propagate as a delegated suspension so the parent
+		// step suspends and the decision can cascade back in on resume.
+		return nil, &bus.ErrDelegatedSuspend{
+			Transport: "inprocess",
+			Child: InProcessChild{
+				AgentName:         agentName,
+				Messages:          res.Messages,
+				SuspensionContext: res.SuspensionContext,
+				CompactionState:   res.CompactionState,
+			},
+		}
+	}
+	return res, nil
+}
+
+// InProcessChild is the SuspensionContext.Data payload for a Sol Task
+// subagent that suspended. It carries everything the resume dispatcher
+// needs to reconstruct and re-drive the subagent on the parent's
+// resume, so the parent checkpoint is self-contained.
+type InProcessChild struct {
+	AgentName         string             `json:"agentName"`
+	Messages          []goai.Message     `json:"messages"`
+	SuspensionContext *SuspensionContext `json:"suspensionContext,omitempty"`
+	CompactionState   *CompactionState   `json:"compactionState,omitempty"`
 }
 
 // generateSessionID creates a unique session ID for prompt caching.

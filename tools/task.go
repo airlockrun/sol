@@ -3,9 +3,11 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/airlockrun/goai/tool"
+	"github.com/airlockrun/sol/bus"
 )
 
 // TaskInput is the input schema for the task tool
@@ -118,6 +120,13 @@ assistant: "I'm going to use the Task tool to launch the with the greeting-respo
 
 			result, err := spawner.SpawnSubagent(ctx, agentType, args.Prompt)
 			if err != nil {
+				// A suspended subagent must propagate (FatalToolError)
+				// so the parent step suspends and the decision can
+				// cascade back in on resume — never stringify it.
+				var delErr *bus.ErrDelegatedSuspend
+				if errors.As(err, &delErr) {
+					return tool.Result{}, err
+				}
 				return tool.Result{
 					Output: fmt.Sprintf("Subagent error: %v", err),
 					Title:  fmt.Sprintf("task: %s (error)", args.Description),

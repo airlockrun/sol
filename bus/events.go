@@ -126,3 +126,28 @@ type ErrQuestionNeeded struct {
 
 func (e *ErrQuestionNeeded) Error() string      { return "question needs answer" }
 func (e *ErrQuestionNeeded) FatalToolError() bool { return true }
+
+// ErrDelegatedSuspend is returned by a tool whose work was delegated to
+// a child execution that itself suspended (a Sol subagent via the Task
+// tool, or a cross-container A2A sibling run). The parent step suspends
+// carrying this so the suspension propagates up the run tree to the
+// root (where a human resolves it) and the decision cascades back down.
+//
+// Child is opaque to bus/runner — only the resume dispatcher (agentsdk)
+// interprets it, keyed by Transport:
+//   - "inprocess": the suspended subagent's reconstruction state
+//     (messages + its own SuspensionContext), nested so the parent
+//     checkpoint is self-contained.
+//   - "a2a": an opaque cross-container handle, e.g. {agentId, taskId},
+//     which airlock resolves to a ResumeRunID downstream.
+//
+// FatalToolError so the executor propagates it to handleSuspension
+// exactly like a permission/question gate.
+type ErrDelegatedSuspend struct {
+	ToolCallID string `json:"toolCallID"`
+	Transport  string `json:"transport"`
+	Child      any    `json:"child"`
+}
+
+func (e *ErrDelegatedSuspend) Error() string       { return "delegated execution suspended (" + e.Transport + ")" }
+func (e *ErrDelegatedSuspend) FatalToolError() bool { return true }
