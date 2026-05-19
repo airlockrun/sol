@@ -257,16 +257,16 @@ Examples:
 							Permission: "*", Pattern: "*", Action: "allow",
 						})
 					case "n", "no":
-						messages = append(messages, goai.NewToolMessage(
-							tc.ID, tc.Name, "Error: permission denied by user", true,
+						messages = append(messages, goai.NewToolResultDenied(
+							tc.ID, tc.Name, "permission denied by user",
 						))
 					default:
 						// Treat as allow once
 					}
 				}
 
-				prompt = ""  // resume with no new prompt
-				continue     // re-enter loop with updated messages + rules
+				prompt = "" // resume with no new prompt
+				continue    // re-enter loop with updated messages + rules
 			}
 
 			// Any other status (failed, cancelled) — exit

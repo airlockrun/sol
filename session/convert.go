@@ -2,7 +2,6 @@ package session
 
 import (
 	"encoding/json"
-	"fmt"
 
 	"github.com/airlockrun/goai"
 	"github.com/airlockrun/goai/message"
@@ -66,12 +65,35 @@ func FromGoAIMessage(m goai.Message) Message {
 			msg.Parts = append(msg.Parts, Part{
 				Type: "tool",
 				Tool: &ToolPart{
-					CallID: v.ToolCallID,
-					Name:   v.ToolName,
-					Output: resultToString(v.Result),
-					Status: "completed",
+					CallID:  v.ToolCallID,
+					Name:    v.ToolName,
+					Output:  message.ToolOutputWire(v.Output),
+					Status:  "completed",
+					Outcome: message.ToolOutcome(v.Output),
 				},
 			})
+			// A content output carries file/image items inline; surface them
+			// as session image/file parts so the CLI can show attachments.
+			if co, ok := v.Output.(message.ContentOutput); ok {
+				for _, it := range co.Value {
+					switch it.Type {
+					case "image-data", "image-url":
+						img := it.Data
+						if img == "" {
+							img = it.URL
+						}
+						msg.Parts = append(msg.Parts, Part{
+							Type:  "image",
+							Image: &ImagePart{Image: img, MimeType: it.MediaType, Source: it.Filename},
+						})
+					case "file-data", "file-url":
+						msg.Parts = append(msg.Parts, Part{
+							Type: "file",
+							File: &FilePart{Data: it.Data, MimeType: it.MediaType, Filename: it.Filename, Source: it.Filename},
+						})
+					}
+				}
+			}
 		case message.ReasoningPart:
 			msg.Parts = append(msg.Parts, Part{
 				Type: "reasoning",
@@ -183,11 +205,16 @@ func MessageToGoAI(msg Message) []goai.Message {
 			if p.Tool.Compacted {
 				output = "[Old tool result content cleared]"
 			}
+			// Rebuild the discriminated outcome (error/denied/success) so it
+			// survives the round-trip — the dot and provider is_error depend
+			// on it. JSON fidelity is intentionally not preserved; the wire
+			// string is what providers send anyway.
+			toolOut := toolOutputFromSession(p.Tool.Outcome, output)
 			if len(extras) > 0 && !p.Tool.Compacted {
 				toolResult := message.ToolResultPart{
 					ToolCallID: p.Tool.CallID,
 					ToolName:   p.Tool.Name,
-					Result:     output,
+					Output:     toolOut,
 				}
 				allParts := []goai.Part{toolResult}
 				allParts = append(allParts, extras...)
@@ -199,8 +226,7 @@ func MessageToGoAI(msg Message) []goai.Message {
 				msgs = append(msgs, goai.NewToolMessage(
 					p.Tool.CallID,
 					p.Tool.Name,
-					output,
-					false,
+					toolOut,
 				))
 			}
 		}
@@ -209,16 +235,15 @@ func MessageToGoAI(msg Message) []goai.Message {
 	return nil
 }
 
-func resultToString(v any) string {
-	if v == nil {
-		return ""
+// toolOutputFromSession rebuilds a discriminated ToolResultOutput from the
+// session ToolPart's structured outcome + flattened output string.
+func toolOutputFromSession(outcome, output string) message.ToolResultOutput {
+	switch outcome {
+	case "error":
+		return message.ErrorTextOutput{Value: output}
+	case "denied":
+		return message.ExecutionDeniedOutput{Reason: output}
+	default:
+		return message.TextOutput{Value: output}
 	}
-	if s, ok := v.(string); ok {
-		return s
-	}
-	b, err := json.Marshal(v)
-	if err != nil {
-		return fmt.Sprintf("%v", v)
-	}
-	return string(b)
 }

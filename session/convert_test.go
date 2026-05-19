@@ -2,10 +2,57 @@ package session
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/airlockrun/goai/message"
 )
+
+// TestRoundtrip_ToolOutcomePreserved guards the regression where the
+// goai→session→goai round-trip flattened every tool result to a success
+// TextOutput, so an errored/denied tool rendered with a green dot.
+func TestRoundtrip_ToolOutcomePreserved(t *testing.T) {
+	cases := []struct {
+		name        string
+		out         message.ToolResultOutput
+		wantOutcome string
+		wantType    string // concrete type after the round-trip
+	}{
+		{"success", message.TextOutput{Value: "ok"}, "success", "text"},
+		{"error", message.ErrorTextOutput{Value: "boom"}, "error", "error-text"},
+		{"denied", message.ExecutionDeniedOutput{Reason: "no"}, "denied", "execution-denied"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			goaiMsg := message.NewToolMessage("call1", "run_js", tc.out)
+
+			sess := FromGoAIMessage(goaiMsg)
+			tp := sess.Parts[0].Tool
+			if tp == nil {
+				t.Fatalf("no tool part")
+			}
+			if tp.Outcome != tc.wantOutcome {
+				t.Fatalf("session ToolPart.Outcome = %q, want %q", tp.Outcome, tc.wantOutcome)
+			}
+
+			back := MessageToGoAI(sess)
+			if len(back) != 1 {
+				t.Fatalf("MessageToGoAI returned %d messages", len(back))
+			}
+			trp, ok := back[0].Content.Parts[0].(message.ToolResultPart)
+			if !ok {
+				t.Fatalf("part is %T, want ToolResultPart", back[0].Content.Parts[0])
+			}
+			if got := message.ToolOutcome(trp.Output); got != tc.wantOutcome {
+				t.Fatalf("round-trip ToolOutcome = %q, want %q", got, tc.wantOutcome)
+			}
+			b, _ := message.MarshalOutput(trp.Output)
+			if !json.Valid(b) || !strings.Contains(string(b), `"type":"`+tc.wantType+`"`) {
+				t.Fatalf("round-trip output = %s, want type %q", b, tc.wantType)
+			}
+		})
+	}
+}
 
 func TestFromGoAIMessage_TextOnly(t *testing.T) {
 	goaiMsg := message.NewUserMessage("hello")
@@ -57,7 +104,7 @@ func TestFromGoAIMessage_ToolResultWithImage(t *testing.T) {
 			message.ToolResultPart{
 				ToolCallID: "call_1",
 				ToolName:   "run_js",
-				Result:     "ok",
+				Output:     message.TextOutput{Value: "ok"},
 			},
 			message.ImagePart{
 				Image:    "base64data",
@@ -133,7 +180,7 @@ func TestRoundtrip_ToolResultWithImage(t *testing.T) {
 			message.ToolResultPart{
 				ToolCallID: "call_1",
 				ToolName:   "run_js",
-				Result:     "done",
+				Output:     message.TextOutput{Value: "done"},
 			},
 			message.ImagePart{
 				Image:    "imgdata",

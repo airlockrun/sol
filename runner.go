@@ -51,16 +51,16 @@ type Runner struct {
 	questionMgr   *bus.QuestionManager
 
 	// State
-	session          *session.Session            // For message history and compaction
+	session          *session.Session // For message history and compaction
 	sessionID        string
-	store            session.SessionStore       // nil = no persistence (CLI mode)
-	compactionConfig *session.CompactionConfig  // nil = use defaults
-	messages        []goai.Message
-	initialMessages []goai.Message             // Pre-loaded thread history (ignored when store is set)
-	newMessages     []goai.Message             // append-only: messages generated during this run
-	compactionState *CompactionState           // set if compaction happened
-	retryStatus     session.RetryStatus
-	doomDetector    *session.DoomLoopDetector
+	store            session.SessionStore      // nil = no persistence (CLI mode)
+	compactionConfig *session.CompactionConfig // nil = use defaults
+	messages         []goai.Message
+	initialMessages  []goai.Message   // Pre-loaded thread history (ignored when store is set)
+	newMessages      []goai.Message   // append-only: messages generated during this run
+	compactionState  *CompactionState // set if compaction happened
+	retryStatus      session.RetryStatus
+	doomDetector     *session.DoomLoopDetector
 
 	// exitState is the optional "must call exit" hook. When non-nil the
 	// step loops break with RunExited as soon as ExitState.Called() turns
@@ -166,24 +166,24 @@ func NewRunner(opts RunnerOptions) *Runner {
 	}
 
 	r := &Runner{
-		agent:           opts.Agent,
-		providerID:      providerID,
-		modelID:         modelID,
-		apiKey:          opts.APIKey,
-		baseURL:         opts.BaseURL,
-		workDir:         opts.WorkDir,
-		quiet:           opts.Quiet,
-		model:           model,
-		toolSet:         toolSet,
-		executor:        opts.Executor,
-		initialMessages: opts.InitialMessages,
+		agent:            opts.Agent,
+		providerID:       providerID,
+		modelID:          modelID,
+		apiKey:           opts.APIKey,
+		baseURL:          opts.BaseURL,
+		workDir:          opts.WorkDir,
+		quiet:            opts.Quiet,
+		model:            model,
+		toolSet:          toolSet,
+		executor:         opts.Executor,
+		initialMessages:  opts.InitialMessages,
 		store:            opts.SessionStore,
 		compactionConfig: opts.CompactionConfig,
 		sessionID:        generateSessionID(),
-		bus:             b,
-		permissionMgr:   bus.NewPermissionManager(b),
-		questionMgr:     bus.NewQuestionManager(b),
-		exitState:       opts.ExitState,
+		bus:              b,
+		permissionMgr:    bus.NewPermissionManager(b),
+		questionMgr:      bus.NewQuestionManager(b),
+		exitState:        opts.ExitState,
 	}
 
 	return r
@@ -810,11 +810,23 @@ func (r *Runner) runStep(ctx context.Context) (*StepResult, error) {
 		case stream.ToolResultEvent:
 			r.bus.Publish(bus.StreamToolResult, e)
 			toolResults = append(toolResults, e)
-			output := e.Output.Output
+			output := message.ToolOutputText(e.Output)
 			if len(output) > 500 {
 				output = output[:500] + "..."
 			}
 			r.log("[result] %s\n", output)
+		case stream.ToolErrorEvent:
+			// An errored tool is still a tool result for pairing purposes —
+			// collect it with its discriminated error output.
+			tr := stream.ToolResultEvent{ToolCallID: e.ToolCallID, ToolName: e.ToolName, Input: e.Input, Output: e.Output}
+			r.bus.Publish(bus.StreamToolResult, tr)
+			toolResults = append(toolResults, tr)
+			r.log("[result] %s\n", message.ToolOutputText(e.Output))
+		case stream.ToolOutputDeniedEvent:
+			tr := stream.ToolResultEvent{ToolCallID: e.ToolCallID, ToolName: e.ToolName, Input: e.Input, Output: message.ExecutionDeniedOutput{Reason: e.Reason}}
+			r.bus.Publish(bus.StreamToolResult, tr)
+			toolResults = append(toolResults, tr)
+			r.log("[result] %s\n", message.ToolOutputText(tr.Output))
 		case stream.ErrorEvent:
 			var permErr *bus.ErrPermissionNeeded
 			var questErr *bus.ErrQuestionNeeded
@@ -914,23 +926,9 @@ func (r *Runner) appendMessages(ctx context.Context, text string, reasoningParts
 		goaiMsgs = append(goaiMsgs, assistantMsg)
 
 		for _, tr := range toolResults {
-			toolMsg := goai.NewToolMessage(
-				tr.ToolCallID,
-				tr.ToolName,
-				tr.Output.Output,
-				false,
-			)
-			// Convert tool result attachments to message content parts
-			// so the LLM can see files on the next turn.
-			for _, att := range tr.Output.Attachments {
-				if strings.HasPrefix(att.MimeType, "image/") {
-					toolMsg.Content.Parts = append(toolMsg.Content.Parts,
-						message.ImagePart{Image: att.Data, MimeType: att.MimeType})
-				} else {
-					toolMsg.Content.Parts = append(toolMsg.Content.Parts,
-						message.FilePart{Data: att.Data, MimeType: att.MimeType, Filename: att.Filename})
-				}
-			}
+			// The discriminated Output carries content/attachments inline;
+			// providers and session conversion expand it as needed.
+			toolMsg := goai.NewToolMessage(tr.ToolCallID, tr.ToolName, tr.Output)
 			r.messages = append(r.messages, toolMsg)
 			r.newMessages = append(r.newMessages, toolMsg)
 			goaiMsgs = append(goaiMsgs, toolMsg)
@@ -956,26 +954,6 @@ func (r *Runner) appendMessages(ctx context.Context, text string, reasoningParts
 					Output: usage.OutputTotal(),
 				}
 				break
-			}
-		}
-
-		// Patch Source from tool attachments (goai parts have no Source field).
-		for _, tr := range toolResults {
-			for _, att := range tr.Output.Attachments {
-				if att.Filename == "" {
-					continue
-				}
-				for i := range sessionMsgs {
-					for j := range sessionMsgs[i].Parts {
-						p := &sessionMsgs[i].Parts[j]
-						if p.Type == "image" && p.Image != nil && p.Image.Source == "" && p.Image.MimeType == att.MimeType {
-							p.Image.Source = att.Filename
-						}
-						if p.Type == "file" && p.File != nil && p.File.Source == "" && p.File.MimeType == att.MimeType {
-							p.File.Source = att.Filename
-						}
-					}
-				}
 			}
 		}
 
@@ -1482,7 +1460,7 @@ type RunResult struct {
 	Messages          []goai.Message     `json:"messages"`
 	NewMessages       []goai.Message     `json:"newMessages,omitempty"`
 	CompactionState   *CompactionState   `json:"compactionState,omitempty"`
-	SuspensionContext *SuspensionContext  `json:"suspensionContext,omitempty"`
+	SuspensionContext *SuspensionContext `json:"suspensionContext,omitempty"`
 
 	// Usage is the sum of every step's LLM usage over the run. InputTotal
 	// and OutputTotal reflect total tokens billed for all API calls this

@@ -60,7 +60,7 @@ type ModelLimits struct {
 // Message represents a message in the session history.
 type Message struct {
 	ID        string `json:"id"`
-	Role      string `json:"role"`                // "system", "user", "assistant", "tool"
+	Role      string `json:"role"` // "system", "user", "assistant", "tool"
 	Content   string `json:"content,omitempty"`
 	Parts     []Part `json:"parts,omitempty"`
 	ParentID  string `json:"parentId,omitempty"`  // For assistant messages, links to user message
@@ -72,7 +72,7 @@ type Message struct {
 // Part represents a part of a message (text, tool call, image, file, etc.)
 type Part struct {
 	ID        string     `json:"id"`
-	Type      string     `json:"type"`              // "text", "tool", "reasoning", "compaction", "image", "file"
+	Type      string     `json:"type"` // "text", "tool", "reasoning", "compaction", "image", "file"
 	Text      string     `json:"text,omitempty"`
 	Tool      *ToolPart  `json:"tool,omitempty"`
 	Image     *ImagePart `json:"image,omitempty"`
@@ -82,11 +82,16 @@ type Part struct {
 
 // ToolPart represents a tool call and its result.
 type ToolPart struct {
-	CallID    string `json:"callId"`
-	Name      string `json:"name"`
-	Input     string `json:"input,omitempty"`
-	Output    string `json:"output,omitempty"`
-	Status    string `json:"status"`              // "pending", "running", "completed", "error"
+	CallID string `json:"callId"`
+	Name   string `json:"name"`
+	Input  string `json:"input,omitempty"`
+	Output string `json:"output,omitempty"`
+	Status string `json:"status"` // lifecycle: "pending", "running", "completed"
+	// Outcome is the structured tool-result outcome, decoupled from the
+	// lifecycle Status so compaction (which prunes Status=="completed")
+	// keeps working: "" | "success" | "error" | "denied". It survives the
+	// goai↔session round-trip so the persisted/UI tool status is correct.
+	Outcome   string `json:"outcome,omitempty"`
 	Compacted bool   `json:"compacted,omitempty"` // True if output has been pruned
 }
 

@@ -678,7 +678,7 @@ func TestRunner_InterruptResumeEquivalence(t *testing.T) {
 		foundToolResultA := false
 		for _, step := range resultA.Steps {
 			for _, tr := range step.ToolResults {
-				if tr.ToolName == "greet" && tr.Output.Output == "Hello, world!" {
+				if tr.ToolName == "greet" && message.ToolOutputText(tr.Output) == "Hello, world!" {
 					foundToolResultA = true
 				}
 			}
@@ -686,7 +686,7 @@ func TestRunner_InterruptResumeEquivalence(t *testing.T) {
 		foundToolResultB := false
 		for _, step := range resultB.Steps {
 			for _, tr := range step.ToolResults {
-				if tr.ToolName == "greet" && tr.Output.Output == "Hello, world!" {
+				if tr.ToolName == "greet" && message.ToolOutputText(tr.Output) == "Hello, world!" {
 					foundToolResultB = true
 				}
 			}
@@ -810,7 +810,7 @@ func TestRunner_InterruptResumeEquivalence(t *testing.T) {
 		foundA := false
 		for _, step := range resultA.Steps {
 			for _, tr := range step.ToolResults {
-				if tr.ToolName == "ask_color" && tr.Output.Output == "Color: Blue" {
+				if tr.ToolName == "ask_color" && message.ToolOutputText(tr.Output) == "Color: Blue" {
 					foundA = true
 				}
 			}
@@ -818,7 +818,7 @@ func TestRunner_InterruptResumeEquivalence(t *testing.T) {
 		foundB := false
 		for _, step := range resultB.Steps {
 			for _, tr := range step.ToolResults {
-				if tr.ToolName == "ask_color" && tr.Output.Output == "Color: Blue" {
+				if tr.ToolName == "ask_color" && message.ToolOutputText(tr.Output) == "Color: Blue" {
 					foundB = true
 				}
 			}
@@ -999,7 +999,7 @@ func TestFilterMessageParts(t *testing.T) {
 		message.ImagePart{Image: "base64data", MimeType: "image/png"},
 	)
 
-	toolMsg := goai.NewToolMessage("tc1", "bash", "output", false)
+	toolMsg := goai.NewToolResultText("tc1", "bash", "output")
 
 	tests := []struct {
 		name           string
@@ -1077,11 +1077,11 @@ func TestFilterMessageParts(t *testing.T) {
 }
 
 // TestRunner_Compact verifies user-triggered Compact:
-// 1. Loads history from the store.
-// 2. Asks the model to summarize (the one LLM call in this path).
-// 3. Persists the compacted state via store.Compact with a non-negative
-//    tokensFreed value — proving the shared compactNow helper wired both
-//    paths correctly.
+//  1. Loads history from the store.
+//  2. Asks the model to summarize (the one LLM call in this path).
+//  3. Persists the compacted state via store.Compact with a non-negative
+//     tokensFreed value — proving the shared compactNow helper wired both
+//     paths correctly.
 func TestRunner_Compact(t *testing.T) {
 	store := &testStore{
 		messages: []session.Message{
