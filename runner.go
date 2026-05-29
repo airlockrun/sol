@@ -868,6 +868,18 @@ func (r *Runner) runStep(ctx context.Context) (*StepResult, error) {
 					ToolResults: toolResults,
 				}, fmt.Errorf("stream error: %w", e.Error)
 			}
+			// Cancellation surfaced as a stream error: persist the partial
+			// step (the assistant tool-call(s) plus a synthesized cancelled
+			// result, added in appendMessages) so the interrupted work
+			// survives into the next turn's context instead of vanishing.
+			if ctx.Err() != nil || errors.Is(e.Error, context.Canceled) {
+				r.appendPartialStep(ctx, textBuilder.String(), reasoningParts, toolCalls, toolResults, stream.Usage{})
+				return &StepResult{
+					Text:        textBuilder.String(),
+					ToolCalls:   toolCalls,
+					ToolResults: toolResults,
+				}, fmt.Errorf("stream error: %w", e.Error)
+			}
 			return nil, fmt.Errorf("stream error: %w", e.Error)
 		}
 	}
@@ -902,6 +914,26 @@ func (r *Runner) appendPartialStep(ctx context.Context, text string, reasoningPa
 // Also updates session history and persists via store if configured. The step's Usage is attached
 // to the assistant session message so billing / display totals can be computed per-message.
 func (r *Runner) appendMessages(ctx context.Context, text string, reasoningParts []goai.ReasoningPart, toolCalls []stream.ToolCall, toolResults []stream.ToolResultEvent, usage stream.Usage) {
+	// Interrupted mid-step: the run's context is already cancelled. Synthesize
+	// a result for every tool-call that never returned so the persisted step
+	// is a valid assistant→tool pair and the next turn's model sees that the
+	// call it issued was cut short by the user rather than silently dropped.
+	if ctx.Err() != nil && len(toolCalls) > 0 {
+		resolved := make(map[string]bool, len(toolResults))
+		for _, tr := range toolResults {
+			resolved[tr.ToolCallID] = true
+		}
+		for _, tc := range toolCalls {
+			if !resolved[tc.ID] {
+				toolResults = append(toolResults, stream.ToolResultEvent{
+					ToolCallID: tc.ID,
+					ToolName:   tc.Name,
+					Output:     message.ErrorTextOutput{Value: "Cancelled by user."},
+				})
+			}
+		}
+	}
+
 	var goaiMsgs []goai.Message
 
 	hasParts := len(toolCalls) > 0 || len(reasoningParts) > 0
@@ -1014,7 +1046,15 @@ func (r *Runner) appendMessages(ctx context.Context, text string, reasoningParts
 			r.session.AddMessage(sm)
 		}
 		if r.store != nil {
-			if err := r.store.Append(ctx, sessionMsgs); err != nil {
+			// Persistence is durability-critical and intentionally decoupled
+			// from run cancellation: once a step is recorded it must land.
+			// The write detaches from ctx's cancellation (keeping its values)
+			// under a bounded timeout, so a step still persists even when the
+			// run is being cancelled — including the interrupted step that the
+			// cancellation itself produced.
+			storeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+			defer cancel()
+			if err := r.store.Append(storeCtx, sessionMsgs); err != nil {
 				r.log("[%s] Warning: store append failed: %v\n", r.agent.Name, err)
 			}
 		}
