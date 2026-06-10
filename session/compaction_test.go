@@ -23,7 +23,7 @@ func TestPrune_ImagePartsStripped(t *testing.T) {
 			{Type: "tool", Tool: &ToolPart{CallID: "c1", Name: "run_js", Input: `{"code":"attachToContext()"}`, Status: "completed"}},
 		}},
 		{Role: "tool", Parts: []Part{
-			{Type: "image", Image: &ImagePart{Image: "s3ref:tmp/img1.jpg", MimeType: "image/jpeg"}},
+			{Type: "file", File: &FilePart{Data: "s3ref:tmp/img1.jpg", MimeType: "image/jpeg"}},
 			{Type: "tool", Tool: &ToolPart{CallID: "c1", Name: "run_js", Output: largeOutput, Status: "completed"}},
 		}},
 		// Turn 2 (old): another tool result with image
@@ -32,7 +32,7 @@ func TestPrune_ImagePartsStripped(t *testing.T) {
 			{Type: "tool", Tool: &ToolPart{CallID: "c2", Name: "run_js", Input: `{}`, Status: "completed"}},
 		}},
 		{Role: "tool", Parts: []Part{
-			{Type: "image", Image: &ImagePart{Image: "s3ref:tmp/img2.png", MimeType: "image/png"}},
+			{Type: "file", File: &FilePart{Data: "s3ref:tmp/img2.png", MimeType: "image/png"}},
 			{Type: "tool", Tool: &ToolPart{CallID: "c2", Name: "run_js", Output: largeOutput, Status: "completed"}},
 		}},
 		// Turn 3 (recent — protected)
@@ -67,7 +67,7 @@ func TestPrune_RecentImagesPreserved(t *testing.T) {
 	s.Messages = []Message{
 		{Role: "user", Content: "only turn"},
 		{Role: "tool", Parts: []Part{
-			{Type: "image", Image: &ImagePart{Image: "s3ref:tmp/img.jpg", MimeType: "image/jpeg"}},
+			{Type: "file", File: &FilePart{Data: "s3ref:tmp/img.jpg", MimeType: "image/jpeg"}},
 			{Type: "tool", Tool: &ToolPart{CallID: "c1", Name: "run_js", Output: largeOutput, Status: "completed"}},
 		}},
 	}

@@ -1057,7 +1057,7 @@ func TestFilterMessageParts(t *testing.T) {
 		goai.ReasoningPart{Text: "thinking..."},
 		goai.TextPart{Text: "hello"},
 		goai.ToolCallPart{ID: "tc1", Name: "bash", Input: json.RawMessage(`{}`)},
-		message.ImagePart{Image: "base64data", MimeType: "image/png"},
+		message.FilePart{Data: message.FileDataBytes{Data: "base64data"}, MimeType: "image/png"},
 	)
 
 	toolMsg := goai.NewToolResultText("tc1", "bash", "output")

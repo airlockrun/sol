@@ -106,8 +106,8 @@ func TestFromGoAIMessage_ToolResultWithImage(t *testing.T) {
 				ToolName:   "run_js",
 				Output:     message.TextOutput{Value: "ok"},
 			},
-			message.ImagePart{
-				Image:    "base64data",
+			message.FilePart{
+				Data:     message.FileDataBytes{Data: "base64data"},
 				MimeType: "image/jpeg",
 			},
 		}},
@@ -123,7 +123,7 @@ func TestFromGoAIMessage_ToolResultWithImage(t *testing.T) {
 	if sm.Parts[0].Type != "tool" || sm.Parts[0].Tool.Output != "ok" {
 		t.Errorf("Parts[0] = %+v", sm.Parts[0])
 	}
-	if sm.Parts[1].Type != "image" || sm.Parts[1].Image.Image != "base64data" {
+	if sm.Parts[1].Type != "file" || sm.Parts[1].File.Data != "base64data" {
 		t.Errorf("Parts[1] = %+v", sm.Parts[1])
 	}
 }
@@ -182,8 +182,8 @@ func TestRoundtrip_ToolResultWithImage(t *testing.T) {
 				ToolName:   "run_js",
 				Output:     message.TextOutput{Value: "done"},
 			},
-			message.ImagePart{
-				Image:    "imgdata",
+			message.FilePart{
+				Data:     message.FileDataBytes{Data: "imgdata"},
 				MimeType: "image/png",
 			},
 		}},
@@ -198,19 +198,19 @@ func TestRoundtrip_ToolResultWithImage(t *testing.T) {
 	if !result[0].Content.IsMultiPart() {
 		t.Fatal("expected multipart")
 	}
-	// Should have ToolResultPart + ImagePart
+	// Should have ToolResultPart + FilePart
 	if len(result[0].Content.Parts) != 2 {
 		t.Fatalf("parts len = %d, want 2", len(result[0].Content.Parts))
 	}
 	if _, ok := result[0].Content.Parts[0].(message.ToolResultPart); !ok {
 		t.Errorf("expected ToolResultPart, got %T", result[0].Content.Parts[0])
 	}
-	img, ok := result[0].Content.Parts[1].(message.ImagePart)
+	img, ok := result[0].Content.Parts[1].(message.FilePart)
 	if !ok {
-		t.Fatalf("expected ImagePart, got %T", result[0].Content.Parts[1])
+		t.Fatalf("expected FilePart, got %T", result[0].Content.Parts[1])
 	}
-	if img.Image != "imgdata" || img.MimeType != "image/png" {
-		t.Errorf("ImagePart = %+v", img)
+	if img.Data.(message.FileDataBytes).Data != "imgdata" || img.MimeType != "image/png" {
+		t.Errorf("FilePart = %+v", img)
 	}
 }
 
@@ -219,7 +219,7 @@ func TestRoundtrip_CompactedImageStripped(t *testing.T) {
 		Role: "tool",
 		Parts: []Part{
 			{Type: "tool", Tool: &ToolPart{CallID: "c1", Name: "run_js", Output: "ok", Status: "completed"}},
-			{Type: "image", Image: &ImagePart{Image: "data", MimeType: "image/jpeg"}, Compacted: true},
+			{Type: "file", File: &FilePart{Data: "data", MimeType: "image/jpeg"}, Compacted: true},
 		},
 	}
 
@@ -230,7 +230,7 @@ func TestRoundtrip_CompactedImageStripped(t *testing.T) {
 	// Compacted image should be stripped — tool result only, no attachments.
 	if result[0].Content.IsMultiPart() {
 		for _, p := range result[0].Content.Parts {
-			if _, ok := p.(message.ImagePart); ok {
+			if _, ok := p.(message.FilePart); ok {
 				t.Error("compacted image should have been stripped")
 			}
 		}

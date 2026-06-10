@@ -54,7 +54,7 @@ type Agent struct {
 type HistoryPolicy struct {
 	ExcludeReasoning bool // Strip ReasoningParts from assistant messages
 	ExcludeToolCalls bool // Strip ToolCallParts + skip tool-role messages
-	ExcludeFiles     bool // Strip ImageParts/FileParts from all messages — stripped at PERSIST time, never reach history
+	ExcludeFiles     bool // Strip FileParts (images + documents) from all messages — stripped at PERSIST time, never reach history
 
 	// FilesRetainTurns keeps image/file parts in the N most recent user turns
 	// of history, then strips them when loading older messages. 0 disables

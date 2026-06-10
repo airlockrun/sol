@@ -69,15 +69,14 @@ type Message struct {
 	Compacted bool   `json:"compacted,omitempty"` // True if tool outputs have been pruned
 }
 
-// Part represents a part of a message (text, tool call, image, file, etc.)
+// Part represents a part of a message (text, tool call, file, etc.)
 type Part struct {
-	ID        string     `json:"id"`
-	Type      string     `json:"type"` // "text", "tool", "reasoning", "compaction", "image", "file"
-	Text      string     `json:"text,omitempty"`
-	Tool      *ToolPart  `json:"tool,omitempty"`
-	Image     *ImagePart `json:"image,omitempty"`
-	File      *FilePart  `json:"file,omitempty"`
-	Compacted bool       `json:"compacted,omitempty"` // True if output has been pruned
+	ID        string    `json:"id"`
+	Type      string    `json:"type"` // "text", "tool", "reasoning", "compaction", "file"
+	Text      string    `json:"text,omitempty"`
+	Tool      *ToolPart `json:"tool,omitempty"`
+	File      *FilePart `json:"file,omitempty"`
+	Compacted bool      `json:"compacted,omitempty"` // True if output has been pruned
 }
 
 // ToolPart represents a tool call and its result.
@@ -95,19 +94,12 @@ type ToolPart struct {
 	Compacted bool   `json:"compacted,omitempty"` // True if output has been pruned
 }
 
-// ImagePart represents an image attachment (base64 or URL).
-type ImagePart struct {
-	Image    string `json:"image"`              // base64 data or URL
-	MimeType string `json:"mimeType,omitempty"` // e.g., "image/png"
-	// Source identifies where this image came from (e.g. a file key, URL, or ID).
-	// Session-level metadata only — not passed to goai or LLM providers.
-	Source string `json:"source,omitempty"`
-}
-
-// FilePart represents a file attachment (base64-encoded).
+// FilePart represents a file attachment, including images. Data holds
+// base64-encoded content or a URL; MimeType drives rendering (an image/*
+// type renders as an image). Mirrors goai's unified message.FilePart.
 type FilePart struct {
-	Data     string `json:"data"`               // base64-encoded content
-	MimeType string `json:"mimeType"`           // e.g., "application/pdf"
+	Data     string `json:"data"`               // base64-encoded content or URL
+	MimeType string `json:"mimeType"`           // e.g., "application/pdf", "image/png"
 	Filename string `json:"filename,omitempty"` // optional filename
 	// Source identifies where this file came from (e.g. a file key, URL, or ID).
 	// Session-level metadata only — not passed to goai or LLM providers.

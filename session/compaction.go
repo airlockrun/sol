@@ -64,7 +64,7 @@ type PrunedInfo struct {
 	Type     string // "tool_output", "image", "file"
 	MimeType string // for images/files
 	Filename string // FilePart.Filename
-	Source   string // ImagePart.Source (e.g. S3 key)
+	Source   string // FilePart.Source (e.g. S3 key)
 }
 
 // CompactionAgent defines the interface for a compaction agent.
@@ -248,22 +248,14 @@ loop:
 					toPrune = append(toPrune, pruneTarget{tool: part.Tool})
 				}
 
-			case "image":
-				if part.Compacted || part.Image == nil {
-					continue
-				}
-				estimate := ImageTokenEstimate
-				total += estimate
-				if total > PruneProtect {
-					pruned += estimate
-					toPrune = append(toPrune, pruneTarget{part: part})
-				}
-
 			case "file":
 				if part.Compacted || part.File == nil {
 					continue
 				}
 				estimate := FileTokenEstimate
+				if strings.HasPrefix(part.File.MimeType, "image/") {
+					estimate = ImageTokenEstimate
+				}
 				total += estimate
 				if total > PruneProtect {
 					pruned += estimate
@@ -287,13 +279,10 @@ loop:
 			if t.part != nil {
 				// Replace image/file with text placeholder.
 				info := PrunedInfo{Type: t.part.Type}
-				if t.part.Image != nil {
-					info.MimeType = t.part.Image.MimeType
-					info.Source = t.part.Image.Source
-				}
 				if t.part.File != nil {
 					info.MimeType = t.part.File.MimeType
 					info.Filename = t.part.File.Filename
+					info.Source = t.part.File.Source
 				}
 				*t.part = Part{
 					Type: "text",

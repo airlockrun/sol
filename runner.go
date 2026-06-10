@@ -1004,26 +1004,14 @@ func (r *Runner) appendMessages(ctx context.Context, text string, reasoningParts
 				var detachNotes []string
 				var filtered []session.Part
 				for _, p := range sessionMsgs[i].Parts {
-					switch p.Type {
-					case "image":
-						if p.Image != nil {
-							detachNotes = append(detachNotes, prunedMsg(session.PrunedInfo{
-								Type:     "image",
-								MimeType: p.Image.MimeType,
-								Source:   p.Image.Source,
-							}))
-							continue // drop image part
-						}
-					case "file":
-						if p.File != nil {
-							detachNotes = append(detachNotes, prunedMsg(session.PrunedInfo{
-								Type:     "file",
-								MimeType: p.File.MimeType,
-								Filename: p.File.Filename,
-								Source:   p.File.Source,
-							}))
-							continue // drop file part
-						}
+					if p.Type == "file" && p.File != nil {
+						detachNotes = append(detachNotes, prunedMsg(session.PrunedInfo{
+							Type:     prunedKind(p.File.MimeType),
+							MimeType: p.File.MimeType,
+							Filename: p.File.Filename,
+							Source:   p.File.Source,
+						}))
+						continue // drop the attachment part
 					}
 					filtered = append(filtered, p)
 				}
@@ -1102,26 +1090,14 @@ func (r *Runner) stripOldFilesFromHistory(history []session.Message) []session.M
 		var detachNotes []string
 		var filtered []session.Part
 		for _, p := range history[i].Parts {
-			switch p.Type {
-			case "image":
-				if p.Image != nil {
-					detachNotes = append(detachNotes, prunedMsg(session.PrunedInfo{
-						Type:     "image",
-						MimeType: p.Image.MimeType,
-						Source:   p.Image.Source,
-					}))
-					continue
-				}
-			case "file":
-				if p.File != nil {
-					detachNotes = append(detachNotes, prunedMsg(session.PrunedInfo{
-						Type:     "file",
-						MimeType: p.File.MimeType,
-						Filename: p.File.Filename,
-						Source:   p.File.Source,
-					}))
-					continue
-				}
+			if p.Type == "file" && p.File != nil {
+				detachNotes = append(detachNotes, prunedMsg(session.PrunedInfo{
+					Type:     prunedKind(p.File.MimeType),
+					MimeType: p.File.MimeType,
+					Filename: p.File.Filename,
+					Source:   p.File.Source,
+				}))
+				continue
 			}
 			filtered = append(filtered, p)
 		}
@@ -1165,7 +1141,7 @@ func filterMessageParts(msg goai.Message, policy agent.HistoryPolicy) goai.Messa
 			if policy.ExcludeToolCalls {
 				continue
 			}
-		case message.ImagePart, message.FilePart:
+		case message.FilePart:
 			if policy.ExcludeFiles {
 				continue
 			}
@@ -1545,4 +1521,13 @@ type StepResult struct {
 	ToolResults  []stream.ToolResultEvent
 	FinishReason stream.FinishReason
 	Usage        stream.Usage
+}
+
+// prunedKind classifies a pruned attachment for the detach-note wording:
+// "image" for image/* media, "file" otherwise.
+func prunedKind(mimeType string) string {
+	if strings.HasPrefix(mimeType, "image/") {
+		return "image"
+	}
+	return "file"
 }
