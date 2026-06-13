@@ -48,12 +48,27 @@ func redactPart(p message.Part, redactor func(string) string) message.Part {
 		v.Input = []byte(redactor(string(v.Input)))
 		return v
 	case message.ToolResultPart:
-		if s, ok := v.Result.(string); ok {
-			v.Result = redactor(s)
+		// Redact the text-bearing output variants; JSON variants pass
+		// through (agents packing secrets into typed output opt into
+		// manual redaction).
+		switch o := v.Output.(type) {
+		case message.TextOutput:
+			o.Value = redactor(o.Value)
+			v.Output = o
+		case message.ErrorTextOutput:
+			o.Value = redactor(o.Value)
+			v.Output = o
+		case message.ExecutionDeniedOutput:
+			o.Reason = redactor(o.Reason)
+			v.Output = o
+		case message.ContentOutput:
+			for i := range o.Value {
+				if o.Value[i].Type == "text" {
+					o.Value[i].Text = redactor(o.Value[i].Text)
+				}
+			}
+			v.Output = o
 		}
-		// Non-string Result (struct/map/etc.) passes through; agents
-		// that pack secrets into typed output should opt into manual
-		// redaction.
 		return v
 	}
 	return p

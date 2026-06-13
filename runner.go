@@ -51,16 +51,16 @@ type Runner struct {
 	questionMgr   *bus.QuestionManager
 
 	// State
-	session          *session.Session            // For message history and compaction
+	session          *session.Session // For message history and compaction
 	sessionID        string
-	store            session.SessionStore       // nil = no persistence (CLI mode)
-	compactionConfig *session.CompactionConfig  // nil = use defaults
-	messages        []goai.Message
-	initialMessages []goai.Message             // Pre-loaded thread history (ignored when store is set)
-	newMessages     []goai.Message             // append-only: messages generated during this run
-	compactionState *CompactionState           // set if compaction happened
-	retryStatus     session.RetryStatus
-	doomDetector    *session.DoomLoopDetector
+	store            session.SessionStore      // nil = no persistence (CLI mode)
+	compactionConfig *session.CompactionConfig // nil = use defaults
+	messages         []goai.Message
+	initialMessages  []goai.Message   // Pre-loaded thread history (ignored when store is set)
+	newMessages      []goai.Message   // append-only: messages generated during this run
+	compactionState  *CompactionState // set if compaction happened
+	retryStatus      session.RetryStatus
+	doomDetector     *session.DoomLoopDetector
 
 	// exitState is the optional "must call exit" hook. When non-nil the
 	// step loops break with RunExited as soon as ExitState.Called() turns
@@ -166,24 +166,24 @@ func NewRunner(opts RunnerOptions) *Runner {
 	}
 
 	r := &Runner{
-		agent:           opts.Agent,
-		providerID:      providerID,
-		modelID:         modelID,
-		apiKey:          opts.APIKey,
-		baseURL:         opts.BaseURL,
-		workDir:         opts.WorkDir,
-		quiet:           opts.Quiet,
-		model:           model,
-		toolSet:         toolSet,
-		executor:        opts.Executor,
-		initialMessages: opts.InitialMessages,
+		agent:            opts.Agent,
+		providerID:       providerID,
+		modelID:          modelID,
+		apiKey:           opts.APIKey,
+		baseURL:          opts.BaseURL,
+		workDir:          opts.WorkDir,
+		quiet:            opts.Quiet,
+		model:            model,
+		toolSet:          toolSet,
+		executor:         opts.Executor,
+		initialMessages:  opts.InitialMessages,
 		store:            opts.SessionStore,
 		compactionConfig: opts.CompactionConfig,
 		sessionID:        generateSessionID(),
-		bus:             b,
-		permissionMgr:   bus.NewPermissionManager(b),
-		questionMgr:     bus.NewQuestionManager(b),
-		exitState:       opts.ExitState,
+		bus:              b,
+		permissionMgr:    bus.NewPermissionManager(b),
+		questionMgr:      bus.NewQuestionManager(b),
+		exitState:        opts.ExitState,
 	}
 
 	return r
@@ -739,7 +739,7 @@ func (r *Runner) runStep(ctx context.Context) (*StepResult, error) {
 	// before the messages leave the agent. agentsdk wires this from
 	// its sensitiveSet. Best-effort; covers system prompt, env prompt,
 	// and history because all three are baked into r.messages.
-	llmMessages := redactMessages(r.messages, r.agent.Redactor)
+	llmMessages := coalesceConsecutiveUser(redactMessages(r.messages, r.agent.Redactor))
 
 	input := stream.Input{
 		Model:           r.model,
@@ -810,22 +810,43 @@ func (r *Runner) runStep(ctx context.Context) (*StepResult, error) {
 		case stream.ToolResultEvent:
 			r.bus.Publish(bus.StreamToolResult, e)
 			toolResults = append(toolResults, e)
-			output := e.Output.Output
+			output := message.ToolOutputText(e.Output)
 			if len(output) > 500 {
 				output = output[:500] + "..."
 			}
 			r.log("[result] %s\n", output)
+		case stream.ToolErrorEvent:
+			// An errored tool is still a tool result for pairing purposes —
+			// collect it with its discriminated error output.
+			tr := stream.ToolResultEvent{ToolCallID: e.ToolCallID, ToolName: e.ToolName, Input: e.Input, Output: e.Output}
+			r.bus.Publish(bus.StreamToolResult, tr)
+			toolResults = append(toolResults, tr)
+			r.log("[result] %s\n", message.ToolOutputText(e.Output))
+		case stream.ToolOutputDeniedEvent:
+			tr := stream.ToolResultEvent{ToolCallID: e.ToolCallID, ToolName: e.ToolName, Input: e.Input, Output: message.ExecutionDeniedOutput{Reason: e.Reason}}
+			r.bus.Publish(bus.StreamToolResult, tr)
+			toolResults = append(toolResults, tr)
+			r.log("[result] %s\n", message.ToolOutputText(tr.Output))
 		case stream.ErrorEvent:
 			var permErr *bus.ErrPermissionNeeded
 			var questErr *bus.ErrQuestionNeeded
-			if errors.As(e.Error, &permErr) || errors.As(e.Error, &questErr) {
-				// Partial step — stream didn't complete, so no usage is available.
+			var delErr *bus.ErrDelegatedSuspend
+			if errors.As(e.Error, &permErr) || errors.As(e.Error, &questErr) || errors.As(e.Error, &delErr) {
+				// Partial step — stream didn't complete, so no usage is
+				// available. Persisting here is load-bearing for ALL three
+				// suspension kinds: the assistant message carrying the
+				// suspended tool_call must land in r.messages / the store so
+				// the resume path's tool-result append forms a valid
+				// assistant→tool pair. A delegated suspend that skipped this
+				// left an orphaned tool message → next LLM turn 400s.
 				r.appendPartialStep(ctx, textBuilder.String(), reasoningParts, toolCalls, toolResults, stream.Usage{})
 
-				// Re-publish suspension events on the runner's bus so the
-				// bridge can forward them to the frontend in real-time.
-				// The original event was published on the toolserver's bus
-				// which the bridge doesn't subscribe to.
+				// Re-publish permission/question suspension events on the
+				// runner's bus so the bridge forwards them in real-time (the
+				// original was on the toolserver's bus). Delegated suspends
+				// carry their gate detail in the SuspensionContext instead
+				// (agentsdk busbridge.emitSuspensionEvent synthesizes the
+				// confirmation_required), so there's nothing to republish.
 				if questErr != nil {
 					r.bus.Publish(bus.QuestionAsked, bus.QuestionAskedPayload{
 						Questions: questErr.Questions,
@@ -841,6 +862,18 @@ func (r *Runner) runStep(ctx context.Context) (*StepResult, error) {
 					})
 				}
 
+				return &StepResult{
+					Text:        textBuilder.String(),
+					ToolCalls:   toolCalls,
+					ToolResults: toolResults,
+				}, fmt.Errorf("stream error: %w", e.Error)
+			}
+			// Cancellation surfaced as a stream error: persist the partial
+			// step (the assistant tool-call(s) plus a synthesized cancelled
+			// result, added in appendMessages) so the interrupted work
+			// survives into the next turn's context instead of vanishing.
+			if ctx.Err() != nil || errors.Is(e.Error, context.Canceled) {
+				r.appendPartialStep(ctx, textBuilder.String(), reasoningParts, toolCalls, toolResults, stream.Usage{})
 				return &StepResult{
 					Text:        textBuilder.String(),
 					ToolCalls:   toolCalls,
@@ -881,6 +914,26 @@ func (r *Runner) appendPartialStep(ctx context.Context, text string, reasoningPa
 // Also updates session history and persists via store if configured. The step's Usage is attached
 // to the assistant session message so billing / display totals can be computed per-message.
 func (r *Runner) appendMessages(ctx context.Context, text string, reasoningParts []goai.ReasoningPart, toolCalls []stream.ToolCall, toolResults []stream.ToolResultEvent, usage stream.Usage) {
+	// Interrupted mid-step: the run's context is already cancelled. Synthesize
+	// a result for every tool-call that never returned so the persisted step
+	// is a valid assistant→tool pair and the next turn's model sees that the
+	// call it issued was cut short by the user rather than silently dropped.
+	if ctx.Err() != nil && len(toolCalls) > 0 {
+		resolved := make(map[string]bool, len(toolResults))
+		for _, tr := range toolResults {
+			resolved[tr.ToolCallID] = true
+		}
+		for _, tc := range toolCalls {
+			if !resolved[tc.ID] {
+				toolResults = append(toolResults, stream.ToolResultEvent{
+					ToolCallID: tc.ID,
+					ToolName:   tc.Name,
+					Output:     message.ErrorTextOutput{Value: "Cancelled by user."},
+				})
+			}
+		}
+	}
+
 	var goaiMsgs []goai.Message
 
 	hasParts := len(toolCalls) > 0 || len(reasoningParts) > 0
@@ -905,23 +958,9 @@ func (r *Runner) appendMessages(ctx context.Context, text string, reasoningParts
 		goaiMsgs = append(goaiMsgs, assistantMsg)
 
 		for _, tr := range toolResults {
-			toolMsg := goai.NewToolMessage(
-				tr.ToolCallID,
-				tr.ToolName,
-				tr.Output.Output,
-				false,
-			)
-			// Convert tool result attachments to message content parts
-			// so the LLM can see files on the next turn.
-			for _, att := range tr.Output.Attachments {
-				if strings.HasPrefix(att.MimeType, "image/") {
-					toolMsg.Content.Parts = append(toolMsg.Content.Parts,
-						message.ImagePart{Image: att.Data, MimeType: att.MimeType})
-				} else {
-					toolMsg.Content.Parts = append(toolMsg.Content.Parts,
-						message.FilePart{Data: att.Data, MimeType: att.MimeType, Filename: att.Filename})
-				}
-			}
+			// The discriminated Output carries content/attachments inline;
+			// providers and session conversion expand it as needed.
+			toolMsg := goai.NewToolMessage(tr.ToolCallID, tr.ToolName, tr.Output)
 			r.messages = append(r.messages, toolMsg)
 			r.newMessages = append(r.newMessages, toolMsg)
 			goaiMsgs = append(goaiMsgs, toolMsg)
@@ -950,26 +989,6 @@ func (r *Runner) appendMessages(ctx context.Context, text string, reasoningParts
 			}
 		}
 
-		// Patch Source from tool attachments (goai parts have no Source field).
-		for _, tr := range toolResults {
-			for _, att := range tr.Output.Attachments {
-				if att.Filename == "" {
-					continue
-				}
-				for i := range sessionMsgs {
-					for j := range sessionMsgs[i].Parts {
-						p := &sessionMsgs[i].Parts[j]
-						if p.Type == "image" && p.Image != nil && p.Image.Source == "" && p.Image.MimeType == att.MimeType {
-							p.Image.Source = att.Filename
-						}
-						if p.Type == "file" && p.File != nil && p.File.Source == "" && p.File.MimeType == att.MimeType {
-							p.File.Source = att.Filename
-						}
-					}
-				}
-			}
-		}
-
 		// Strip image/file parts and append detach info to tool output before
 		// persisting when ExcludeFiles is set. The detach message goes into the
 		// tool Output string (not a separate text part) so it works with ALL
@@ -985,26 +1004,14 @@ func (r *Runner) appendMessages(ctx context.Context, text string, reasoningParts
 				var detachNotes []string
 				var filtered []session.Part
 				for _, p := range sessionMsgs[i].Parts {
-					switch p.Type {
-					case "image":
-						if p.Image != nil {
-							detachNotes = append(detachNotes, prunedMsg(session.PrunedInfo{
-								Type:     "image",
-								MimeType: p.Image.MimeType,
-								Source:   p.Image.Source,
-							}))
-							continue // drop image part
-						}
-					case "file":
-						if p.File != nil {
-							detachNotes = append(detachNotes, prunedMsg(session.PrunedInfo{
-								Type:     "file",
-								MimeType: p.File.MimeType,
-								Filename: p.File.Filename,
-								Source:   p.File.Source,
-							}))
-							continue // drop file part
-						}
+					if p.Type == "file" && p.File != nil {
+						detachNotes = append(detachNotes, prunedMsg(session.PrunedInfo{
+							Type:     prunedKind(p.File.MimeType),
+							MimeType: p.File.MimeType,
+							Filename: p.File.Filename,
+							Source:   p.File.Source,
+						}))
+						continue // drop the attachment part
 					}
 					filtered = append(filtered, p)
 				}
@@ -1027,7 +1034,15 @@ func (r *Runner) appendMessages(ctx context.Context, text string, reasoningParts
 			r.session.AddMessage(sm)
 		}
 		if r.store != nil {
-			if err := r.store.Append(ctx, sessionMsgs); err != nil {
+			// Persistence is durability-critical and intentionally decoupled
+			// from run cancellation: once a step is recorded it must land.
+			// The write detaches from ctx's cancellation (keeping its values)
+			// under a bounded timeout, so a step still persists even when the
+			// run is being cancelled — including the interrupted step that the
+			// cancellation itself produced.
+			storeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+			defer cancel()
+			if err := r.store.Append(storeCtx, sessionMsgs); err != nil {
 				r.log("[%s] Warning: store append failed: %v\n", r.agent.Name, err)
 			}
 		}
@@ -1075,26 +1090,14 @@ func (r *Runner) stripOldFilesFromHistory(history []session.Message) []session.M
 		var detachNotes []string
 		var filtered []session.Part
 		for _, p := range history[i].Parts {
-			switch p.Type {
-			case "image":
-				if p.Image != nil {
-					detachNotes = append(detachNotes, prunedMsg(session.PrunedInfo{
-						Type:     "image",
-						MimeType: p.Image.MimeType,
-						Source:   p.Image.Source,
-					}))
-					continue
-				}
-			case "file":
-				if p.File != nil {
-					detachNotes = append(detachNotes, prunedMsg(session.PrunedInfo{
-						Type:     "file",
-						MimeType: p.File.MimeType,
-						Filename: p.File.Filename,
-						Source:   p.File.Source,
-					}))
-					continue
-				}
+			if p.Type == "file" && p.File != nil {
+				detachNotes = append(detachNotes, prunedMsg(session.PrunedInfo{
+					Type:     prunedKind(p.File.MimeType),
+					MimeType: p.File.MimeType,
+					Filename: p.File.Filename,
+					Source:   p.File.Source,
+				}))
+				continue
 			}
 			filtered = append(filtered, p)
 		}
@@ -1138,7 +1141,7 @@ func filterMessageParts(msg goai.Message, policy agent.HistoryPolicy) goai.Messa
 			if policy.ExcludeToolCalls {
 				continue
 			}
-		case message.ImagePart, message.FilePart:
+		case message.FilePart:
 			if policy.ExcludeFiles {
 				continue
 			}
@@ -1163,33 +1166,50 @@ func filterMessageParts(msg goai.Message, policy agent.HistoryPolicy) goai.Messa
 // handleSuspension checks if the error is a permission/question suspension
 // and populates the RunResult accordingly.
 func (r *Runner) handleSuspension(err error, stepResult *StepResult, result *RunResult) (*RunResult, bool) {
-	var permErr *bus.ErrPermissionNeeded
-	var questErr *bus.ErrQuestionNeeded
-	if errors.As(err, &permErr) {
+	// stepResult is populated when a suspension is raised mid-step via
+	// the bus (today's permission/question gates). It is nil when the
+	// suspension is a FatalToolError RETURNED from a tool's Execute
+	// (ErrDelegatedSuspend today; a future top-level question/permission
+	// tool would be the same) — runStep returns (nil, err) there.
+	// Normalize once so every branch is nil-safe by construction rather
+	// than depending on which trigger path produced the error.
+	var pending []stream.ToolCall
+	var completed []stream.ToolResultEvent
+	if stepResult != nil {
+		pending = pendingToolCalls(stepResult.ToolCalls, stepResult.ToolResults)
+		completed = stepResult.ToolResults
+	}
+
+	suspend := func(reason string, data any) (*RunResult, bool) {
 		result.Status = RunSuspended
 		result.Messages = r.copyMessages()
 		result.NewMessages = r.copyNewMessages()
 		result.CompactionState = r.compactionState
 		result.SuspensionContext = &SuspensionContext{
-			Reason:           "permission",
-			Data:             permErr,
-			PendingToolCalls: pendingToolCalls(stepResult.ToolCalls, stepResult.ToolResults),
-			CompletedResults: stepResult.ToolResults,
+			Reason:           reason,
+			Data:             data,
+			PendingToolCalls: pending,
+			CompletedResults: completed,
 		}
 		return result, true
 	}
+
+	var permErr *bus.ErrPermissionNeeded
+	if errors.As(err, &permErr) {
+		return suspend("permission", permErr)
+	}
+	var questErr *bus.ErrQuestionNeeded
 	if errors.As(err, &questErr) {
-		result.Status = RunSuspended
-		result.Messages = r.copyMessages()
-		result.NewMessages = r.copyNewMessages()
-		result.CompactionState = r.compactionState
-		result.SuspensionContext = &SuspensionContext{
-			Reason:           "question",
-			Data:             questErr,
-			PendingToolCalls: pendingToolCalls(stepResult.ToolCalls, stepResult.ToolResults),
-			CompletedResults: stepResult.ToolResults,
-		}
-		return result, true
+		return suspend("question", questErr)
+	}
+	var delErr *bus.ErrDelegatedSuspend
+	if errors.As(err, &delErr) {
+		// A delegated child (Task subagent / A2A sibling) suspended.
+		// The resume dispatcher re-drives the child via
+		// SuspensionContext.Data (keyed by Transport) — it does not
+		// rely on PendingToolCalls, so the nil-stepResult case (empty
+		// pending/completed) is correct, not lossy, here.
+		return suspend("delegated", delErr)
 	}
 	return nil, false
 }
@@ -1272,7 +1292,36 @@ func (r *Runner) SpawnSubagent(ctx context.Context, agentName string, prompt str
 	})
 	subRunner.parent = r
 
-	return subRunner.Run(ctx, prompt)
+	res, err := subRunner.Run(ctx, prompt)
+	if err != nil {
+		return res, err
+	}
+	if res != nil && res.Status == RunSuspended {
+		// The subagent hit a gate. Don't swallow it as a (partial)
+		// result — propagate as a delegated suspension so the parent
+		// step suspends and the decision can cascade back in on resume.
+		return nil, &bus.ErrDelegatedSuspend{
+			Transport: "inprocess",
+			Child: InProcessChild{
+				AgentName:         agentName,
+				Messages:          res.Messages,
+				SuspensionContext: res.SuspensionContext,
+				CompactionState:   res.CompactionState,
+			},
+		}
+	}
+	return res, nil
+}
+
+// InProcessChild is the SuspensionContext.Data payload for a Sol Task
+// subagent that suspended. It carries everything the resume dispatcher
+// needs to reconstruct and re-drive the subagent on the parent's
+// resume, so the parent checkpoint is self-contained.
+type InProcessChild struct {
+	AgentName         string             `json:"agentName"`
+	Messages          []goai.Message     `json:"messages"`
+	SuspensionContext *SuspensionContext `json:"suspensionContext,omitempty"`
+	CompactionState   *CompactionState   `json:"compactionState,omitempty"`
 }
 
 // generateSessionID creates a unique session ID for prompt caching.
@@ -1427,7 +1476,7 @@ type RunResult struct {
 	Messages          []goai.Message     `json:"messages"`
 	NewMessages       []goai.Message     `json:"newMessages,omitempty"`
 	CompactionState   *CompactionState   `json:"compactionState,omitempty"`
-	SuspensionContext *SuspensionContext  `json:"suspensionContext,omitempty"`
+	SuspensionContext *SuspensionContext `json:"suspensionContext,omitempty"`
 
 	// Usage is the sum of every step's LLM usage over the run. InputTotal
 	// and OutputTotal reflect total tokens billed for all API calls this
@@ -1472,4 +1521,13 @@ type StepResult struct {
 	ToolResults  []stream.ToolResultEvent
 	FinishReason stream.FinishReason
 	Usage        stream.Usage
+}
+
+// prunedKind classifies a pruned attachment for the detach-note wording:
+// "image" for image/* media, "file" otherwise.
+func prunedKind(mimeType string) string {
+	if strings.HasPrefix(mimeType, "image/") {
+		return "image"
+	}
+	return "file"
 }

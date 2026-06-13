@@ -1,0 +1,3 @@
+# Compiled binaries (build artifacts — rebuild from source, never commit)
+/sol
+/toolserver

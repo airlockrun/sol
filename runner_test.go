@@ -322,6 +322,67 @@ func TestRunner_SuspensionOnPermissionNeeded(t *testing.T) {
 	}
 }
 
+// TestRunner_CancelMidTool_PersistsInterruptedStep verifies that cancelling a
+// run while a tool is executing still persists the in-flight step — the
+// assistant's tool-call plus a paired tool-result — so the next turn's model
+// sees both the call it issued and that the user interrupted it, rather than
+// the whole step vanishing from history.
+func TestRunner_CancelMidTool_PersistsInterruptedStep(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Stand in for the user hitting cancel mid-tool: the tool cancels the run
+	// from under itself, then blocks on the cancellation like a real
+	// long-running call would.
+	slowTool := tool.New("slow").
+		Description("Blocks until the run is cancelled").
+		Execute(func(toolCtx context.Context, _ json.RawMessage, _ tool.CallOptions) (tool.Result, error) {
+			cancel()
+			<-toolCtx.Done()
+			return tool.Result{}, toolCtx.Err()
+		}).Build()
+
+	mockModel := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
+		StreamResponse: testutil.MockToolCallResponse("call_1", "slow", map[string]string{}, testutil.MockUsage(10, 5)),
+	})
+
+	store := &testStore{}
+	runner := NewRunner(RunnerOptions{
+		Agent:        testAgent(tool.Set{"slow": slowTool}),
+		Model:        mockModel,
+		SessionStore: store,
+		Quiet:        true,
+	})
+
+	result, _ := runner.Run(ctx, "run the slow tool")
+
+	if result.Status != RunCancelled {
+		t.Fatalf("status = %s, want %s", result.Status, RunCancelled)
+	}
+
+	// The interrupted step must be durably recorded: the assistant tool-call
+	// and a paired tool-result for the same call id.
+	var sawCall, sawResult bool
+	for _, m := range store.messages {
+		for _, p := range m.Parts {
+			if p.Type != "tool" || p.Tool == nil || p.Tool.CallID != "call_1" {
+				continue
+			}
+			switch m.Role {
+			case "assistant":
+				sawCall = true
+			case "tool":
+				sawResult = true
+			}
+		}
+	}
+	if !sawCall {
+		t.Error("store missing the assistant tool-call for the interrupted step")
+	}
+	if !sawResult {
+		t.Error("store missing a paired tool-result for the cancelled call")
+	}
+}
+
 func TestRunner_CheckpointResumeRoundTrip(t *testing.T) {
 	permTool := tool.New("perm_tool").
 		Description("Tool that asks permission").
@@ -678,7 +739,7 @@ func TestRunner_InterruptResumeEquivalence(t *testing.T) {
 		foundToolResultA := false
 		for _, step := range resultA.Steps {
 			for _, tr := range step.ToolResults {
-				if tr.ToolName == "greet" && tr.Output.Output == "Hello, world!" {
+				if tr.ToolName == "greet" && message.ToolOutputText(tr.Output) == "Hello, world!" {
 					foundToolResultA = true
 				}
 			}
@@ -686,7 +747,7 @@ func TestRunner_InterruptResumeEquivalence(t *testing.T) {
 		foundToolResultB := false
 		for _, step := range resultB.Steps {
 			for _, tr := range step.ToolResults {
-				if tr.ToolName == "greet" && tr.Output.Output == "Hello, world!" {
+				if tr.ToolName == "greet" && message.ToolOutputText(tr.Output) == "Hello, world!" {
 					foundToolResultB = true
 				}
 			}
@@ -810,7 +871,7 @@ func TestRunner_InterruptResumeEquivalence(t *testing.T) {
 		foundA := false
 		for _, step := range resultA.Steps {
 			for _, tr := range step.ToolResults {
-				if tr.ToolName == "ask_color" && tr.Output.Output == "Color: Blue" {
+				if tr.ToolName == "ask_color" && message.ToolOutputText(tr.Output) == "Color: Blue" {
 					foundA = true
 				}
 			}
@@ -818,7 +879,7 @@ func TestRunner_InterruptResumeEquivalence(t *testing.T) {
 		foundB := false
 		for _, step := range resultB.Steps {
 			for _, tr := range step.ToolResults {
-				if tr.ToolName == "ask_color" && tr.Output.Output == "Color: Blue" {
+				if tr.ToolName == "ask_color" && message.ToolOutputText(tr.Output) == "Color: Blue" {
 					foundB = true
 				}
 			}
@@ -996,10 +1057,10 @@ func TestFilterMessageParts(t *testing.T) {
 		goai.ReasoningPart{Text: "thinking..."},
 		goai.TextPart{Text: "hello"},
 		goai.ToolCallPart{ID: "tc1", Name: "bash", Input: json.RawMessage(`{}`)},
-		message.ImagePart{Image: "base64data", MimeType: "image/png"},
+		message.FilePart{Data: message.FileDataBytes{Data: "base64data"}, MimeType: "image/png"},
 	)
 
-	toolMsg := goai.NewToolMessage("tc1", "bash", "output", false)
+	toolMsg := goai.NewToolResultText("tc1", "bash", "output")
 
 	tests := []struct {
 		name           string
@@ -1077,11 +1138,11 @@ func TestFilterMessageParts(t *testing.T) {
 }
 
 // TestRunner_Compact verifies user-triggered Compact:
-// 1. Loads history from the store.
-// 2. Asks the model to summarize (the one LLM call in this path).
-// 3. Persists the compacted state via store.Compact with a non-negative
-//    tokensFreed value — proving the shared compactNow helper wired both
-//    paths correctly.
+//  1. Loads history from the store.
+//  2. Asks the model to summarize (the one LLM call in this path).
+//  3. Persists the compacted state via store.Compact with a non-negative
+//     tokensFreed value — proving the shared compactNow helper wired both
+//     paths correctly.
 func TestRunner_Compact(t *testing.T) {
 	store := &testStore{
 		messages: []session.Message{

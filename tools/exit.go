@@ -19,7 +19,7 @@ import (
 type ExitState struct {
 	mu      sync.Mutex
 	called  bool
-	status  string // "success" or "error"
+	status  string // agent-reported status
 	message string
 }
 
@@ -36,6 +36,18 @@ func (s *ExitState) Result() (status, message string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.status, s.message
+}
+
+// Set records an exit outcome. ExitTool calls it internally; it is also
+// exported so a caller that supplies its own exit-tool variant — e.g.
+// one with an extended status vocabulary — can still drive the runner's
+// "must call exit" termination through a standard ExitState.
+func (s *ExitState) Set(status, message string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.called = true
+	s.status = status
+	s.message = message
 }
 
 type exitInput struct {
@@ -71,11 +83,7 @@ After you call this tool the run terminates immediately. Do NOT output additiona
 			if p.Status != "success" && p.Status != "error" {
 				return tool.Result{}, fmt.Errorf("exit: status must be \"success\" or \"error\", got %q", p.Status)
 			}
-			state.mu.Lock()
-			state.called = true
-			state.status = p.Status
-			state.message = p.Message
-			state.mu.Unlock()
+			state.Set(p.Status, p.Message)
 			return tool.Result{
 				Output: "Run terminated. The runner will return RunExited.",
 				Title:  "exit:" + p.Status,

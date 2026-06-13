@@ -2,11 +2,36 @@ package session
 
 import (
 	"encoding/json"
-	"fmt"
+	"strings"
 
 	"github.com/airlockrun/goai"
 	"github.com/airlockrun/goai/message"
 )
+
+// stringFromFileData extracts the raw payload string from a goai FileData
+// union for the session model's flat string fields.
+func stringFromFileData(d message.FileData) string {
+	switch v := d.(type) {
+	case message.FileDataBytes:
+		return v.Data
+	case message.FileDataURL:
+		return v.URL
+	case message.FileDataText:
+		return v.Text
+	default:
+		return ""
+	}
+}
+
+// fileDataFromString rebuilds a goai FileData union from a session model's
+// flat string: http(s) and data URLs become a URL reference, everything else
+// is treated as inline base64 bytes.
+func fileDataFromString(s string) message.FileData {
+	if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") || strings.HasPrefix(s, "data:") {
+		return message.FileDataURL{URL: s}
+	}
+	return message.FileDataBytes{Data: s}
+}
 
 // FromGoAIMessages converts goai messages to session messages.
 func FromGoAIMessages(msgs []goai.Message) []Message {
@@ -35,19 +60,11 @@ func FromGoAIMessage(m goai.Message) Message {
 				Type: "text",
 				Text: v.Text,
 			})
-		case message.ImagePart:
-			msg.Parts = append(msg.Parts, Part{
-				Type: "image",
-				Image: &ImagePart{
-					Image:    v.Image,
-					MimeType: v.MimeType,
-				},
-			})
 		case message.FilePart:
 			msg.Parts = append(msg.Parts, Part{
 				Type: "file",
 				File: &FilePart{
-					Data:     v.Data,
+					Data:     stringFromFileData(v.Data),
 					MimeType: v.MimeType,
 					Filename: v.Filename,
 				},
@@ -66,12 +83,30 @@ func FromGoAIMessage(m goai.Message) Message {
 			msg.Parts = append(msg.Parts, Part{
 				Type: "tool",
 				Tool: &ToolPart{
-					CallID: v.ToolCallID,
-					Name:   v.ToolName,
-					Output: resultToString(v.Result),
-					Status: "completed",
+					CallID:  v.ToolCallID,
+					Name:    v.ToolName,
+					Output:  message.ToolOutputWire(v.Output),
+					Status:  "completed",
+					Outcome: message.ToolOutcome(v.Output),
 				},
 			})
+			// A content output carries file/image items inline; surface them
+			// as session image/file parts so the CLI can show attachments.
+			if co, ok := v.Output.(message.ContentOutput); ok {
+				for _, it := range co.Value {
+					switch it.Type {
+					case "image-data", "image-url", "file-data", "file-url":
+						data := it.Data
+						if data == "" {
+							data = it.URL
+						}
+						msg.Parts = append(msg.Parts, Part{
+							Type: "file",
+							File: &FilePart{Data: data, MimeType: it.MediaType, Filename: it.Filename, Source: it.Filename},
+						})
+					}
+				}
+			}
 		case message.ReasoningPart:
 			msg.Parts = append(msg.Parts, Part{
 				Type: "reasoning",
@@ -121,17 +156,10 @@ func MessageToGoAI(msg Message) []goai.Message {
 							Input: json.RawMessage(p.Tool.Input),
 						})
 					}
-				case "image":
-					if p.Image != nil {
-						parts = append(parts, message.ImagePart{
-							Image:    p.Image.Image,
-							MimeType: p.Image.MimeType,
-						})
-					}
 				case "file":
 					if p.File != nil {
 						parts = append(parts, message.FilePart{
-							Data:     p.File.Data,
+							Data:     fileDataFromString(p.File.Data),
 							MimeType: p.File.MimeType,
 							Filename: p.File.Filename,
 						})
@@ -157,17 +185,10 @@ func MessageToGoAI(msg Message) []goai.Message {
 				if p.Text != "" {
 					extras = append(extras, message.TextPart{Text: p.Text})
 				}
-			case "image":
-				if p.Image != nil {
-					extras = append(extras, message.ImagePart{
-						Image:    p.Image.Image,
-						MimeType: p.Image.MimeType,
-					})
-				}
 			case "file":
 				if p.File != nil {
 					extras = append(extras, message.FilePart{
-						Data:     p.File.Data,
+						Data:     fileDataFromString(p.File.Data),
 						MimeType: p.File.MimeType,
 						Filename: p.File.Filename,
 					})
@@ -183,11 +204,16 @@ func MessageToGoAI(msg Message) []goai.Message {
 			if p.Tool.Compacted {
 				output = "[Old tool result content cleared]"
 			}
+			// Rebuild the discriminated outcome (error/denied/success) so it
+			// survives the round-trip — the dot and provider is_error depend
+			// on it. JSON fidelity is intentionally not preserved; the wire
+			// string is what providers send anyway.
+			toolOut := toolOutputFromSession(p.Tool.Outcome, output)
 			if len(extras) > 0 && !p.Tool.Compacted {
 				toolResult := message.ToolResultPart{
 					ToolCallID: p.Tool.CallID,
 					ToolName:   p.Tool.Name,
-					Result:     output,
+					Output:     toolOut,
 				}
 				allParts := []goai.Part{toolResult}
 				allParts = append(allParts, extras...)
@@ -199,8 +225,7 @@ func MessageToGoAI(msg Message) []goai.Message {
 				msgs = append(msgs, goai.NewToolMessage(
 					p.Tool.CallID,
 					p.Tool.Name,
-					output,
-					false,
+					toolOut,
 				))
 			}
 		}
@@ -209,16 +234,15 @@ func MessageToGoAI(msg Message) []goai.Message {
 	return nil
 }
 
-func resultToString(v any) string {
-	if v == nil {
-		return ""
+// toolOutputFromSession rebuilds a discriminated ToolResultOutput from the
+// session ToolPart's structured outcome + flattened output string.
+func toolOutputFromSession(outcome, output string) message.ToolResultOutput {
+	switch outcome {
+	case "error":
+		return message.ErrorTextOutput{Value: output}
+	case "denied":
+		return message.ExecutionDeniedOutput{Reason: output}
+	default:
+		return message.TextOutput{Value: output}
 	}
-	if s, ok := v.(string); ok {
-		return s
-	}
-	b, err := json.Marshal(v)
-	if err != nil {
-		return fmt.Sprintf("%v", v)
-	}
-	return string(b)
 }

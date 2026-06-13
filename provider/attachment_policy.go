@@ -16,15 +16,15 @@ type AttachmentPolicy struct {
 	MaxInlineBytesTotal int
 
 	// SupportsURL is true when the provider accepts http(s):// URLs for
-	// image parts. OpenAI chat+responses detect the prefix on ImagePart.Image;
-	// Anthropic + Google do the same and also accept it via FilePart.URL (see
+	// image file parts (a FilePart with an image/* type and a URL data
+	// variant). Anthropic + Google also accept non-image files by URL (see
 	// SupportsFileURL).
 	SupportsURL bool
 
 	// SupportsFileURL is true when the provider accepts http(s):// URLs for
-	// file parts via message.FilePart.URL. Anthropic + Google support PDFs
-	// and other file types by URL; OpenAI currently does not on the chat
-	// path.
+	// non-image file parts (a FilePart with a URL data variant). Anthropic +
+	// Google support PDFs and other file types by URL; OpenAI currently does
+	// not on the chat path.
 	SupportsFileURL bool
 
 	// MaxURLImages caps how many image/file parts per request can be sent
@@ -48,8 +48,8 @@ var DefaultAttachmentPolicy = AttachmentPolicy{
 // (same as Overlay above). Values are applied as-is — not merged with
 // DefaultAttachmentPolicy — so each entry must be complete.
 //
-// Covered: every provider in goai whose message conversion detects the
-// http(s) prefix on message.ImagePart.Image or reads message.FilePart.URL.
+// Covered: every provider in goai whose message conversion accepts a
+// message.FilePart carrying a URL data variant.
 //
 // Sizing references (as of 2026-Q2 docs):
 //   - OpenAI GPT-4o: 500 images/req, 50 MB total payload. Per-image soft
