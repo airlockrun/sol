@@ -383,6 +383,62 @@ func TestRunner_CancelMidTool_PersistsInterruptedStep(t *testing.T) {
 	}
 }
 
+func TestRunner_CompletedStep_PairsOrphanToolCall(t *testing.T) {
+	// A tool with no execute function is a NoExecute: goai skips it and emits
+	// no result event, so the completed step would otherwise persist an
+	// assistant tool-call with no answering tool message — an orphan that 400s
+	// the next turn on OpenAI-compatible providers. appendMessages must
+	// synthesize a result so the persisted step is a valid assistant→tool pair.
+	noExec := tool.New("noexec").Description("a tool with no execute function").Build()
+	if noExec.Execute != nil {
+		t.Fatal("test precondition: noexec tool must have a nil Execute")
+	}
+
+	mockModel := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
+		StreamResponses: [][]stream.Event{
+			testutil.MockToolCallResponse("call_1", "noexec", map[string]string{}, testutil.MockUsage(10, 5)),
+			testutil.MockTextResponse("all done", testutil.MockUsage(5, 3)),
+		},
+	})
+
+	store := &testStore{}
+	runner := NewRunner(RunnerOptions{
+		Agent:        testAgent(tool.Set{"noexec": noExec}),
+		Model:        mockModel,
+		SessionStore: store,
+		Quiet:        true,
+	})
+
+	result, err := runner.Run(context.Background(), "call the noexec tool")
+	if err != nil {
+		t.Fatalf("run error: %v", err)
+	}
+	if result.Status != RunCompleted {
+		t.Fatalf("status = %s, want %s", result.Status, RunCompleted)
+	}
+
+	var sawCall, sawResult bool
+	for _, m := range store.messages {
+		for _, p := range m.Parts {
+			if p.Type != "tool" || p.Tool == nil || p.Tool.CallID != "call_1" {
+				continue
+			}
+			switch m.Role {
+			case "assistant":
+				sawCall = true
+			case "tool":
+				sawResult = true
+			}
+		}
+	}
+	if !sawCall {
+		t.Error("store missing the assistant tool-call for the orphaned call")
+	}
+	if !sawResult {
+		t.Error("store missing the synthesized tool-result pairing the orphaned call")
+	}
+}
+
 func TestRunner_CheckpointResumeRoundTrip(t *testing.T) {
 	permTool := tool.New("perm_tool").
 		Description("Tool that asks permission").

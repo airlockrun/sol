@@ -898,7 +898,7 @@ func (r *Runner) runStep(ctx context.Context) (*StepResult, error) {
 
 	r.bus.Publish(bus.StreamStepComplete, stepResult)
 
-	r.appendMessages(ctx, text, reasoningParts, toolCalls, toolResults, usage)
+	r.appendMessages(ctx, true, text, reasoningParts, toolCalls, toolResults, usage)
 
 	return stepResult, nil
 }
@@ -907,18 +907,30 @@ func (r *Runner) runStep(ctx context.Context) (*StepResult, error) {
 // for a partially completed step (e.g., when a tool needs permission/question). Usage is
 // typically zero here because the stream did not complete.
 func (r *Runner) appendPartialStep(ctx context.Context, text string, reasoningParts []goai.ReasoningPart, toolCalls []stream.ToolCall, toolResults []stream.ToolResultEvent, usage stream.Usage) {
-	r.appendMessages(ctx, text, reasoningParts, toolCalls, toolResults, usage)
+	// completed=false: a suspended step (permission/question) deliberately
+	// leaves its pending tool-call unanswered for the resume path to fill, so
+	// orphan-synthesis must not run. The ctx-cancelled sub-case still gets a
+	// synthesized "Cancelled by user." result via appendMessages' own check.
+	r.appendMessages(ctx, false, text, reasoningParts, toolCalls, toolResults, usage)
 }
 
 // appendMessages builds and appends assistant + tool result messages to r.messages and r.newMessages.
 // Also updates session history and persists via store if configured. The step's Usage is attached
 // to the assistant session message so billing / display totals can be computed per-message.
-func (r *Runner) appendMessages(ctx context.Context, text string, reasoningParts []goai.ReasoningPart, toolCalls []stream.ToolCall, toolResults []stream.ToolResultEvent, usage stream.Usage) {
-	// Interrupted mid-step: the run's context is already cancelled. Synthesize
-	// a result for every tool-call that never returned so the persisted step
-	// is a valid assistant→tool pair and the next turn's model sees that the
-	// call it issued was cut short by the user rather than silently dropped.
-	if ctx.Err() != nil && len(toolCalls) > 0 {
+//
+// completed reports whether the model stream finished normally for this step.
+// A completed step must never persist an assistant tool-call without a matching
+// result: a tool with no execute function (NoExecute) or a result the provider
+// stream dropped would otherwise leave an orphan that fails the next turn's LLM
+// call (OpenAI-compatible APIs reject an unanswered tool_call). Both that case
+// and a mid-step cancellation synthesize a placeholder result so the persisted
+// step is always a valid assistant→tool pair.
+func (r *Runner) appendMessages(ctx context.Context, completed bool, text string, reasoningParts []goai.ReasoningPart, toolCalls []stream.ToolCall, toolResults []stream.ToolResultEvent, usage stream.Usage) {
+	if len(toolCalls) > 0 && (completed || ctx.Err() != nil) {
+		reason := "No tool result was recorded for this call."
+		if ctx.Err() != nil {
+			reason = "Cancelled by user."
+		}
 		resolved := make(map[string]bool, len(toolResults))
 		for _, tr := range toolResults {
 			resolved[tr.ToolCallID] = true
@@ -928,7 +940,7 @@ func (r *Runner) appendMessages(ctx context.Context, text string, reasoningParts
 				toolResults = append(toolResults, stream.ToolResultEvent{
 					ToolCallID: tc.ID,
 					ToolName:   tc.Name,
-					Output:     message.ErrorTextOutput{Value: "Cancelled by user."},
+					Output:     message.ErrorTextOutput{Value: reason},
 				})
 			}
 		}
