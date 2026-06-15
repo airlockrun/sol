@@ -1503,27 +1503,21 @@ func (r *RunResult) GetTotalText() string {
 	return r.TotalText
 }
 
-// sumStepsUsage accumulates per-step usage into a single total. Input and
-// output tokens both accumulate across steps because each provider call
-// bills independently — replacing (not summing) would undercount tool-loop
-// runs. Cache/reasoning fields left zero for now; billing cares about
-// totals first, breakdown later.
+// sumStepsUsage accumulates per-step usage into a single total. Each provider
+// call bills independently, so steps sum (replacing would undercount tool-loop
+// runs). Usage.Add carries the full breakdown — total, cached/non-cached input,
+// text/reasoning output — so downstream cost accounting (airlock's llm_usage
+// ledger) sees cache reads and prices them at the cheaper cached rate instead
+// of billing every input token at full price.
 func sumStepsUsage(steps []*StepResult) stream.Usage {
-	var in, out int
+	var total stream.Usage
 	for _, s := range steps {
 		if s == nil {
 			continue
 		}
-		in += s.Usage.InputTotal()
-		out += s.Usage.OutputTotal()
+		total.Add(s.Usage)
 	}
-	if in == 0 && out == 0 {
-		return stream.Usage{}
-	}
-	return stream.Usage{
-		InputTokens:  stream.InputTokens{Total: stream.IntPtr(in)},
-		OutputTokens: stream.OutputTokens{Total: stream.IntPtr(out)},
-	}
+	return total
 }
 
 // StepResult contains the results of a single step.
