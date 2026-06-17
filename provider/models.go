@@ -36,23 +36,23 @@ type ModelsDevProvider struct {
 // ModelInfo represents a model from models.dev, optionally enriched with
 // goai-supplied Kind classification by AllProviders().
 type ModelInfo struct {
-	ID    string `json:"id"`
-	Name  string `json:"name"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
 	// Kind classifies the model's primary purpose. Set by AllProviders()
 	// from goai's typed lists (EmbeddingModels / ImageModels /
 	// SpeechModels / TranscriptionModels / RerankingModels). Empty when
 	// goai has no entry — clients treat empty as KindLanguage.
-	Kind         ModelKind        `json:"kind,omitempty"`
-	Family       string           `json:"family,omitempty"`
-	ReleaseDate  string           `json:"release_date,omitempty"`
-	Attachment   bool             `json:"attachment,omitempty"`
-	Reasoning    bool             `json:"reasoning,omitempty"`
-	Temperature  bool             `json:"temperature,omitempty"`
-	ToolCall     bool             `json:"tool_call,omitempty"`
-	Modalities   *ModelModalities `json:"modalities,omitempty"`
-	Cost         *ModelCost       `json:"cost,omitempty"`
-	Limit        *ModelLimit      `json:"limit,omitempty"`
-	Status string `json:"status,omitempty"` // alpha, beta, deprecated
+	Kind        ModelKind        `json:"kind,omitempty"`
+	Family      string           `json:"family,omitempty"`
+	ReleaseDate string           `json:"release_date,omitempty"`
+	Attachment  bool             `json:"attachment,omitempty"`
+	Reasoning   bool             `json:"reasoning,omitempty"`
+	Temperature bool             `json:"temperature,omitempty"`
+	ToolCall    bool             `json:"tool_call,omitempty"`
+	Modalities  *ModelModalities `json:"modalities,omitempty"`
+	Cost        *ModelCost       `json:"cost,omitempty"`
+	Limit       *ModelLimit      `json:"limit,omitempty"`
+	Status      string           `json:"status,omitempty"` // alpha, beta, deprecated
 	// models.dev's `experimental` field was historically a bool but now
 	// ships as an object (or absent) depending on the model. We don't
 	// currently consume it; capturing it as RawMessage keeps the struct
