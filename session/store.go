@@ -30,6 +30,6 @@ type SessionStore interface {
 // Messages live only in the session's Messages slice; nothing is persisted.
 type MemoryStore struct{}
 
-func (MemoryStore) Load(context.Context) ([]Message, error)              { return nil, nil }
-func (MemoryStore) Append(context.Context, []Message) error              { return nil }
-func (MemoryStore) Compact(context.Context, []Message, int) error        { return nil }
+func (MemoryStore) Load(context.Context) ([]Message, error)       { return nil, nil }
+func (MemoryStore) Append(context.Context, []Message) error       { return nil }
+func (MemoryStore) Compact(context.Context, []Message, int) error { return nil }

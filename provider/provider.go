@@ -94,36 +94,70 @@ type providerFactory func(Options) provider.Provider
 // message conversion (e.g. DeepSeek's reasoning_content rules).
 var providerFactories = map[string]providerFactory{
 	// Direct providers (each has its own wire format).
-	"openai":    func(o Options) provider.Provider { return openai.New(provider.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
-	"anthropic": func(o Options) provider.Provider { return anthropic.New(anthropic.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
-	"google":    func(o Options) provider.Provider { return google.New(google.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
-	"mistral":   func(o Options) provider.Provider { return mistral.New(mistral.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
-	"cohere":    func(o Options) provider.Provider { return cohere.New(cohere.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
+	"openai": func(o Options) provider.Provider {
+		return openai.New(provider.Options{APIKey: o.APIKey, BaseURL: o.BaseURL})
+	},
+	"anthropic": func(o Options) provider.Provider {
+		return anthropic.New(anthropic.Options{APIKey: o.APIKey, BaseURL: o.BaseURL})
+	},
+	"google": func(o Options) provider.Provider {
+		return google.New(google.Options{APIKey: o.APIKey, BaseURL: o.BaseURL})
+	},
+	"mistral": func(o Options) provider.Provider {
+		return mistral.New(mistral.Options{APIKey: o.APIKey, BaseURL: o.BaseURL})
+	},
+	"cohere": func(o Options) provider.Provider {
+		return cohere.New(cohere.Options{APIKey: o.APIKey, BaseURL: o.BaseURL})
+	},
 
 	// OpenAI-compatible providers — must NOT fall through to the openai
 	// package because their endpoints, default base URLs, and (for
 	// deepseek) message conversion are all different.
-	"deepseek":    func(o Options) provider.Provider { return deepseek.New(deepseek.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
-	"groq":        func(o Options) provider.Provider { return groq.New(groq.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
-	"fireworks":   func(o Options) provider.Provider { return fireworks.New(fireworks.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
-	"cerebras":    func(o Options) provider.Provider { return cerebras.New(cerebras.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
-	"perplexity":  func(o Options) provider.Provider { return perplexity.New(perplexity.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
-	"togetherai":  func(o Options) provider.Provider { return togetherai.New(togetherai.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
-	"deepinfra":   func(o Options) provider.Provider { return deepinfra.New(deepinfra.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
-	"baseten":     func(o Options) provider.Provider { return baseten.New(baseten.Options{APIKey: o.APIKey}) }, // baseten.Options has no BaseURL — model deployments embed the URL
-	"xai":         func(o Options) provider.Provider { return xai.New(xai.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
-	"huggingface": func(o Options) provider.Provider { return huggingface.New(huggingface.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
+	"deepseek": func(o Options) provider.Provider {
+		return deepseek.New(deepseek.Options{APIKey: o.APIKey, BaseURL: o.BaseURL})
+	},
+	"groq": func(o Options) provider.Provider { return groq.New(groq.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
+	"fireworks": func(o Options) provider.Provider {
+		return fireworks.New(fireworks.Options{APIKey: o.APIKey, BaseURL: o.BaseURL})
+	},
+	"cerebras": func(o Options) provider.Provider {
+		return cerebras.New(cerebras.Options{APIKey: o.APIKey, BaseURL: o.BaseURL})
+	},
+	"perplexity": func(o Options) provider.Provider {
+		return perplexity.New(perplexity.Options{APIKey: o.APIKey, BaseURL: o.BaseURL})
+	},
+	"togetherai": func(o Options) provider.Provider {
+		return togetherai.New(togetherai.Options{APIKey: o.APIKey, BaseURL: o.BaseURL})
+	},
+	"deepinfra": func(o Options) provider.Provider {
+		return deepinfra.New(deepinfra.Options{APIKey: o.APIKey, BaseURL: o.BaseURL})
+	},
+	"baseten": func(o Options) provider.Provider { return baseten.New(baseten.Options{APIKey: o.APIKey}) }, // baseten.Options has no BaseURL — model deployments embed the URL
+	"xai":     func(o Options) provider.Provider { return xai.New(xai.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
+	"huggingface": func(o Options) provider.Provider {
+		return huggingface.New(huggingface.Options{APIKey: o.APIKey, BaseURL: o.BaseURL})
+	},
 
 	// Speech / audio / image providers.
-	"elevenlabs": func(o Options) provider.Provider { return elevenlabs.New(elevenlabs.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
-	"deepgram":   func(o Options) provider.Provider { return deepgram.New(deepgram.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
-	"assemblyai": func(o Options) provider.Provider { return assemblyai.New(assemblyai.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
-	"revai":      func(o Options) provider.Provider { return revai.New(revai.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
-	"lmnt":       func(o Options) provider.Provider { return lmnt.New(lmnt.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
-	"hume":       func(o Options) provider.Provider { return hume.New(hume.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
-	"fal":        func(o Options) provider.Provider { return fal.New(fal.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
-	"luma":       func(o Options) provider.Provider { return luma.New(luma.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
-	"replicate":  func(o Options) provider.Provider { return replicate.New(replicate.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
+	"elevenlabs": func(o Options) provider.Provider {
+		return elevenlabs.New(elevenlabs.Options{APIKey: o.APIKey, BaseURL: o.BaseURL})
+	},
+	"deepgram": func(o Options) provider.Provider {
+		return deepgram.New(deepgram.Options{APIKey: o.APIKey, BaseURL: o.BaseURL})
+	},
+	"assemblyai": func(o Options) provider.Provider {
+		return assemblyai.New(assemblyai.Options{APIKey: o.APIKey, BaseURL: o.BaseURL})
+	},
+	"revai": func(o Options) provider.Provider {
+		return revai.New(revai.Options{APIKey: o.APIKey, BaseURL: o.BaseURL})
+	},
+	"lmnt": func(o Options) provider.Provider { return lmnt.New(lmnt.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
+	"hume": func(o Options) provider.Provider { return hume.New(hume.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
+	"fal":  func(o Options) provider.Provider { return fal.New(fal.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
+	"luma": func(o Options) provider.Provider { return luma.New(luma.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
+	"replicate": func(o Options) provider.Provider {
+		return replicate.New(replicate.Options{APIKey: o.APIKey, BaseURL: o.BaseURL})
+	},
 }
 
 // createProvider instantiates a goai provider by ID. Unknown providers

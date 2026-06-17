@@ -115,7 +115,7 @@ type ErrPermissionNeeded struct {
 	Metadata   map[string]any `json:"metadata,omitempty"`
 }
 
-func (e *ErrPermissionNeeded) Error() string      { return "permission needed: " + e.Permission }
+func (e *ErrPermissionNeeded) Error() string        { return "permission needed: " + e.Permission }
 func (e *ErrPermissionNeeded) FatalToolError() bool { return true }
 
 // ErrQuestionNeeded is returned when no pre-loaded answer is available.
@@ -124,7 +124,7 @@ type ErrQuestionNeeded struct {
 	ToolCallID string         `json:"toolCallID"`
 }
 
-func (e *ErrQuestionNeeded) Error() string      { return "question needs answer" }
+func (e *ErrQuestionNeeded) Error() string        { return "question needs answer" }
 func (e *ErrQuestionNeeded) FatalToolError() bool { return true }
 
 // ErrDelegatedSuspend is returned by a tool whose work was delegated to
@@ -149,5 +149,7 @@ type ErrDelegatedSuspend struct {
 	Child      any    `json:"child"`
 }
 
-func (e *ErrDelegatedSuspend) Error() string       { return "delegated execution suspended (" + e.Transport + ")" }
+func (e *ErrDelegatedSuspend) Error() string {
+	return "delegated execution suspended (" + e.Transport + ")"
+}
 func (e *ErrDelegatedSuspend) FatalToolError() bool { return true }

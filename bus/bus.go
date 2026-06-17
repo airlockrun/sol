@@ -108,4 +108,3 @@ func (b *Bus) Once(eventType string, callback func(Event) bool) {
 		}
 	})
 }
-
