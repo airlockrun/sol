@@ -12,13 +12,14 @@ import (
 	"github.com/airlockrun/goai/tool"
 )
 
-// defaultOpenAIModel is the default model for OpenAI web search. We pick
-// gpt-5-nano over gpt-5/gpt-5-mini for latency: web search runs through
-// the Responses API and gpt-5 with default reasoning takes 30-60s on
-// terse queries. Nano returns comparable citation coverage in ~10s,
-// which fits comfortably under public-DM timeouts. Callers that want
-// higher-quality synthesis can override via Options.Model.
-const defaultOpenAIModel = "gpt-5-nano"
+// defaultOpenAIModel is the last-resort OpenAI web-search model, used only when
+// pickSearchModel can't reach the live catalog (offline). We pin the nano tier
+// for latency: web search runs through the Responses API and a full gpt-5 with
+// default reasoning takes 30-60s on terse queries, while nano returns comparable
+// citation coverage in ~10s. Online, pickSearchModel resolves the current nano
+// from models.dev, so this rarely fires; callers can still override via
+// Options.Model.
+const defaultOpenAIModel = "gpt-5.4-nano"
 
 // searchOpenAI runs a web-search-grounded generation through goai's
 // OpenAI Responses provider with the openai.web_search hosted tool.
@@ -27,6 +28,9 @@ const defaultOpenAIModel = "gpt-5-nano"
 // generateText.sources.
 func (c *DirectClient) searchOpenAI(ctx context.Context, req Request) (*Response, error) {
 	model := c.model
+	if model == "" {
+		model = pickSearchModel("openai", []string{"nano", "mini"})
+	}
 	if model == "" {
 		model = defaultOpenAIModel
 	}

@@ -11,16 +11,20 @@ import (
 	"github.com/airlockrun/goai/tool"
 )
 
-// defaultGrokModel is the default xAI model for grok-backed web search.
-// Grok 4 reasoning-capable models route through the Responses API,
-// which is required for the hosted web_search tool.
-const defaultGrokModel = "grok-4-fast"
+// defaultGrokModel is the last-resort xAI model for grok-backed web search, used
+// only when pickSearchModel can't reach the live catalog (offline). xAI routes
+// the hosted web_search tool through the Responses API; we pin a non-reasoning
+// variant for latency. Online, pickSearchModel resolves the current one.
+const defaultGrokModel = "grok-4.20-0309-non-reasoning"
 
 // searchGrok runs a web-search-grounded generation through goai's xAI
 // Responses provider with the xai.web_search hosted tool. Citations
 // arrive as SourceEvents from url_citation annotations on the response.
 func (c *DirectClient) searchGrok(ctx context.Context, req Request) (*Response, error) {
 	model := c.model
+	if model == "" {
+		model = pickSearchModel("xai", []string{"fast", "mini", "non-reasoning"})
+	}
 	if model == "" {
 		model = defaultGrokModel
 	}
