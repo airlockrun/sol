@@ -29,7 +29,7 @@ type ProviderOverlay struct {
 
 	// SearchBackend is the sol/websearch client name used when this provider
 	// supplies search. For LLM providers with native search, this differs
-	// from the provider_id (xai→grok, google→gemini, moonshot→kimi) because
+	// from the provider_id (xai→grok, google→gemini, moonshotai→kimi) because
 	// the search backend has its own historical name. For pure search
 	// providers it's the same as the overlay key.
 	//
@@ -61,7 +61,7 @@ var Overlay = map[string]ProviderOverlay{
 		ExtraCapabilities: []string{"search"},
 		SearchBackend:     "gemini",
 	},
-	"moonshot": {
+	"moonshotai": {
 		ExtraCapabilities: []string{"search"},
 		SearchBackend:     "kimi",
 	},
