@@ -26,7 +26,7 @@ func TestOverlayOpenAISearch(t *testing.T) {
 // misconfiguration (the capability matrix would promise what the runtime
 // can't deliver).
 func TestOverlaySearchProviders(t *testing.T) {
-	expect := []string{"openai", "xai", "google", "moonshot", "perplexity", "brave"}
+	expect := []string{"openai", "xai", "google", "moonshotai", "perplexity", "brave"}
 	for _, id := range expect {
 		ov, ok := Overlay[id]
 		if !ok {
