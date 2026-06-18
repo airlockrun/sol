@@ -11,9 +11,11 @@ import (
 	"github.com/airlockrun/goai/tool"
 )
 
-// defaultGeminiModel is the default model for gemini-backed web search.
-// Gemini 2.5 supports the google_search grounding tool.
-const defaultGeminiModel = "gemini-2.5-flash"
+// defaultGeminiModel is the last-resort gemini web-search model, used only when
+// pickSearchModel can't reach the live catalog (offline). The flash-lite tier
+// supports the google_search grounding tool and is the latency pick; online,
+// pickSearchModel resolves the current flash-lite from models.dev.
+const defaultGeminiModel = "gemini-3.1-flash-lite"
 
 // searchGemini runs a search-grounded generation through goai's Google
 // provider with the google_search grounding tool. Citations arrive as
@@ -21,6 +23,9 @@ const defaultGeminiModel = "gemini-2.5-flash"
 // (web variant), matching ai-sdk's extractSources behavior.
 func (c *DirectClient) searchGemini(ctx context.Context, req Request) (*Response, error) {
 	model := c.model
+	if model == "" {
+		model = pickSearchModel("google", []string{"flash-lite", "flash"})
+	}
 	if model == "" {
 		model = defaultGeminiModel
 	}

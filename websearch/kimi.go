@@ -11,8 +11,10 @@ import (
 
 const (
 	defaultKimiBaseURL = "https://api.moonshot.ai/v1"
-	defaultKimiModel   = "moonshot-v1-128k"
-	kimiMaxRounds      = 3
+	// defaultKimiModel is the offline last-resort; online, pickSearchModel
+	// resolves the current kimi-k2 model from models.dev ("moonshotai").
+	defaultKimiModel = "kimi-k2.6"
+	kimiMaxRounds    = 3
 )
 
 type kimiRequest struct {
@@ -64,6 +66,11 @@ type kimiResponse struct {
 
 func (c *DirectClient) searchKimi(ctx context.Context, req Request) (*Response, error) {
 	model := c.model
+	if model == "" {
+		// models.dev keys Moonshot under "moonshotai"; "k2" tracks the kimi-k2
+		// line (the -code variants are filtered out by searchExcludeTokens).
+		model = pickSearchModel("moonshotai", []string{"k2"})
+	}
 	if model == "" {
 		model = defaultKimiModel
 	}
