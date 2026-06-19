@@ -7,10 +7,22 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/airlockrun/goai/tool"
 	"github.com/airlockrun/sol/bus"
-	"golang.org/x/net/websocket"
+	"github.com/coder/websocket"
+)
+
+// maxWSMessageBytes is the per-message read limit for the toolserver socket.
+// coder/websocket defaults to 32 KiB, far too small for tool payloads (a file
+// read or a command's output routinely exceeds it). Tools already cap their
+// own output, so a generous ceiling here only guards against a runaway frame.
+const maxWSMessageBytes = 100 << 20 // 100 MiB
+
+const (
+	wsPingInterval = 30 * time.Second
+	wsWriteTimeout = 10 * time.Second
 )
 
 // ToolServer wraps a tool.Executor and serves requests over WebSocket.
@@ -62,43 +74,118 @@ type message struct {
 	ActiveTools []string             `json:"active_tools,omitempty"` // tool names to expose
 }
 
-// Handler returns an http.Handler for the WebSocket endpoint.
-func (s *ToolServer) Handler() http.Handler {
-	return websocket.Handler(s.handleConnection)
+// serverConn wraps a connection with a write mutex. coder/websocket forbids
+// concurrent data writes; the read loop and the keepalive goroutine both
+// touch the socket, so every JSON write goes through writeMsg under the lock.
+// (Ping is safe to call concurrently with Write per coder/websocket, so it
+// stays outside the lock.)
+type serverConn struct {
+	ws      *websocket.Conn
+	writeMu sync.Mutex
 }
 
-// handleConnection handles a single WebSocket connection.
-func (s *ToolServer) handleConnection(ws *websocket.Conn) {
-	defer ws.Close()
+func (c *serverConn) writeMsg(ctx context.Context, msg message) error {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	wctx, cancel := context.WithTimeout(ctx, wsWriteTimeout)
+	defer cancel()
+	return c.ws.Write(wctx, websocket.MessageText, data)
+}
 
-	for {
-		var msg message
-		if err := websocket.JSON.Receive(ws, &msg); err != nil {
-			// Connection closed or error
+// Handler returns an http.Handler for the WebSocket endpoint.
+func (s *ToolServer) Handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			InsecureSkipVerify: true, // toolserver runs inside the trusted build container
+		})
+		if err != nil {
 			return
 		}
+		ws.SetReadLimit(maxWSMessageBytes)
+		s.handleConnection(ws)
+	})
+}
 
-		switch msg.Type {
-		case "request":
-			s.handleRequest(ws, msg)
-		case "tools":
-			s.handleToolsRequest(ws, msg)
-		case "set_rules":
-			s.handleSetRules(ws, msg)
-		case "set_active_tools":
-			s.handleSetActiveTools(ws, msg)
-		case "push_answers":
-			s.handlePushAnswers(ws, msg)
-		default:
-			s.sendError(ws, msg.ID, fmt.Sprintf("unknown message type: %s", msg.Type))
+// handleConnection handles a single WebSocket connection. A keepalive ping
+// detects a dead peer; any read error (including a failed ping that cancels
+// the context) ends the loop and closes the socket — there is no reconnect.
+func (s *ToolServer) handleConnection(ws *websocket.Conn) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer ws.Close(websocket.StatusNormalClosure, "")
+
+	sc := &serverConn{ws: ws}
+	go s.pingLoop(ctx, ws, cancel)
+
+	for {
+		_, data, err := ws.Read(ctx)
+		if err != nil {
+			return // connection closed or error
+		}
+		var msg message
+		if err := json.Unmarshal(data, &msg); err != nil {
+			s.sendError(ctx, sc, "", fmt.Sprintf("invalid message: %v", err))
+			continue
+		}
+		s.dispatch(ctx, sc, msg)
+	}
+}
+
+// pingLoop sends periodic pings; a ping that fails (no pong) means the peer is
+// gone, so it cancels the connection context to unblock the read loop.
+func (s *ToolServer) pingLoop(ctx context.Context, ws *websocket.Conn, cancel context.CancelFunc) {
+	ticker := time.NewTicker(wsPingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pctx, c := context.WithTimeout(ctx, wsWriteTimeout)
+			err := ws.Ping(pctx)
+			c()
+			if err != nil {
+				cancel()
+				return
+			}
 		}
 	}
 }
 
+// dispatch routes one message. A defensive recover keeps a panic in the
+// marshal/dispatch layer (tool panics are already recovered in the executor)
+// from tearing the connection — it becomes an error reply instead.
+func (s *ToolServer) dispatch(ctx context.Context, sc *serverConn, msg message) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.sendError(ctx, sc, msg.ID, fmt.Sprintf("internal error: %v", r))
+		}
+	}()
+
+	switch msg.Type {
+	case "request":
+		s.handleRequest(ctx, sc, msg)
+	case "tools":
+		s.handleToolsRequest(ctx, sc, msg)
+	case "set_rules":
+		s.handleSetRules(ctx, sc, msg)
+	case "set_active_tools":
+		s.handleSetActiveTools(ctx, sc, msg)
+	case "push_answers":
+		s.handlePushAnswers(ctx, sc, msg)
+	default:
+		s.sendError(ctx, sc, msg.ID, fmt.Sprintf("unknown message type: %s", msg.Type))
+	}
+}
+
 // handleRequest processes a tool execution request.
-func (s *ToolServer) handleRequest(ws *websocket.Conn, msg message) {
+func (s *ToolServer) handleRequest(ctx context.Context, sc *serverConn, msg message) {
 	if msg.Request == nil {
-		s.sendError(ws, msg.ID, "missing request")
+		s.sendError(ctx, sc, msg.ID, "missing request")
 		return
 	}
 
@@ -110,45 +197,39 @@ func (s *ToolServer) handleRequest(ws *websocket.Conn, msg message) {
 	// Reject tools not in the active set
 	if active != nil {
 		if _, ok := active[msg.Request.ToolName]; !ok {
-			s.sendError(ws, msg.ID, fmt.Sprintf("tool %q not available", msg.Request.ToolName))
+			s.sendError(ctx, sc, msg.ID, fmt.Sprintf("tool %q not available", msg.Request.ToolName))
 			return
 		}
 	}
 
 	// Inject Bus/PM/QM into context so tools can call AskPermission/AskQuestion
-	ctx := context.Background()
-	ctx = bus.WithBus(ctx, s.bus)
-	ctx = bus.WithPermissionManager(ctx, s.pm)
-	ctx = bus.WithQuestionManager(ctx, s.qm)
+	execCtx := context.Background()
+	execCtx = bus.WithBus(execCtx, s.bus)
+	execCtx = bus.WithPermissionManager(execCtx, s.pm)
+	execCtx = bus.WithQuestionManager(execCtx, s.qm)
 
-	resp, err := executor.Execute(ctx, *msg.Request)
+	resp, err := executor.Execute(execCtx, *msg.Request)
 	if err != nil {
 		// Check for structured fatal errors that need to propagate
 		var permErr *bus.ErrPermissionNeeded
 		var questErr *bus.ErrQuestionNeeded
 		if errors.As(err, &permErr) {
-			websocket.JSON.Send(ws, message{Type: "response", ID: msg.ID, PermissionNeeded: permErr})
+			_ = sc.writeMsg(ctx, message{Type: "response", ID: msg.ID, PermissionNeeded: permErr})
 			return
 		}
 		if errors.As(err, &questErr) {
-			websocket.JSON.Send(ws, message{Type: "response", ID: msg.ID, QuestionNeeded: questErr})
+			_ = sc.writeMsg(ctx, message{Type: "response", ID: msg.ID, QuestionNeeded: questErr})
 			return
 		}
-		s.sendError(ws, msg.ID, err.Error())
+		s.sendError(ctx, sc, msg.ID, err.Error())
 		return
 	}
 
-	// Send response
-	reply := message{
-		Type:     "response",
-		ID:       msg.ID,
-		Response: &resp,
-	}
-	websocket.JSON.Send(ws, reply)
+	_ = sc.writeMsg(ctx, message{Type: "response", ID: msg.ID, Response: &resp})
 }
 
 // handleToolsRequest returns the available tool definitions.
-func (s *ToolServer) handleToolsRequest(ws *websocket.Conn, msg message) {
+func (s *ToolServer) handleToolsRequest(ctx context.Context, sc *serverConn, msg message) {
 	s.mu.RLock()
 	allTools := s.executor.Tools()
 	active := s.activeTools
@@ -166,22 +247,17 @@ func (s *ToolServer) handleToolsRequest(ws *websocket.Conn, msg message) {
 		filtered = allTools
 	}
 
-	reply := message{
-		Type:  "tools",
-		ID:    msg.ID,
-		Tools: filtered,
-	}
-	websocket.JSON.Send(ws, reply)
+	_ = sc.writeMsg(ctx, message{Type: "tools", ID: msg.ID, Tools: filtered})
 }
 
 // handleSetRules sets the permission rules and sends an ack.
-func (s *ToolServer) handleSetRules(ws *websocket.Conn, msg message) {
+func (s *ToolServer) handleSetRules(ctx context.Context, sc *serverConn, msg message) {
 	s.pm.SetRules(msg.Rules)
-	websocket.JSON.Send(ws, message{Type: "set_rules", ID: msg.ID})
+	_ = sc.writeMsg(ctx, message{Type: "set_rules", ID: msg.ID})
 }
 
 // handleSetActiveTools restricts which tools the server exposes and accepts.
-func (s *ToolServer) handleSetActiveTools(ws *websocket.Conn, msg message) {
+func (s *ToolServer) handleSetActiveTools(ctx context.Context, sc *serverConn, msg message) {
 	active := make(map[string]struct{}, len(msg.ActiveTools))
 	for _, name := range msg.ActiveTools {
 		active[name] = struct{}{}
@@ -189,23 +265,18 @@ func (s *ToolServer) handleSetActiveTools(ws *websocket.Conn, msg message) {
 	s.mu.Lock()
 	s.activeTools = active
 	s.mu.Unlock()
-	websocket.JSON.Send(ws, message{Type: "set_active_tools", ID: msg.ID})
+	_ = sc.writeMsg(ctx, message{Type: "set_active_tools", ID: msg.ID})
 }
 
 // handlePushAnswers pushes pre-loaded answers and sends an ack.
-func (s *ToolServer) handlePushAnswers(ws *websocket.Conn, msg message) {
+func (s *ToolServer) handlePushAnswers(ctx context.Context, sc *serverConn, msg message) {
 	s.qm.PushAnswers(msg.Answers)
-	websocket.JSON.Send(ws, message{Type: "push_answers", ID: msg.ID})
+	_ = sc.writeMsg(ctx, message{Type: "push_answers", ID: msg.ID})
 }
 
 // sendError sends an error response.
-func (s *ToolServer) sendError(ws *websocket.Conn, id, errMsg string) {
-	reply := message{
-		Type:  "response",
-		ID:    id,
-		Error: errMsg,
-	}
-	websocket.JSON.Send(ws, reply)
+func (s *ToolServer) sendError(ctx context.Context, sc *serverConn, id, errMsg string) {
+	_ = sc.writeMsg(ctx, message{Type: "response", ID: id, Error: errMsg})
 }
 
 // ListenAndServe starts the server on the given address.

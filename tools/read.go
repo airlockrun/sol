@@ -150,6 +150,11 @@ Usage:
 			return tool.Result{
 				Output: result.String(),
 				Title:  filepath.Base(filePath),
+				Metadata: map[string]any{
+					"lines":      len(raw),
+					"bytes":      bytes,
+					"totalLines": totalLines,
+				},
 			}, nil
 		}).
 		Build()

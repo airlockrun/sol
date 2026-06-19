@@ -74,9 +74,17 @@ func Grep() tool.Tool {
 				output = grepWithGrep(ctx, searchPath, args.Pattern, args.Include)
 			}
 
+			matches := 0
+			if strings.HasPrefix(output, "Found ") {
+				fmt.Sscanf(output, "Found %d matches", &matches)
+			}
+
 			return tool.Result{
 				Output: output,
 				Title:  args.Pattern,
+				Metadata: map[string]any{
+					"matches": matches,
+				},
 			}, nil
 		}).
 		Build()

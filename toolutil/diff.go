@@ -146,6 +146,23 @@ func generateHunks(oldLines, newLines []string) []string {
 	return hunks
 }
 
+// DiffStats counts added and removed lines in a unified diff produced by
+// GenerateDiff, ignoring the `+++`/`---` file headers. Used to summarize an
+// edit as "+<added> -<removed>" without echoing the changed line bodies.
+func DiffStats(diff string) (added, removed int) {
+	for _, line := range strings.Split(diff, "\n") {
+		switch {
+		case strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "---"):
+			continue
+		case strings.HasPrefix(line, "+"):
+			added++
+		case strings.HasPrefix(line, "-"):
+			removed++
+		}
+	}
+	return added, removed
+}
+
 // TrimDiff trims a diff to a reasonable size for display
 func TrimDiff(diff string, maxLines int) string {
 	if maxLines <= 0 {

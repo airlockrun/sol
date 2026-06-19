@@ -76,6 +76,9 @@ func Glob() tool.Tool {
 			return tool.Result{
 				Output: strings.Join(output, "\n"),
 				Title:  filepath.Base(searchPath),
+				Metadata: map[string]any{
+					"matches": len(files),
+				},
 			}, nil
 		}).
 		Build()

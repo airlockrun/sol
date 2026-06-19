@@ -105,9 +105,14 @@ func Edit() tool.Tool {
 				if sessionID != "" {
 					toolutil.FileTime.Read(sessionID, args.FilePath)
 				}
+				added, removed := toolutil.DiffStats(diff)
 				return tool.Result{
 					Output: "Edit applied successfully.",
 					Title:  filepath.Base(args.FilePath),
+					Metadata: map[string]any{
+						"added":   added,
+						"removed": removed,
+					},
 				}, nil
 			}
 
@@ -151,9 +156,14 @@ func Edit() tool.Tool {
 				toolutil.FileTime.Read(sessionID, args.FilePath)
 			}
 
+			added, removed := toolutil.DiffStats(diff)
 			return tool.Result{
 				Output: "Edit applied successfully.",
 				Title:  filepath.Base(args.FilePath),
+				Metadata: map[string]any{
+					"added":   added,
+					"removed": removed,
+				},
 			}, nil
 		}).
 		Build()

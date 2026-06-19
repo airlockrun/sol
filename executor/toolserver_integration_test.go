@@ -120,6 +120,62 @@ func TestToolServer_ExecuteThroughPipeline(t *testing.T) {
 	}
 }
 
+// panicTool panics when executed — used to verify a tool panic doesn't tear
+// the toolserver connection.
+func panicTool() tool.Tool {
+	return tool.Tool{
+		Name:        "boom",
+		Description: "panics",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{}}`),
+		Execute: func(ctx context.Context, input json.RawMessage, opts tool.CallOptions) (tool.Result, error) {
+			panic("kaboom")
+		},
+	}
+}
+
+// TestToolServer_PanicSurvives is the core regression guard for the
+// "build dies on a tool panic" bug: a panicking tool must come back as a normal
+// IsError result (carrying the stack), and the SAME connection must keep
+// serving subsequent calls instead of dropping with a broken pipe.
+func TestToolServer_PanicSurvives(t *testing.T) {
+	ts := make(tool.Set)
+	ts.Add(panicTool())
+	ts.Add(mockTool("echo"))
+	_, _, remote, cleanup := setupPipeline(t, ts)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp, err := remote.Execute(ctx, tool.Request{
+		ToolCallID: "call_boom",
+		ToolName:   "boom",
+		Input:      json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("Execute(boom) err = %v; want nil (panic should become a result)", err)
+	}
+	if !resp.IsError {
+		t.Fatalf("boom resp.IsError = false; want true")
+	}
+	if !strings.Contains(resp.Output, "panicked") {
+		t.Errorf("boom resp.Output = %q; want it to mention the panic", resp.Output)
+	}
+
+	// The connection must still be alive: a follow-up call succeeds.
+	resp, err = remote.Execute(ctx, tool.Request{
+		ToolCallID: "call_after",
+		ToolName:   "echo",
+		Input:      json.RawMessage(`{"input":"alive"}`),
+	})
+	if err != nil {
+		t.Fatalf("Execute(echo) after panic err = %v; connection did not survive", err)
+	}
+	if resp.Output != "echo: alive" {
+		t.Errorf("echo after panic output = %q; want %q", resp.Output, "echo: alive")
+	}
+}
+
 // permissionTool creates a tool that calls AskPermission via the context.
 func permissionTool() tool.Tool {
 	return tool.Tool{

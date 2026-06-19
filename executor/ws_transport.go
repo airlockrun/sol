@@ -2,21 +2,26 @@ package executor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/airlockrun/goai/tool"
 	"github.com/airlockrun/sol/bus"
-	"golang.org/x/net/websocket"
+	"github.com/coder/websocket"
 )
 
 // WSTransport implements Transport using WebSocket.
 type WSTransport struct {
-	conn      *websocket.Conn
-	mu        sync.Mutex
+	conn    *websocket.Conn
+	ctx     context.Context
+	cancel  context.CancelFunc
+	writeMu sync.Mutex
+
 	pending   map[string]chan message
 	pendingMu sync.Mutex
 	nextID    atomic.Uint64
@@ -28,48 +33,32 @@ type WSTransport struct {
 // The URL should be in the format "ws://host:port/ws".
 // Optional headers are sent during the handshake (e.g., Authorization).
 func NewWSTransport(url string, headers ...http.Header) (*WSTransport, error) {
-	cfg, err := websocket.NewConfig(url, "http://localhost")
-	if err != nil {
-		return nil, fmt.Errorf("invalid url: %w", err)
-	}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	opts := &websocket.DialOptions{}
 	if len(headers) > 0 {
-		for key, vals := range headers[0] {
-			for _, v := range vals {
-				cfg.Header.Set(key, v)
-			}
-		}
+		opts.HTTPHeader = headers[0]
 	}
 
-	conn, err := websocket.DialConfig(cfg)
+	conn, _, err := websocket.Dial(ctx, url, opts)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("failed to connect: %w", err)
 	}
+	conn.SetReadLimit(maxWSMessageBytes)
 
 	t := &WSTransport{
 		conn:    conn,
+		ctx:     ctx,
+		cancel:  cancel,
 		pending: make(map[string]chan message),
 		done:    make(chan struct{}),
 	}
 
-	// Start reader goroutine
 	go t.readLoop()
+	go t.pingLoop()
 
 	return t, nil
-}
-
-// NewWSTransportFromConn creates a WebSocket transport from an existing connection.
-// This is useful when the connection is established by the caller.
-func NewWSTransportFromConn(conn *websocket.Conn) *WSTransport {
-	t := &WSTransport{
-		conn:    conn,
-		pending: make(map[string]chan message),
-		done:    make(chan struct{}),
-	}
-
-	// Start reader goroutine
-	go t.readLoop()
-
-	return t
 }
 
 // Send implements Transport.
@@ -192,10 +181,7 @@ func (t *WSTransport) roundTrip(ctx context.Context, msg message) (message, erro
 		t.pendingMu.Unlock()
 	}()
 
-	t.mu.Lock()
-	err := websocket.JSON.Send(t.conn, msg)
-	t.mu.Unlock()
-	if err != nil {
+	if err := t.writeMsg(ctx, msg); err != nil {
 		return message{}, fmt.Errorf("failed to send: %w", err)
 	}
 
@@ -209,15 +195,33 @@ func (t *WSTransport) roundTrip(ctx context.Context, msg message) (message, erro
 	}
 }
 
+// writeMsg serializes and writes a message under the write lock (coder/websocket
+// forbids concurrent data writes).
+func (t *WSTransport) writeMsg(ctx context.Context, msg message) error {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	wctx, cancel := context.WithTimeout(ctx, wsWriteTimeout)
+	defer cancel()
+	return t.conn.Write(wctx, websocket.MessageText, data)
+}
+
 // readLoop reads messages from the WebSocket and dispatches responses.
 func (t *WSTransport) readLoop() {
 	defer close(t.done)
+	defer t.cancel()
 
 	for {
+		_, data, err := t.conn.Read(t.ctx)
+		if err != nil {
+			return // connection closed or error
+		}
 		var msg message
-		if err := websocket.JSON.Receive(t.conn, &msg); err != nil {
-			// Connection closed or error
-			return
+		if err := json.Unmarshal(data, &msg); err != nil {
+			continue
 		}
 
 		// Dispatch response to pending request by ID
@@ -234,10 +238,34 @@ func (t *WSTransport) readLoop() {
 	}
 }
 
+// pingLoop keeps the connection alive and surfaces a dead server: a failed
+// ping cancels the context, which unblocks readLoop and closes the transport.
+func (t *WSTransport) pingLoop() {
+	ticker := time.NewTicker(wsPingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-t.ctx.Done():
+			return
+		case <-t.done:
+			return
+		case <-ticker.C:
+			pctx, cancel := context.WithTimeout(t.ctx, wsWriteTimeout)
+			err := t.conn.Ping(pctx)
+			cancel()
+			if err != nil {
+				t.cancel()
+				return
+			}
+		}
+	}
+}
+
 // Close implements Transport.
 func (t *WSTransport) Close() error {
 	if t.closed.Swap(true) {
 		return nil // Already closed
 	}
-	return t.conn.Close()
+	t.cancel()
+	return t.conn.Close(websocket.StatusNormalClosure, "")
 }

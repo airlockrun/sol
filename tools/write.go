@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/airlockrun/goai/tool"
 	"github.com/airlockrun/sol/toolutil"
@@ -123,6 +124,8 @@ Usage:
 				Metadata: map[string]any{
 					"filepath": filePath,
 					"exists":   exists,
+					"created":  !exists,
+					"lines":    strings.Count(args.Content, "\n") + 1,
 				},
 			}, nil
 		}).
