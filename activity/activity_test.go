@@ -9,6 +9,7 @@ func TestSummarize(t *testing.T) {
 	tests := []struct {
 		name      string
 		tool      string
+		input     json.RawMessage
 		title     string
 		meta      map[string]any
 		output    string
@@ -53,7 +54,13 @@ func TestSummarize(t *testing.T) {
 			wantKind: KindSearch, wantLabel: "Finding files: src", wantLog: "[glob] src (1 match)",
 		},
 		{
-			name: "bash", tool: "bash", title: "List files", output: "a.go\nb.go\n",
+			name: "bash command", tool: "bash",
+			input: json.RawMessage(`{"command":"templ generate","description":"Generate templates"}`),
+			title: "Generate templates", output: "ok\n",
+			wantKind: KindCommand, wantLabel: "Running: templ generate", wantLog: "[bash] templ generate → ok",
+		},
+		{
+			name: "bash fallback to description", tool: "bash", title: "List files", output: "a.go\nb.go\n",
 			wantKind: KindCommand, wantLabel: "Running: List files", wantLog: "[bash] List files → a.go",
 		},
 		{
@@ -83,7 +90,7 @@ func TestSummarize(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			a := Summarize(tt.tool, nil, tt.title, tt.meta, tt.output, tt.outcome)
+			a := Summarize(tt.tool, tt.input, tt.title, tt.meta, tt.output, tt.outcome)
 			if tt.wantKind != "" && a.Kind != tt.wantKind {
 				t.Errorf("Kind = %q, want %q", a.Kind, tt.wantKind)
 			}

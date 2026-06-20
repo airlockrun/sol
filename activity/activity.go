@@ -65,9 +65,14 @@ func Summarize(toolName string, input json.RawMessage, title string, metadata ma
 	switch toolName {
 	case "bash":
 		a.Kind = KindCommand
-		if title != "" {
+		// Prefer the actual command from the input; fall back to the tool's
+		// description (Result.Title) when it's somehow absent.
+		switch cmd := firstLine(stringFromInput(input, "command"), detailMax); {
+		case cmd != "":
+			a.Label = "Running: " + cmd
+		case title != "":
 			a.Label = "Running: " + title
-		} else {
+		default:
 			a.Label = "Running command"
 		}
 		a.Detail = firstLine(output, detailMax)
@@ -157,6 +162,20 @@ func searchPrefix(toolName string) string {
 		return "glob"
 	}
 	return "grep"
+}
+
+// stringFromInput pulls a top-level string field out of a tool call's raw
+// JSON input. Returns "" on missing key or unparseable input.
+func stringFromInput(input json.RawMessage, key string) string {
+	if len(input) == 0 {
+		return ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal(input, &m); err != nil {
+		return ""
+	}
+	s, _ := m[key].(string)
+	return s
 }
 
 func firstLine(s string, max int) string {
