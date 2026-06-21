@@ -50,10 +50,9 @@ func TestAllProvidersMergesOverlay(t *testing.T) {
 
 	// Capability union: openai should have Transcription + Speech (from
 	// goai-supplied gpt-4o-transcribe / tts-1 entries that AllProviders
-	// synthesizes) and Search (from overlay ExtraCapabilities → Responses
+	// synthesizes) and Search (derived from its SearchBackend → Responses
 	// API web_search).
-	ov := Overlay["openai"]
-	caps := ProviderCapabilities(openai, ov.ExtraCapabilities)
+	caps := ProviderCapabilities(openai)
 	if !caps.Transcription {
 		t.Error("post-merge openai should have Transcription capability (from gpt-4o-transcribe / whisper-1)")
 	}
@@ -61,6 +60,6 @@ func TestAllProvidersMergesOverlay(t *testing.T) {
 		t.Error("post-merge openai should have Speech capability (from tts-1)")
 	}
 	if !caps.Search {
-		t.Error("post-merge openai should have Search capability (overlay Responses API web_search)")
+		t.Error("post-merge openai should have Search capability (SearchBackend → Responses API web_search)")
 	}
 }
