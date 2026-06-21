@@ -1,33 +1,31 @@
 package provider
 
-// AllProviders returns the full provider catalog: models.dev data merged
-// with the hand-maintained Overlay AND goai's typed kind lists. Callers
-// that want the live models.dev map unmodified should call LoadProviders
-// directly.
+// AllProviders returns the full provider catalog: models.dev data enriched
+// with hand-maintained extras (search-only provider stubs, goai's typed kind
+// lists, name-based + OpenRouter embedding classification). Callers that want
+// the live models.dev map unmodified should call LoadProviders directly.
 //
 // Deprecated models (Status == "deprecated" per models.dev) are dropped
 // before the goai merge so they don't surface in pickers / catalogs.
 // Runtime lookups via GetModelInfo go through LoadProviders directly and
 // so still resolve — agents configured on a now-deprecated model keep
-// running, they're just hidden from the agent-create dropdown going
-// forward. Overlay-supplied ExtraModels with Status="deprecated" are
-// also filtered for consistency.
+// running, they're just hidden from the agent-create dropdown going forward.
 //
 // Merge semantics, in order:
 //
 //  1. Start from models.dev's LoadProviders() result.
-//  2. Layer Overlay: providers in both sources merge ExtraModels into the
-//     Models map (overlay wins on key collisions). Providers only in
-//     Overlay (e.g. brave) get a synthesized stub.
+//  2. Synthesize stubs for search-only providers absent from models.dev
+//     (e.g. brave). Their search capability is derived from SearchBackend.
 //  3. Drop deprecated entries from every provider in the merged set.
 //  4. Layer goai: for each provider goai has typed-list coverage for
 //     (see goaiProviderFactories), stamp ModelInfo.Kind on existing
 //     entries and synthesize new ModelInfo for goai-listed IDs that
-//     models.dev doesn't ship (e.g. openai's whisper-1, tts-1 — which is
-//     why we no longer carry them in Overlay.ExtraModels). Goai is
+//     models.dev doesn't ship (e.g. openai's whisper-1, tts-1). Goai is
 //     authoritative for Kind; modalities, cost, and limits come from
 //     whichever source has them (models.dev wins, kind-derived defaults
 //     fall in for the rest).
+//  5. Name-based embedding classification (any model id/name with "embed").
+//  6. Merge OpenRouter's dedicated embeddings catalog (openrouter.go).
 //
 // The returned map's inner *ModelsDevProvider pointers are clones whenever
 // we touched the provider, so callers can mutate top-level safely. Caches
@@ -38,35 +36,23 @@ func AllProviders() (map[string]*ModelsDevProvider, error) {
 		return nil, err
 	}
 
-	out := make(map[string]*ModelsDevProvider, len(base)+len(Overlay))
+	out := make(map[string]*ModelsDevProvider, len(base)+len(searchOnlyProviders))
 	for id, p := range base {
 		out[id] = p
 	}
 
-	// Step 2: overlay merge.
-	for id, ov := range Overlay {
-		existing, ok := out[id]
-		if !ok {
-			// Provider isn't in models.dev at all — synthesize a stub.
-			stub := &ModelsDevProvider{
-				ID:     id,
-				Name:   ov.DisplayName,
-				Models: map[string]ModelInfo{},
-			}
-			for _, em := range ov.ExtraModels {
-				stub.Models[em.ID] = em
-			}
-			out[id] = stub
+	// Step 2: synthesize stubs for search-only providers that models.dev
+	// doesn't list at all (e.g. Brave), so they still surface as configurable
+	// providers. Their "search" capability is derived later from SearchBackend.
+	for id, displayName := range searchOnlyProviders {
+		if _, ok := out[id]; ok {
 			continue
 		}
-		if len(ov.ExtraModels) == 0 {
-			continue
+		out[id] = &ModelsDevProvider{
+			ID:     id,
+			Name:   displayName,
+			Models: map[string]ModelInfo{},
 		}
-		clone := cloneProvider(existing)
-		for _, em := range ov.ExtraModels {
-			clone.Models[em.ID] = em
-		}
-		out[id] = clone
 	}
 
 	// Step 3: drop deprecated models. We iterate every provider in the
@@ -167,6 +153,14 @@ func AllProviders() (map[string]*ModelsDevProvider, error) {
 		}
 		out[id] = clone
 	}
+
+	// Step 6: OpenRouter embeddings. OpenRouter keeps its embedding models on a
+	// separate endpoint absent from both models.dev and OpenRouter's own
+	// /models list, so fetch them (cached, non-blocking) and merge additively
+	// into the openrouter provider as Kind=embedding. Many of them (gte, e5,
+	// sentence-transformers, …) have no "embed" in the name, so Step 5 can't
+	// catch them — this dedicated source is the only reliable one.
+	mergeOpenRouterEmbeddings(out, openRouterEmbeddingModels())
 
 	return out, nil
 }

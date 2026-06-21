@@ -19,9 +19,9 @@ import (
 // standalone Sol CLI and the build-time sol runner where there's no DB.
 func WebSearch(llmProvider, llmAPIKey string) (tool.Tool, bool) {
 	// 1. Can the LLM provider also do search? Reuse the same key.
-	if ov, ok := solprovider.Overlay[llmProvider]; ok && ov.SearchBackend != "" {
+	if backend := solprovider.SearchBackend(llmProvider); backend != "" {
 		return websearch.NewTool(websearch.NewClient(websearch.Options{
-			Provider: ov.SearchBackend,
+			Provider: backend,
 			APIKey:   llmAPIKey,
 		})), true
 	}

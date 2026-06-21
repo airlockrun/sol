@@ -155,27 +155,26 @@ func TestProviderCapabilities(t *testing.T) {
 	}}
 
 	tests := []struct {
-		name   string
-		p      *ModelsDevProvider
-		extras []string
-		want   CapabilitySet
+		name string
+		p    *ModelsDevProvider
+		want CapabilitySet
 	}{
 		{
-			name:   "nil provider + search extra",
-			p:      nil,
-			extras: []string{CapSearch},
-			want:   CapabilitySet{Search: true},
+			name: "nil provider",
+			p:    nil,
+			want: CapabilitySet{},
 		},
 		{
-			name: "single text model",
-			p: &ModelsDevProvider{Models: map[string]ModelInfo{
+			// "nosearch" is not in searchBackends, so no Search is added.
+			name: "single text model, no search backend",
+			p: &ModelsDevProvider{ID: "nosearch", Models: map[string]ModelInfo{
 				"a": textModel,
 			}},
 			want: CapabilitySet{Text: true},
 		},
 		{
 			name: "multi-model union",
-			p: &ModelsDevProvider{Models: map[string]ModelInfo{
+			p: &ModelsDevProvider{ID: "nosearch", Models: map[string]ModelInfo{
 				"a": textModel,
 				"b": visionModel,
 				"c": imgGenModel,
@@ -183,33 +182,29 @@ func TestProviderCapabilities(t *testing.T) {
 			want: CapabilitySet{Text: true, Vision: true, ImageGen: true},
 		},
 		{
-			name: "model union + search overlay",
-			p: &ModelsDevProvider{Models: map[string]ModelInfo{
-				"a": visionModel, // has text+image in, text out → text + vision
+			// "openai" has a SearchBackend, so Search is OR'd in.
+			name: "model union + search from backend",
+			p: &ModelsDevProvider{ID: "openai", Models: map[string]ModelInfo{
+				"a": visionModel, // text+image in, text out → text + vision
 			}},
-			extras: []string{CapSearch},
-			want:   CapabilitySet{Text: true, Vision: true, Search: true},
+			want: CapabilitySet{Text: true, Vision: true, Search: true},
 		},
 		{
-			name:   "empty provider + no extras = empty set",
-			p:      &ModelsDevProvider{Models: map[string]ModelInfo{}},
-			extras: nil,
-			want:   CapabilitySet{},
+			// brave: a search-only provider stub (no models).
+			name: "search-only provider, no models",
+			p:    &ModelsDevProvider{ID: "brave", Models: map[string]ModelInfo{}},
+			want: CapabilitySet{Search: true},
 		},
 		{
-			name: "extras override missing modalities",
-			p:    &ModelsDevProvider{Models: map[string]ModelInfo{}},
-			// Overlay can, in theory, declare any capability. We don't use
-			// this for text/vision/etc. today, but the OR semantics must
-			// hold so the field is unambiguous.
-			extras: []string{CapText, CapSearch},
-			want:   CapabilitySet{Text: true, Search: true},
+			name: "empty non-search provider = empty set",
+			p:    &ModelsDevProvider{ID: "nosearch", Models: map[string]ModelInfo{}},
+			want: CapabilitySet{},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := ProviderCapabilities(tt.p, tt.extras)
+			got := ProviderCapabilities(tt.p)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("ProviderCapabilities() = %+v, want %+v", got, tt.want)
 			}

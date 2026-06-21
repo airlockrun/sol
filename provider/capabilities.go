@@ -152,47 +152,30 @@ func CapabilitiesFromModel(m ModelInfo) CapabilitySet {
 	return cs
 }
 
-// ProviderCapabilities unions ModelCapabilities across every model in the
-// provider and then ORs in extras (capabilities that aren't derivable from
-// any single model's modalities, such as "search"). Callers typically pass
-// Overlay[providerID].ExtraCapabilities as extras.
+// ProviderCapabilities unions per-model capabilities across every model in the
+// provider, then ORs in "search" when the provider has a web-search backend
+// (SearchBackend). Search is a provider feature, not derivable from any single
+// model's modalities, so it's the one capability sourced outside the models.
 //
-// It's valid for a provider to have no models — e.g. brave, which is only
-// represented via Overlay. In that case the result is whatever the extras
-// declare.
-func ProviderCapabilities(p *ModelsDevProvider, extras []string) CapabilitySet {
+// A provider with no models is valid — e.g. brave, a search-only stub — in
+// which case the result is just its search capability.
+func ProviderCapabilities(p *ModelsDevProvider) CapabilitySet {
 	var cs CapabilitySet
-	if p != nil {
-		for _, m := range p.Models {
-			mc := CapabilitiesFromModel(m)
-			cs.Text = cs.Text || mc.Text
-			cs.Vision = cs.Vision || mc.Vision
-			cs.ImageGen = cs.ImageGen || mc.ImageGen
-			cs.Embedding = cs.Embedding || mc.Embedding
-			cs.Speech = cs.Speech || mc.Speech
-			cs.Transcription = cs.Transcription || mc.Transcription
-			cs.Reranking = cs.Reranking || mc.Reranking
-		}
+	if p == nil {
+		return cs
 	}
-	for _, cap := range extras {
-		switch cap {
-		case CapText:
-			cs.Text = true
-		case CapVision:
-			cs.Vision = true
-		case CapImageGen:
-			cs.ImageGen = true
-		case CapSearch:
-			cs.Search = true
-		case CapEmbedding:
-			cs.Embedding = true
-		case CapSpeech:
-			cs.Speech = true
-		case CapTranscription:
-			cs.Transcription = true
-		case CapReranking:
-			cs.Reranking = true
-		}
+	for _, m := range p.Models {
+		mc := CapabilitiesFromModel(m)
+		cs.Text = cs.Text || mc.Text
+		cs.Vision = cs.Vision || mc.Vision
+		cs.ImageGen = cs.ImageGen || mc.ImageGen
+		cs.Embedding = cs.Embedding || mc.Embedding
+		cs.Speech = cs.Speech || mc.Speech
+		cs.Transcription = cs.Transcription || mc.Transcription
+		cs.Reranking = cs.Reranking || mc.Reranking
+	}
+	if SearchBackend(p.ID) != "" {
+		cs.Search = true
 	}
 	return cs
 }

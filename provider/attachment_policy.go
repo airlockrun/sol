@@ -44,9 +44,9 @@ var DefaultAttachmentPolicy = AttachmentPolicy{
 	SupportsURL:         false,
 }
 
-// AttachmentOverlay is the per-provider override map. Keyed by provider_id
-// (same as Overlay above). Values are applied as-is — not merged with
-// DefaultAttachmentPolicy — so each entry must be complete.
+// AttachmentOverlay is the per-provider override map, keyed by provider_id.
+// Values are applied as-is — not merged with DefaultAttachmentPolicy — so each
+// entry must be complete.
 //
 // Covered: every provider in goai whose message conversion accepts a
 // message.FilePart carrying a URL data variant.
