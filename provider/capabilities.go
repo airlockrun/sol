@@ -1,5 +1,7 @@
 package provider
 
+import "strings"
+
 // ModelKind classifies a model by its primary purpose. Sourced from goai's
 // per-provider typed lists (Models / EmbeddingModels / ImageModels /
 // SpeechModels / TranscriptionModels / RerankingModels). Empty means sol
@@ -89,18 +91,29 @@ func (c CapabilitySet) List() []string {
 // Search is never set at the model level — it's a provider capability (see
 // ProviderCapabilities).
 //
-// Kind-derived caps fire whenever Kind is set; modality-derived caps fire
-// independently — a Kind=Language model with image input still gets Vision.
-// Modality-only classification is the fallback for catalog entries from
-// providers without goai typed-list coverage.
+// Embedding is special-cased and detected by NAME: models.dev exposes no
+// embedding modality or type, so an embedding model is indistinguishable from
+// a text→text model by its catalog entry. Any model whose id/name contains
+// "embed" is treated as embedding-only — it must not also report text, or it
+// would surface as a chat model and land in the text/build/exec pickers.
+// AllProviders() stamps Kind=embedding for the same models (the picker-grouping
+// axis); this name check keeps the pure function correct on its own. A false
+// positive (a chat model named "…embed…") just errors when called the wrong
+// way at runtime — an acceptable trade for zero hand-maintained lists.
+//
+// Other kind-derived caps fire whenever Kind is set; modality-derived caps
+// fire independently — a Kind=Language model with image input still gets
+// Vision. Modality-only classification is the fallback for catalog entries
+// from providers without goai typed-list coverage.
 func CapabilitiesFromModel(m ModelInfo) CapabilitySet {
-	var cs CapabilitySet
+	if m.Kind == KindEmbedding || isEmbeddingModel(m.ID, m.Name) {
+		return CapabilitySet{Embedding: true}
+	}
 
+	var cs CapabilitySet
 	switch m.Kind {
 	case KindLanguage:
 		cs.Text = true
-	case KindEmbedding:
-		cs.Embedding = true
 	case KindImage:
 		cs.ImageGen = true
 	case KindSpeech:
@@ -182,6 +195,18 @@ func ProviderCapabilities(p *ModelsDevProvider, extras []string) CapabilitySet {
 		}
 	}
 	return cs
+}
+
+// isEmbeddingModel reports whether a model is an embedding model, detected
+// purely by its id or name containing "embed" (case-insensitive). models.dev
+// exposes no embedding modality or type, so the name is the only signal that
+// works across every provider; goai's per-provider EmbeddingModels() lists are
+// a redundant subset of this. A false positive surfaces as a runtime error
+// when the model is invoked as a chat (or the Embed call returns non-vector
+// output) — an acceptable trade for not hand-maintaining lists.
+func isEmbeddingModel(id, name string) bool {
+	return strings.Contains(strings.ToLower(id), "embed") ||
+		strings.Contains(strings.ToLower(name), "embed")
 }
 
 func containsStr(haystack []string, needle string) bool {

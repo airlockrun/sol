@@ -139,6 +139,35 @@ func AllProviders() (map[string]*ModelsDevProvider, error) {
 		}
 	}
 
+	// Step 5: name-based embedding classification. models.dev exposes no
+	// embedding modality or type, so an embedding model is indistinguishable
+	// from a text→text model by its catalog entry. Rather than hand-curate
+	// per-provider lists, treat any model whose id/name contains "embed" as an
+	// embedding model — giving embedding coverage across every provider. Name
+	// is authoritative (no non-embedding model is named "embed"); a rare false
+	// positive just errors when called. Clone only providers we touch so
+	// LoadProviders' cache stays intact.
+	for id, p := range out {
+		needs := false
+		for _, m := range p.Models {
+			if m.Kind != KindEmbedding && isEmbeddingModel(m.ID, m.Name) {
+				needs = true
+				break
+			}
+		}
+		if !needs {
+			continue
+		}
+		clone := cloneProvider(p)
+		for mid, m := range clone.Models {
+			if isEmbeddingModel(m.ID, m.Name) {
+				m.Kind = KindEmbedding
+				clone.Models[mid] = m
+			}
+		}
+		out[id] = clone
+	}
+
 	return out, nil
 }
 
