@@ -137,6 +137,16 @@ var providerFactories = map[string]providerFactory{
 	"huggingface": func(o Options) provider.Provider {
 		return huggingface.New(huggingface.Options{APIKey: o.APIKey, BaseURL: o.BaseURL})
 	},
+	// OpenRouter is an OpenAI-compatible gateway with no dedicated goai
+	// package; route it through openaicompat (/chat/completions), defaulting
+	// to its API root so it never falls through to api.openai.com.
+	"openrouter": func(o Options) provider.Provider {
+		baseURL := o.BaseURL
+		if baseURL == "" {
+			baseURL = OpenRouterBaseURL
+		}
+		return newOpenAICompatProvider("openrouter", baseURL, o.APIKey)
+	},
 
 	// Speech / audio / image providers.
 	"elevenlabs": func(o Options) provider.Provider {
@@ -160,14 +170,23 @@ var providerFactories = map[string]providerFactory{
 	},
 }
 
-// createProvider instantiates a goai provider by ID. Unknown providers
-// fall back to the openai package — preserves backward compatibility,
-// but providers in providerFactories above are dispatched correctly.
+// createProvider instantiates a goai provider by ID. A provider with no
+// dedicated factory above is treated as OpenAI-compatible (the common case for
+// gateways): it routes through openaicompat's /chat/completions wire format at
+// the configured base URL, falling back to the provider's models.dev API root.
+// It must NOT fall through to the openai package — that speaks the Responses
+// API at api.openai.com and would send a foreign API key to OpenAI.
 func createProvider(providerID string, opts Options) provider.Provider {
 	if f, ok := providerFactories[providerID]; ok {
 		return f(opts)
 	}
-	return openai.New(provider.Options{APIKey: opts.APIKey, BaseURL: opts.BaseURL})
+	baseURL := opts.BaseURL
+	if baseURL == "" {
+		if info, ok := GetProviderInfo(providerID); ok {
+			baseURL = strings.TrimRight(info.API, "/")
+		}
+	}
+	return newOpenAICompatProvider(providerID, baseURL, opts.APIKey)
 }
 
 // CreateImageModel creates an image generation model from provider and model IDs.
