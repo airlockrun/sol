@@ -134,15 +134,23 @@ Usage:
 				result.WriteString(fmt.Sprintf("%05d| %s\n", lineNum, line))
 			}
 
-			// Add footer message (matching opencode format)
+			// Footer mirrors opencode: surface the visible line range and the
+			// exact offset to continue from, so the model paginates a truncated
+			// file instead of proceeding on a partial read. offset is 0-based,
+			// so the next chunk starts at offset+len(raw) — the line right after
+			// the last one shown.
 			lastReadLine := offset + len(raw)
+			firstLine := offset + 1
 			hasMoreLines := totalLines > lastReadLine
 
-			if truncatedByBytes {
-				result.WriteString(fmt.Sprintf("\n(Output truncated at %d bytes. Use 'offset' parameter to read beyond line %d)", maxReadBytes, lastReadLine))
-			} else if hasMoreLines {
-				result.WriteString(fmt.Sprintf("\n(File has more lines. Use 'offset' parameter to read beyond line %d)", lastReadLine))
-			} else {
+			switch {
+			case truncatedByBytes:
+				result.WriteString(fmt.Sprintf("\n(Output capped at %d KB. Showing lines %d-%d. Use offset=%d to continue.)",
+					maxReadBytes/1024, firstLine, lastReadLine, lastReadLine))
+			case hasMoreLines:
+				result.WriteString(fmt.Sprintf("\n(Showing lines %d-%d of %d. Use offset=%d to continue.)",
+					firstLine, lastReadLine, totalLines, lastReadLine))
+			default:
 				result.WriteString(fmt.Sprintf("\n(End of file - total %d lines)", totalLines))
 			}
 			result.WriteString("\n</file>")
