@@ -1434,6 +1434,22 @@ func (r *Runner) RunUntilExit(ctx context.Context, prompt string, opts RunUntilE
 		return out, err
 	}
 
+	// Continue scopes its RunResult (Steps, Usage, TotalText) to that nudge
+	// segment alone. Accumulate across the initial run and every nudge so the
+	// returned result reflects the whole interaction — otherwise a run that
+	// needed a nudge reports only the last segment's tokens to the caller (and
+	// to the LLM-usage ledger), undercounting badly.
+	steps := append([]*StepResult(nil), result.Steps...)
+	totalText := result.TotalText
+	aggregate := func() {
+		if out.RunResult == nil {
+			return
+		}
+		out.RunResult.Steps = steps
+		out.RunResult.TotalText = totalText
+		out.RunResult.Usage = sumStepsUsage(steps)
+	}
+
 	// Re-drive only when the underlying run terminated normally without
 	// the agent calling exit. Failures, cancellations, and suspensions
 	// pass through unchanged.
@@ -1441,11 +1457,17 @@ func (r *Runner) RunUntilExit(ctx context.Context, prompt string, opts RunUntilE
 		out.Nudges = nudge + 1
 		result, err = r.Continue(ctx, nudgeMsg)
 		out.RunResult = result
+		if result != nil {
+			steps = append(steps, result.Steps...)
+			totalText += result.TotalText
+		}
 		if err != nil {
+			aggregate()
 			return out, err
 		}
 	}
 
+	aggregate()
 	return out, nil
 }
 
