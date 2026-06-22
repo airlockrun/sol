@@ -44,11 +44,12 @@ func TestReadTool_TruncatesByBytes(t *testing.T) {
 
 	result := executeReadTool(t, ReadInput{FilePath: largePath})
 
-	if !strings.Contains(result, "Output truncated at") {
-		t.Errorf("expected truncation message for large file, got:\n%s", result[max(0, len(result)-500):])
+	if !strings.Contains(result, "Output capped at") {
+		t.Errorf("expected byte-cap message for large file, got:\n%s", result[max(0, len(result)-500):])
 	}
-	if !strings.Contains(result, "bytes") {
-		t.Error("expected bytes truncation message")
+	// The footer must hand the model an explicit offset to continue from.
+	if !strings.Contains(result, "Use offset=") {
+		t.Error("expected an explicit 'Use offset=' continuation hint")
 	}
 }
 
@@ -67,8 +68,12 @@ func TestReadTool_TruncatesByLineCount(t *testing.T) {
 
 	result := executeReadTool(t, ReadInput{FilePath: manyLinesPath, Limit: 10})
 
-	if !strings.Contains(result, "File has more lines") {
-		t.Error("expected 'File has more lines' message")
+	// 10 of 100 lines shown, with the offset to continue from line 10 (0-based).
+	if !strings.Contains(result, "Showing lines 1-10 of 100") {
+		t.Errorf("expected 'Showing lines 1-10 of 100' range, got:\n%s", result[max(0, len(result)-300):])
+	}
+	if !strings.Contains(result, "Use offset=10 to continue.") {
+		t.Error("expected 'Use offset=10 to continue.' hint")
 	}
 	if !strings.Contains(result, "line0") {
 		t.Error("expected first line to be present")
