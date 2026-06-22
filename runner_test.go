@@ -242,6 +242,52 @@ func TestRunner_RunWithInitialMessages_ThenContinue(t *testing.T) {
 	}
 }
 
+// TestRunUntilExit_AccumulatesUsageAcrossNudges guards against the ledger
+// undercount: when the model stops without calling exit, RunUntilExit nudges
+// (a fresh Continue), and the returned result must reflect the WHOLE
+// interaction's usage — not just the final nudge segment.
+func TestRunUntilExit_AccumulatesUsageAcrossNudges(t *testing.T) {
+	mockModel := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
+		StreamResponses: [][]stream.Event{
+			// First run: model produces text but doesn't call exit → nudge.
+			testutil.MockTextResponse("draft done", testutil.MockUsage(10, 5)),
+			// Nudge: model calls exit.
+			testutil.MockToolCallResponse("call_exit", "exit",
+				map[string]string{"status": "success", "message": "done"}, testutil.MockUsage(7, 3)),
+		},
+	})
+
+	exitState := &tools.ExitState{}
+	runner := NewRunner(RunnerOptions{
+		Agent:     testAgent(tool.Set{}),
+		Model:     mockModel,
+		Quiet:     true,
+		ExitState: exitState,
+	})
+	runner.PermissionManager().SetRules([]bus.PermissionRule{{Permission: "*", Pattern: "*", Action: "allow"}})
+
+	out, err := runner.RunUntilExit(context.Background(), "build it", RunUntilExitOptions{MaxNudges: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exitState.Called() {
+		t.Fatal("exit should have been called after the nudge")
+	}
+	if out.Nudges != 1 {
+		t.Fatalf("Nudges = %d, want 1 (a nudge must have happened to exercise the bug)", out.Nudges)
+	}
+
+	in, outTok := out.RunResult.Usage.InputTokens.Total, out.RunResult.Usage.OutputTokens.Total
+	if in == nil || outTok == nil {
+		t.Fatalf("usage totals missing: %+v", out.RunResult.Usage)
+	}
+	// 10+7 input, 5+3 output across the run and the nudge. The pre-fix bug
+	// reported only the nudge segment (7 in / 3 out).
+	if *in != 17 || *outTok != 8 {
+		t.Errorf("aggregated usage = in:%d out:%d, want in:17 out:8", *in, *outTok)
+	}
+}
+
 func TestRunner_RunWithInitialMessages_EmptyPrompt(t *testing.T) {
 	mockModel := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
 		StreamResponse: testutil.MockTextResponse("resumed!", testutil.MockUsage(10, 5)),
