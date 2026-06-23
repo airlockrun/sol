@@ -1,8 +1,54 @@
 package tools
 
 import (
+	"context"
+	"encoding/json"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/airlockrun/goai/tool"
+	"github.com/airlockrun/sol/bus"
 )
+
+// allowAllCtx returns a context carrying a PermissionManager that auto-approves
+// every request, so Execute runs the command instead of returning
+// ErrPermissionNeeded.
+func allowAllCtx() context.Context {
+	pm := bus.NewPermissionManager(bus.New())
+	pm.AddRule(bus.PermissionRule{Permission: "*", Pattern: "*", Action: "allow"})
+	return bus.WithPermissionManager(context.Background(), pm)
+}
+
+// TestBash_TimeoutKillsCommand verifies that a command exceeding its timeout is
+// terminated promptly — well before the command would finish on its own — and
+// that the timeout note is surfaced in the output. This guards the process-group
+// kill + WaitDelay backstop: without them a `sleep 30` (or a hung test binary)
+// would keep Run blocked past the deadline.
+func TestBash_TimeoutKillsCommand(t *testing.T) {
+	bashTool := Bash(t.TempDir())
+
+	input, _ := json.Marshal(BashInput{
+		Command:     "sleep 30",
+		Timeout:     500, // ms
+		Description: "sleep that outlives its timeout",
+	})
+
+	start := time.Now()
+	result, err := bashTool.Execute(allowAllCtx(), input, tool.CallOptions{})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	// 500ms timeout + 5s WaitDelay ⇒ must return far below the 30s sleep.
+	if elapsed > 20*time.Second {
+		t.Errorf("Execute took %v — timeout did not release the command", elapsed)
+	}
+	if !strings.Contains(result.Output, "exceeding timeout") {
+		t.Errorf("output missing timeout note, got: %q", result.Output)
+	}
+}
 
 func TestExtractCommandPattern(t *testing.T) {
 	tests := []struct {

@@ -16,7 +16,14 @@ import (
 )
 
 const (
-	defaultBashTimeout = 2 * 60 * 1000 // 2 minutes in ms
+	defaultBashTimeout = 45 * 1000 // 45 seconds in ms
+
+	// bashWaitDelay bounds how long Run waits after the timeout fires
+	// before force-closing the command's I/O pipes. Without it, a killed
+	// command whose descendants inherited stdout/stderr keeps Run blocked
+	// until those descendants exit — so the timeout would not actually
+	// release the tool call. See Bash for the matching process-group kill.
+	bashWaitDelay = 5 * time.Second
 )
 
 // patchParamDescription replaces the description of a property in a JSON Schema.
@@ -259,7 +266,7 @@ Before executing the command, please follow these steps:
 
 Usage notes:
   - The command argument is required.
-  - You can specify an optional timeout in milliseconds. If not specified, commands will time out after 120000ms (2 minutes).
+  - You can specify an optional timeout in milliseconds. If not specified, commands will time out after 45000ms (45 seconds). When the timeout fires the whole process tree is killed. Long-running commands (go build, go test, dependency installs) WILL exceed the default; pass a larger timeout for those (e.g. 300000 for a five-minute build).
   - It is very helpful if you write a clear, concise description of what this command does in 5-10 words.
   - If the output exceeds 2000 lines or 51200 bytes, it will be truncated and the full output will be written to a file. You can use Read with offset/limit to read specific sections or Grep to search the full content. Because of this, you do NOT need to use ` + "`head`" + `, ` + "`tail`" + `, or other truncation commands to limit output - just run the command directly.
 
@@ -437,6 +444,12 @@ Important:
 
 			cmd := exec.CommandContext(execCtx, "bash", "-c", args.Command)
 			cmd.Dir = effectiveWorkDir
+			// Run the command in its own process group and SIGKILL the
+			// whole group when execCtx fires, so descendants (a hung
+			// `go test` binary, a child server) die with it instead of
+			// being orphaned. WaitDelay backstops the pipe-holding case.
+			configureProcAttr(cmd)
+			cmd.WaitDelay = bashWaitDelay
 
 			var stdout, stderr bytes.Buffer
 			cmd.Stdout = &stdout
