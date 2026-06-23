@@ -168,9 +168,12 @@ Usage:
 		Build()
 }
 
-// isBinaryByExtension checks if a file is binary based on its extension
-func isBinaryByExtension(filepath string) bool {
-	ext := strings.ToLower(strings.TrimPrefix(filepath[strings.LastIndex(filepath, "."):], "."))
+// isBinaryByExtension checks if a file is binary based on its extension.
+// Uses filepath.Ext so an extensionless path (Dockerfile, Makefile, LICENSE)
+// yields "" rather than panicking — LastIndex returns -1 for a path with no
+// dot, and the old path[-1:] slice blew up on exactly those files.
+func isBinaryByExtension(p string) bool {
+	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(p), "."))
 	switch ext {
 	case "zip", "tar", "gz", "exe", "dll", "so", "class", "jar", "war",
 		"7z", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp",

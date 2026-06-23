@@ -27,6 +27,21 @@ func executeReadTool(t *testing.T, input ReadInput) string {
 	return result.Output
 }
 
+// TestReadTool_ExtensionlessFile guards the isBinaryByExtension panic: a path
+// with no "." (Dockerfile, Makefile, LICENSE) made strings.LastIndex return -1
+// and the old path[-1:] slice blew up. Such files are text and must read fine.
+func TestReadTool_ExtensionlessFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	p := filepath.Join(tmpDir, "Dockerfile")
+	if err := os.WriteFile(p, []byte("FROM scratch\nCMD [\"/agent\"]\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	result := executeReadTool(t, ReadInput{FilePath: p})
+	if !strings.Contains(result, "FROM scratch") {
+		t.Errorf("expected Dockerfile contents, got:\n%s", result)
+	}
+}
+
 func TestReadTool_TruncatesByBytes(t *testing.T) {
 	tmpDir := t.TempDir()
 	largePath := filepath.Join(tmpDir, "large.txt")
