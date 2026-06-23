@@ -261,6 +261,43 @@ func TestBuildSkillDescription(t *testing.T) {
 	}
 }
 
+// TestSetSkillScanDirs_AdditiveWithDefaults verifies that a configured skill
+// root is scanned IN ADDITION to the built-in defaults (here, ~/.claude), so
+// platform-provided skills don't shadow workspace discovery.
+func TestSetSkillScanDirs_AdditiveWithDefaults(t *testing.T) {
+	writeSkill := func(dir, name string) {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		body := "---\nname: " + name + "\ndescription: " + name + " desc\n---\n\nbody\n"
+		if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Default discovery via ~/.claude/skills (HOME overridden to a temp dir).
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeSkill(filepath.Join(home, ".claude", "skills", "from-home"), "from-home")
+
+	// An extra configured root (the platform-provided case).
+	extra := t.TempDir()
+	writeSkill(filepath.Join(extra, "skills", "from-extra"), "from-extra")
+
+	skillRegistry = &SkillRegistry{skills: make(map[string]SkillInfo)}
+	SetSkillScanDirs([]string{extra})
+	if err := skillRegistry.Scan(); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+
+	if _, ok := skillRegistry.Get("from-extra"); !ok {
+		t.Error("configured-root skill 'from-extra' not registered")
+	}
+	if _, ok := skillRegistry.Get("from-home"); !ok {
+		t.Error("default ~/.claude skill 'from-home' missing — scan is not additive")
+	}
+}
+
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || strings.Contains(s, substr))
 }
