@@ -38,12 +38,26 @@ type SkillRegistry struct {
 	scanDirs []string // directories to scan for skills
 }
 
-// SetScanDirs sets the directories to scan for skills
+// SetScanDirs sets ADDITIONAL directories to scan for skills, on top of the
+// built-in defaults (cwd/.claude, ~/.claude, …). Each entry is a skill root
+// scanned for <dir>/skills/**/SKILL.md and <dir>/skill/**/SKILL.md. Passing
+// nil clears the extras and falls back to defaults only.
 func (r *SkillRegistry) SetScanDirs(dirs []string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.scanDirs = dirs
 	r.scanned = false // force rescan
+}
+
+// SetSkillScanDirs points the shared skill registry at ADDITIONAL skill roots
+// (in addition to the defaults). The toolserver calls this from its
+// --skills-dir flag / SKILLS_DIRS env so the platform can ship skills outside
+// the agent workspace. Empty input is a no-op.
+func SetSkillScanDirs(dirs []string) {
+	if len(dirs) == 0 {
+		return
+	}
+	skillRegistry.SetScanDirs(dirs)
 }
 
 // Scan discovers all available skills
@@ -57,11 +71,10 @@ func (r *SkillRegistry) Scan() error {
 
 	r.skills = make(map[string]SkillInfo)
 
-	// Build list of directories to scan
-	dirs := r.scanDirs
-	if len(dirs) == 0 {
-		dirs = r.defaultScanDirs()
-	}
+	// Scan the built-in defaults (cwd/.claude, ~/.claude, …) plus any
+	// explicitly-configured roots, so platform-provided skills augment rather
+	// than replace workspace discovery.
+	dirs := append(r.defaultScanDirs(), r.scanDirs...)
 
 	for _, dir := range dirs {
 		if err := r.scanDir(dir); err != nil {

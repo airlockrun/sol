@@ -24,6 +24,7 @@ func main() {
 	addr := flag.String("addr", ":8080", "listen address")
 	spaceDir := flag.String("space-dir", "/home/agent/space", "space directory (overlayfs merged mount)")
 	homeDir := flag.String("home-dir", "", "set HOME environment variable to this path")
+	skillsDir := flag.String("skills-dir", "", "comma-separated extra skill roots (each scanned for skills/**/SKILL.md); overrides the SKILLS_DIRS env var")
 	flag.Parse()
 
 	// Set HOME if specified (container bind-mounts a per-run home directory)
@@ -37,6 +38,22 @@ func main() {
 
 	// Working directory is the space dir itself (overlayfs merged view)
 	workDir := *spaceDir
+
+	// Register additional skill roots before building the tool set: the skill
+	// tool's description/schema snapshot the catalogue at construction, so the
+	// dirs must be set first. --skills-dir (comma-separated) overrides the
+	// SKILLS_DIRS env (OS path-list separated).
+	var skillDirs []string
+	if *skillsDir != "" {
+		for _, d := range strings.Split(*skillsDir, ",") {
+			if d = strings.TrimSpace(d); d != "" {
+				skillDirs = append(skillDirs, d)
+			}
+		}
+	} else if env := os.Getenv("SKILLS_DIRS"); env != "" {
+		skillDirs = filepath.SplitList(env)
+	}
+	tools.SetSkillScanDirs(skillDirs)
 
 	// Start with all tools — airlock sends set_active_tools to filter
 	toolSet := tools.CreateAllTools(workDir)
