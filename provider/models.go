@@ -318,9 +318,10 @@ func refreshOnce(tag string) {
 	if err := saveToCache(providers); err != nil {
 		log.Printf("sol/provider: failed to save models cache: %v", err)
 	}
-	// Refresh OpenRouter's separate embeddings catalog on the same cadence so
-	// the first catalog request after startup already has it. Best-effort.
-	refreshOpenRouterEmbeddingModels()
+	// Warm OpenRouter's modality catalog (embedding/image/speech/transcription,
+	// one request) on the same cadence so the first catalog request after
+	// startup already has it. Best-effort.
+	refreshOpenRouterModels()
 }
 
 // GetProviderInfo returns provider info from the models.dev data

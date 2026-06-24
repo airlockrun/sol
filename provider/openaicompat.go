@@ -18,23 +18,28 @@ const OpenRouterBaseURL = "https://openrouter.ai/api/v1"
 // interface.
 //
 // Text generation routes through openaicompat (POST {base}/chat/completions) —
-// NOT the embedded OpenAI provider, whose default Model() speaks the Responses
-// API (/responses), which these endpoints don't implement. The embedded OpenAI
+// NOT the embedded modality provider, whose default Model() speaks the Responses
+// API (/responses), which these endpoints don't implement. The embedded
 // provider supplies the other modalities (embeddings, image, speech,
-// transcription) at the SAME base URL, since those wire formats are
-// OpenAI-compatible too.
+// transcription) at the SAME base URL; it defaults to the OpenAI provider (whose
+// wire formats are OpenAI-compatible), but a gateway with divergent shapes —
+// OpenRouter's /images and JSON-base64 transcription — passes its own.
 type openAICompatProvider struct {
-	provider.Provider // OpenAI provider at the same base URL — non-text modalities.
+	provider.Provider // modality provider at the same base URL — non-text modalities.
 	id                string
 	compat            *openaicompat.Provider
 }
 
 // newOpenAICompatProvider builds a compat provider for id at baseURL. baseURL
 // must include the version path (e.g. ".../v1"); openaicompat appends
-// "/chat/completions".
-func newOpenAICompatProvider(id, baseURL, apiKey string) *openAICompatProvider {
+// "/chat/completions". modalities supplies non-text models; pass nil to default
+// to the OpenAI provider at the same base URL.
+func newOpenAICompatProvider(id, baseURL, apiKey string, modalities provider.Provider) *openAICompatProvider {
+	if modalities == nil {
+		modalities = openai.New(provider.Options{APIKey: apiKey, BaseURL: baseURL})
+	}
 	return &openAICompatProvider{
-		Provider: openai.New(provider.Options{APIKey: apiKey, BaseURL: baseURL}),
+		Provider: modalities,
 		id:       id,
 		compat: openaicompat.New(openaicompat.Options{
 			ProviderID:                id,

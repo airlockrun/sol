@@ -27,6 +27,7 @@ import (
 	"github.com/airlockrun/goai/provider/luma"
 	"github.com/airlockrun/goai/provider/mistral"
 	"github.com/airlockrun/goai/provider/openai"
+	goaiopenrouter "github.com/airlockrun/goai/provider/openrouter"
 	"github.com/airlockrun/goai/provider/perplexity"
 	"github.com/airlockrun/goai/provider/proxy"
 	"github.com/airlockrun/goai/provider/replicate"
@@ -145,7 +146,11 @@ var providerFactories = map[string]providerFactory{
 		if baseURL == "" {
 			baseURL = OpenRouterBaseURL
 		}
-		return newOpenAICompatProvider("openrouter", baseURL, o.APIKey)
+		// Chat routes through openaicompat; image/speech/transcription use the
+		// dedicated goai openrouter provider, whose wire shapes (POST /images,
+		// JSON-base64 transcription) differ from OpenAI's.
+		return newOpenAICompatProvider("openrouter", baseURL, o.APIKey,
+			goaiopenrouter.New(provider.Options{APIKey: o.APIKey, BaseURL: baseURL}))
 	},
 
 	// Speech / audio / image providers.
@@ -186,7 +191,7 @@ func createProvider(providerID string, opts Options) provider.Provider {
 			baseURL = strings.TrimRight(info.API, "/")
 		}
 	}
-	return newOpenAICompatProvider(providerID, baseURL, opts.APIKey)
+	return newOpenAICompatProvider(providerID, baseURL, opts.APIKey, nil)
 }
 
 // CreateImageModel creates an image generation model from provider and model IDs.

@@ -154,13 +154,12 @@ func AllProviders() (map[string]*ModelsDevProvider, error) {
 		out[id] = clone
 	}
 
-	// Step 6: OpenRouter embeddings. OpenRouter keeps its embedding models on a
-	// separate endpoint absent from both models.dev and OpenRouter's own
-	// /models list, so fetch them (cached, non-blocking) and merge additively
-	// into the openrouter provider as Kind=embedding. Many of them (gte, e5,
-	// sentence-transformers, …) have no "embed" in the name, so Step 5 can't
-	// catch them — this dedicated source is the only reliable one.
-	mergeOpenRouterEmbeddings(out, openRouterEmbeddingModels())
+	// Step 6: OpenRouter's non-chat modalities (embedding, image, speech,
+	// transcription), which models.dev doesn't carry. Fetched in ONE request
+	// (output_modalities=all, cached + non-blocking), classified by output
+	// modality, and merged additively into the openrouter provider — collisions
+	// keep the models.dev chat entry.
+	mergeOpenRouterModels(out, openRouterModels())
 
 	return out, nil
 }
