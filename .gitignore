@@ -1,3 +1,7 @@
 # Compiled binaries (build artifacts — rebuild from source, never commit)
 /sol
 /toolserver
+
+# Local environment / secrets — never commit
+.env
+.env.*
