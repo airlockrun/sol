@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -45,6 +46,35 @@ type Result struct {
 	Title   string
 	URL     string
 	Snippet string
+}
+
+// Text renders the response as a single string ready to drop into an LLM
+// prompt: the provider's synthesized answer when present (LLM-backed providers
+// like Grok/Gemini/Kimi set Synthesis), otherwise a bulleted list of the
+// results as "- Title (URL): Snippet". Returns "" when there's neither a
+// synthesis nor any results.
+func (r *Response) Text() string {
+	if s := strings.TrimSpace(r.Synthesis); s != "" {
+		return s
+	}
+	var sb strings.Builder
+	for i, res := range r.Results {
+		if i > 0 {
+			sb.WriteByte('\n')
+		}
+		sb.WriteString("- ")
+		sb.WriteString(res.Title)
+		if res.URL != "" {
+			sb.WriteString(" (")
+			sb.WriteString(res.URL)
+			sb.WriteByte(')')
+		}
+		if res.Snippet != "" {
+			sb.WriteString(": ")
+			sb.WriteString(res.Snippet)
+		}
+	}
+	return sb.String()
 }
 
 // Options configures a direct search client. Mirrors the LLM provider pattern:
