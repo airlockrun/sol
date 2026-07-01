@@ -99,3 +99,36 @@ func TestSourcesToResults(t *testing.T) {
 		}
 	})
 }
+
+func TestResponseText(t *testing.T) {
+	t.Run("prefers synthesis", func(t *testing.T) {
+		r := &Response{
+			Synthesis: "The answer is 42.",
+			Results:   []Result{{Title: "Ignored", URL: "https://x", Snippet: "nope"}},
+		}
+		if got := r.Text(); got != "The answer is 42." {
+			t.Errorf("Text() = %q, want synthesis", got)
+		}
+	})
+	t.Run("formats results when no synthesis", func(t *testing.T) {
+		r := &Response{Results: []Result{
+			{Title: "Go 1.26", URL: "https://go.dev", Snippet: "released"},
+			{Title: "No URL"},
+		}}
+		want := "- Go 1.26 (https://go.dev): released\n- No URL"
+		if got := r.Text(); got != want {
+			t.Errorf("Text() = %q, want %q", got, want)
+		}
+	})
+	t.Run("blank synthesis falls through to results", func(t *testing.T) {
+		r := &Response{Synthesis: "   ", Results: []Result{{Title: "X"}}}
+		if got := r.Text(); got != "- X" {
+			t.Errorf("Text() = %q, want %q", got, "- X")
+		}
+	})
+	t.Run("empty", func(t *testing.T) {
+		if got := (&Response{}).Text(); got != "" {
+			t.Errorf("Text() = %q, want empty", got)
+		}
+	})
+}
