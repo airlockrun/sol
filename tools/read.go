@@ -38,8 +38,6 @@ Usage:
 - Any lines longer than 2000 characters will be truncated
 - Results are returned using cat -n format, with line numbers starting at 1
 - You have the capability to call multiple tools in a single response. It is always better to speculatively read multiple files as a batch that are potentially useful.
-- If you read a file that exists but has empty contents you will receive a system reminder warning in place of file contents.
-- You can read image files using this tool.
 `).
 		SchemaFromStruct(ReadInput{}).
 		Execute(func(ctx context.Context, input json.RawMessage, opts tool.CallOptions) (tool.Result, error) {
@@ -93,6 +91,13 @@ Usage:
 			}
 
 			lines := strings.Split(string(content), "\n")
+			// A trailing newline (most text files end with one) makes Split
+			// emit a spurious empty final element. Drop it so totalLines and
+			// the footer reflect the real line count instead of an off-by-one
+			// with a phantom blank last line.
+			if n := len(lines); n > 1 && lines[n-1] == "" && strings.HasSuffix(string(content), "\n") {
+				lines = lines[:n-1]
+			}
 			totalLines := len(lines)
 
 			offset := args.Offset
@@ -111,8 +116,14 @@ Usage:
 
 			for i := offset; i < len(lines) && i < offset+limit; i++ {
 				line := lines[i]
+				// Truncate on a rune boundary — the doc promises "characters",
+				// and slicing raw bytes at maxLineLength could split a multibyte
+				// rune and emit invalid UTF-8. Only pay the []rune cost for lines
+				// long enough to possibly exceed the limit.
 				if len(line) > maxLineLength {
-					line = line[:maxLineLength] + "..."
+					if r := []rune(line); len(r) > maxLineLength {
+						line = string(r[:maxLineLength]) + "..."
+					}
 				}
 				size := len(line)
 				if len(raw) > 0 {

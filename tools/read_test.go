@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/airlockrun/goai/tool"
 )
@@ -264,5 +265,59 @@ func TestIsBinaryContent(t *testing.T) {
 				t.Errorf("isBinaryContent(%v) = %v, want %v", tc.content, result, tc.binary)
 			}
 		})
+	}
+}
+
+// TestReadTool_TrailingNewlineLineCount: a newline-terminated file (the common
+// case) must not report an off-by-one total or render a phantom blank final line.
+func TestReadTool_TrailingNewlineLineCount(t *testing.T) {
+	tmpDir := t.TempDir()
+	p := filepath.Join(tmpDir, "nl.txt")
+	if err := os.WriteFile(p, []byte("a\nb\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	result := executeReadTool(t, ReadInput{FilePath: p})
+
+	if !strings.Contains(result, "total 2 lines") {
+		t.Errorf("expected 'total 2 lines' for a 2-line file, got:\n%s", result)
+	}
+	if strings.Contains(result, "00003|") {
+		t.Errorf("phantom empty final line rendered:\n%s", result)
+	}
+	if !strings.Contains(result, "00001| a") || !strings.Contains(result, "00002| b") {
+		t.Errorf("expected both content lines, got:\n%s", result)
+	}
+}
+
+// TestReadTool_LongLineTruncationIsValidUTF8: truncating a long line of
+// multibyte runes must cut on a rune boundary, not mid-rune. The three-byte
+// rune here makes byte 2000 land inside a rune, so a raw byte slice would emit
+// invalid UTF-8.
+func TestReadTool_LongLineTruncationIsValidUTF8(t *testing.T) {
+	tmpDir := t.TempDir()
+	p := filepath.Join(tmpDir, "wide.txt")
+	if err := os.WriteFile(p, []byte(strings.Repeat("€", 3000)), 0644); err != nil {
+		t.Fatal(err)
+	}
+	result := executeReadTool(t, ReadInput{FilePath: p})
+
+	if !strings.Contains(result, "...") {
+		t.Error("expected the long line to be truncated with ...")
+	}
+	if !utf8.ValidString(result) {
+		t.Error("truncated output is not valid UTF-8 — a rune was split")
+	}
+}
+
+// TestReadTool_DescriptionMatchesBehavior: the tool returns text only — it does
+// not render images or emit a system-reminder for empty files, so the
+// description must not promise either (regression guard against the inherited
+// Claude Code boilerplate).
+func TestReadTool_DescriptionMatchesBehavior(t *testing.T) {
+	desc := Read().Description
+	for _, banned := range []string{"image files", "system reminder"} {
+		if strings.Contains(desc, banned) {
+			t.Errorf("description claims %q but the tool doesn't implement it", banned)
+		}
 	}
 }
