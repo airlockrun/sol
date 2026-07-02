@@ -1,15 +1,19 @@
 package provider
 
-// AllProviders returns the full provider catalog: models.dev data enriched
-// with hand-maintained extras (search-only provider stubs, goai's typed kind
-// lists, name-based + OpenRouter embedding classification). Callers that want
-// the live models.dev map unmodified should call LoadProviders directly.
+// AllProviders returns the full provider catalog: models.dev data enriched with
+// sol-derived model kinds, the search-only provider stubs, and OpenRouter's
+// non-chat modality catalog. Callers that want the live models.dev map
+// unmodified should call LoadProviders directly.
 //
-// Deprecated models (Status == "deprecated" per models.dev) are dropped
-// before the goai merge so they don't surface in pickers / catalogs.
-// Runtime lookups via GetModelInfo go through LoadProviders directly and
-// so still resolve — agents configured on a now-deprecated model keep
-// running, they're just hidden from the agent-create dropdown going forward.
+// The catalog is fully dynamic: models.dev + OpenRouter, fetched and cached.
+// The only hand-maintained entries are the search providers (overlay.go) —
+// models.dev has no notion of web search. Nothing enumerates model IDs
+// statically; a model absent from both dynamic sources isn't offered.
+//
+// Deprecated models (Status == "deprecated" per models.dev) are dropped so they
+// don't surface in pickers / catalogs. Runtime lookups via GetModelInfo go
+// through LoadProviders directly and so still resolve — agents configured on a
+// now-deprecated model keep running, they're just hidden from the dropdown.
 //
 // Merge semantics, in order:
 //
@@ -17,15 +21,12 @@ package provider
 //  2. Synthesize stubs for search-only providers absent from models.dev
 //     (e.g. brave). Their search capability is derived from SearchBackend.
 //  3. Drop deprecated entries from every provider in the merged set.
-//  4. Layer goai: for each provider goai has typed-list coverage for
-//     (see goaiProviderFactories), stamp ModelInfo.Kind on existing
-//     entries and synthesize new ModelInfo for goai-listed IDs that
-//     models.dev doesn't ship (e.g. openai's whisper-1, tts-1). Goai is
-//     authoritative for Kind; modalities, cost, and limits come from
-//     whichever source has them (models.dev wins, kind-derived defaults
-//     fall in for the rest).
-//  5. Name-based embedding classification (any model id/name with "embed").
-//  6. Merge OpenRouter's dedicated embeddings catalog (openrouter.go).
+//  4. Classify each model's Kind from its own properties (models.dev carries
+//     no explicit kind): embeddings by name, image models by output modality.
+//     Everything else is a language model; speech/transcription come from
+//     OpenRouter in step 5.
+//  5. Merge OpenRouter's non-chat modality catalog (openrouter.go) — embedding,
+//     image, speech, transcription — which models.dev doesn't carry.
 //
 // The returned map's inner *ModelsDevProvider pointers are clones whenever
 // we touched the provider, so callers can mutate top-level safely. Caches
@@ -78,65 +79,15 @@ func AllProviders() (map[string]*ModelsDevProvider, error) {
 		out[id] = clone
 	}
 
-	// Step 4: goai kind merge. Walk every provider goai has typed-list
-	// coverage for, even ones absent from models.dev (e.g. fal, luma —
-	// they ship via goai but aren't in models.dev's catalog).
-	for providerID := range goaiProviderFactories {
-		kinds := goaiKindLists(providerID)
-		if len(kinds) == 0 {
-			continue
-		}
-
-		existing, ok := out[providerID]
-		if !ok {
-			// Synthesize a stub provider for goai-only entries.
-			existing = &ModelsDevProvider{
-				ID:     providerID,
-				Name:   providerID,
-				Models: map[string]ModelInfo{},
-			}
-			out[providerID] = existing
-		} else {
-			// Clone before mutating so we don't poison the LoadProviders cache.
-			existing = cloneProvider(existing)
-			out[providerID] = existing
-		}
-
-		for kind, ids := range kinds {
-			for _, id := range ids {
-				m, present := existing.Models[id]
-				if present {
-					// models.dev/Overlay already has this model — only
-					// stamp Kind if not already set.
-					if m.Kind == "" {
-						m.Kind = kind
-						existing.Models[id] = m
-					}
-					continue
-				}
-				// goai-only model — synthesize a usable entry.
-				existing.Models[id] = ModelInfo{
-					ID:         id,
-					Name:       id,
-					Kind:       kind,
-					Modalities: modalitiesForKind(kind),
-				}
-			}
-		}
-	}
-
-	// Step 5: name-based embedding classification. models.dev exposes no
-	// embedding modality or type, so an embedding model is indistinguishable
-	// from a text→text model by its catalog entry. Rather than hand-curate
-	// per-provider lists, treat any model whose id/name contains "embed" as an
-	// embedding model — giving embedding coverage across every provider. Name
-	// is authoritative (no non-embedding model is named "embed"); a rare false
-	// positive just errors when called. Clone only providers we touch so
-	// LoadProviders' cache stays intact.
+	// Step 4: classify each model's Kind from its own properties. models.dev
+	// carries no explicit kind, so we derive it — embeddings by name, image
+	// models by output modality (see derivedKind). Speech/transcription come
+	// from OpenRouter (step 5); everything else stays a language model. Clone
+	// only providers we actually restamp so LoadProviders' cache stays intact.
 	for id, p := range out {
 		needs := false
 		for _, m := range p.Models {
-			if m.Kind != KindEmbedding && isEmbeddingModel(m.ID, m.Name) {
+			if m.Kind == "" && derivedKind(m) != "" {
 				needs = true
 				break
 			}
@@ -146,15 +97,17 @@ func AllProviders() (map[string]*ModelsDevProvider, error) {
 		}
 		clone := cloneProvider(p)
 		for mid, m := range clone.Models {
-			if isEmbeddingModel(m.ID, m.Name) {
-				m.Kind = KindEmbedding
-				clone.Models[mid] = m
+			if m.Kind == "" {
+				if k := derivedKind(m); k != "" {
+					m.Kind = k
+					clone.Models[mid] = m
+				}
 			}
 		}
 		out[id] = clone
 	}
 
-	// Step 6: OpenRouter's non-chat modalities (embedding, image, speech,
+	// Step 5: OpenRouter's non-chat modalities (embedding, image, speech,
 	// transcription), which models.dev doesn't carry. Fetched in ONE request
 	// (output_modalities=all, cached + non-blocking), classified by output
 	// modality, and merged additively into the openrouter provider — collisions
@@ -162,6 +115,39 @@ func AllProviders() (map[string]*ModelsDevProvider, error) {
 	mergeOpenRouterModels(out, openRouterModels())
 
 	return out, nil
+}
+
+// derivedKind classifies a models.dev entry by its own properties, since
+// models.dev exposes no explicit kind. Embedding is name-based — models.dev
+// reports embeddings as text→text, indistinguishable from chat otherwise, and
+// no non-embedding model is named "embed". Image is output-modality based: a
+// model whose output is image (and not text) is an image generator. Returns ""
+// for a plain language model. Speech/transcription aren't derived here —
+// models.dev doesn't reliably carry audio models; those arrive via OpenRouter.
+func derivedKind(m ModelInfo) ModelKind {
+	if isEmbeddingModel(m.ID, m.Name) {
+		return KindEmbedding
+	}
+	if m.Modalities != nil && outputsImageOnly(m.Modalities.Output) {
+		return KindImage
+	}
+	return ""
+}
+
+// outputsImageOnly reports whether a model's output modalities mark it as an
+// image generator: image is present and text is not (a text-output model that
+// can also emit images is a chat model, not an image model).
+func outputsImageOnly(output []string) bool {
+	hasImage := false
+	for _, o := range output {
+		switch o {
+		case "text":
+			return false
+		case "image":
+			hasImage = true
+		}
+	}
+	return hasImage
 }
 
 // cloneProvider returns a shallow copy of p with a fresh Models map so

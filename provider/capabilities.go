@@ -2,13 +2,13 @@ package provider
 
 import "strings"
 
-// ModelKind classifies a model by its primary purpose. Sourced from goai's
-// per-provider typed lists (Models / EmbeddingModels / ImageModels /
-// SpeechModels / TranscriptionModels / RerankingModels). Empty means sol
-// has no goai typed-list coverage for the provider — currently true for
-// the openai-compat bucket (groq, xai, cerebras, fireworks, deepseek,
-// perplexity, togetherai, etc.), all of which ship language models, so
-// callers can safely treat empty as KindLanguage when filtering.
+// ModelKind classifies a model by its primary purpose. Derived by the catalog
+// (AllProviders) from each model's own properties: embeddings by name, image
+// models by output modality, and speech/transcription from OpenRouter's
+// output_modalities tags. Empty means a plain language/text model — the default
+// for chat models and the openai-compat bucket (groq, xai, cerebras, fireworks,
+// deepseek, perplexity, togetherai, etc.). Callers treat empty as KindLanguage
+// when filtering.
 type ModelKind string
 
 const (
@@ -19,6 +19,28 @@ const (
 	KindTranscription ModelKind = "transcription" // speech-to-text
 	KindReranking     ModelKind = "reranking"
 )
+
+// modalitiesForKind returns the default input/output modalities for a model
+// known only by its kind — the OpenRouter modality catalog, which classifies by
+// output modality but carries no per-model modality detail. Reflects the
+// typical shape per kind.
+func modalitiesForKind(k ModelKind) *ModelModalities {
+	switch k {
+	case KindLanguage:
+		return &ModelModalities{Input: []string{"text"}, Output: []string{"text"}}
+	case KindEmbedding:
+		return &ModelModalities{Input: []string{"text"}, Output: []string{}}
+	case KindImage:
+		return &ModelModalities{Input: []string{"text"}, Output: []string{"image"}}
+	case KindSpeech:
+		return &ModelModalities{Input: []string{"text"}, Output: []string{"audio"}}
+	case KindTranscription:
+		return &ModelModalities{Input: []string{"audio"}, Output: []string{"text"}}
+	case KindReranking:
+		return &ModelModalities{Input: []string{"text"}, Output: []string{}}
+	}
+	return nil
+}
 
 // Capability constants. These are the strings exposed over the API and used
 // as keys in the UI capability matrix. Keep them lowercase snake_case.
@@ -104,7 +126,7 @@ func (c CapabilitySet) List() []string {
 // Other kind-derived caps fire whenever Kind is set; modality-derived caps
 // fire independently — a Kind=Language model with image input still gets
 // Vision. Modality-only classification is the fallback for catalog entries
-// from providers without goai typed-list coverage.
+// whose Kind wasn't derived (a plain language model with rich input modalities).
 func CapabilitiesFromModel(m ModelInfo) CapabilitySet {
 	if m.Kind == KindEmbedding || isEmbeddingModel(m.ID, m.Name) {
 		return CapabilitySet{Embedding: true}

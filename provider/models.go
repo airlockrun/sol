@@ -33,15 +33,15 @@ type ModelsDevProvider struct {
 	Models map[string]ModelInfo `json:"models"`
 }
 
-// ModelInfo represents a model from models.dev, optionally enriched with
-// goai-supplied Kind classification by AllProviders().
+// ModelInfo represents a model from models.dev or OpenRouter, optionally
+// enriched with a sol-derived Kind classification by AllProviders().
 type ModelInfo struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
-	// Kind classifies the model's primary purpose. Set by AllProviders()
-	// from goai's typed lists (EmbeddingModels / ImageModels /
-	// SpeechModels / TranscriptionModels / RerankingModels). Empty when
-	// goai has no entry — clients treat empty as KindLanguage.
+	// Kind classifies the model's primary purpose. Set by AllProviders():
+	// embeddings by name, image models by output modality, speech/
+	// transcription from OpenRouter's output_modalities tags. Empty for a
+	// plain language model — clients treat empty as KindLanguage.
 	Kind        ModelKind        `json:"kind,omitempty"`
 	Family      string           `json:"family,omitempty"`
 	ReleaseDate string           `json:"release_date,omitempty"`

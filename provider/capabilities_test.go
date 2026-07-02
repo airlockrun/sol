@@ -73,10 +73,9 @@ func TestCapabilitiesFromModel(t *testing.T) {
 			want: CapabilitySet{Text: true},
 		},
 
-		// Kind-derived cases: a goai-supplied Kind sets the canonical flag
-		// regardless of modalities. Empty modalities (typical for
-		// embedding/reranking models on models.dev) used to leave the set
-		// blank; now Kind alone classifies.
+		// Kind-derived cases: a set Kind sets the canonical flag regardless of
+		// modalities. Empty modalities (typical for embedding/reranking models
+		// on models.dev) still classify by Kind alone.
 		{
 			name: "kind=embedding (empty modalities)",
 			in:   ModelInfo{ID: "text-embedding-3-small", Kind: KindEmbedding},
