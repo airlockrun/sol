@@ -3,17 +3,18 @@ package provider
 import "testing"
 
 // TestAllProvidersMergesOverlay runs against whatever LoadProviders() returns
-// (cached models.dev data or the built-in fallback). It asserts that the
-// overlay is applied on top: openai gains its STT/TTS models, brave shows up
-// as a synthetic catalog-only entry, and the shared-cache pointer is cloned
-// so we don't corrupt upstream data.
+// (cached models.dev data or the built-in fallback). It asserts the sol-owned
+// enrichment on top: the search overlay (brave synthetic entry + openai's
+// SearchBackend-derived capability) and that the shared cache pointer is cloned
+// before any Kind is stamped.
 func TestAllProvidersMergesOverlay(t *testing.T) {
 	all, err := AllProviders()
 	if err != nil {
 		t.Fatalf("AllProviders: %v", err)
 	}
 
-	// Brave is a synthetic catalog-only entry.
+	// Search overlay: brave is a synthetic catalog-only entry (models.dev has
+	// no notion of search providers). This is the ONLY hand-maintained data.
 	brave, ok := all["brave"]
 	if !ok {
 		t.Fatal("AllProviders missing brave (should be synthesized from overlay)")
@@ -25,41 +26,64 @@ func TestAllProvidersMergesOverlay(t *testing.T) {
 		t.Errorf("brave.Models = %d entries, want 0", len(brave.Models))
 	}
 
-	// OpenAI should gain the overlay STT/TTS models on top of whatever
-	// models.dev provides.
 	openai, ok := all["openai"]
 	if !ok {
-		t.Skip("openai not in upstream provider list, skipping merge check")
-	}
-	for _, id := range []string{"gpt-4o-transcribe", "whisper-1", "tts-1", "tts-1-hd"} {
-		if _, ok := openai.Models[id]; !ok {
-			t.Errorf("openai.Models missing overlay entry %q", id)
-		}
+		t.Skip("openai not in upstream provider list, skipping enrichment check")
 	}
 
-	// The merged provider must not be the same pointer as the shared cache.
-	// (Otherwise repeated AllProviders() calls would accumulate overlay
-	// entries in the cache on every call.)
+	// Search capability derives from SearchBackend (overlay), not from any
+	// model — openai serves web_search via the Responses API.
+	if !ProviderCapabilities(openai).Search {
+		t.Error("post-merge openai should have Search capability (SearchBackend → Responses API web_search)")
+	}
+
+	// Cache-clone safety: AllProviders stamps sol-derived Kind, but must clone
+	// before mutating so LoadProviders' cache stays pristine. Find a model
+	// AllProviders classified (embedding by name / image by modality) and
+	// assert the cached copy still has an empty Kind.
 	rawBase, err := LoadProviders()
 	if err != nil {
 		t.Fatalf("LoadProviders: %v", err)
 	}
-	if rawOpenAI, ok := rawBase["openai"]; ok && rawOpenAI == openai {
-		t.Error("AllProviders() returned shared cache pointer for openai — overlay merge must clone")
+	rawOpenAI, ok := rawBase["openai"]
+	if !ok {
+		return
 	}
+	for id, m := range openai.Models {
+		if m.Kind == "" {
+			continue
+		}
+		if raw, ok := rawOpenAI.Models[id]; ok && raw.Kind != "" {
+			t.Errorf("AllProviders mutated the LoadProviders cache: openai/%s has Kind=%q in the base map", id, raw.Kind)
+		}
+		if rawOpenAI == openai {
+			t.Error("AllProviders returned the shared cache pointer for openai — classification must clone")
+		}
+		break
+	}
+}
 
-	// Capability union: openai should have Transcription + Speech (from
-	// goai-supplied gpt-4o-transcribe / tts-1 entries that AllProviders
-	// synthesizes) and Search (derived from its SearchBackend → Responses
-	// API web_search).
-	caps := ProviderCapabilities(openai)
-	if !caps.Transcription {
-		t.Error("post-merge openai should have Transcription capability (from gpt-4o-transcribe / whisper-1)")
+func TestDerivedKind(t *testing.T) {
+	img := func(out ...string) ModelInfo {
+		return ModelInfo{ID: "m", Name: "m", Modalities: &ModelModalities{Output: out}}
 	}
-	if !caps.Speech {
-		t.Error("post-merge openai should have Speech capability (from tts-1)")
+	cases := []struct {
+		name string
+		m    ModelInfo
+		want ModelKind
+	}{
+		{"chat text→text", img("text"), ""},
+		{"image-only output", img("image"), KindImage},
+		{"text+image output is chat, not image", img("text", "image"), ""},
+		{"embedding by name", ModelInfo{ID: "text-embedding-3-small", Name: "Text Embedding 3"}, KindEmbedding},
+		{"embedding name beats image modality", ModelInfo{ID: "some-embed", Name: "x", Modalities: &ModelModalities{Output: []string{"image"}}}, KindEmbedding},
+		{"nil modalities, plain name", ModelInfo{ID: "gpt-5", Name: "GPT-5"}, ""},
 	}
-	if !caps.Search {
-		t.Error("post-merge openai should have Search capability (SearchBackend → Responses API web_search)")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := derivedKind(tc.m); got != tc.want {
+				t.Errorf("derivedKind = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
