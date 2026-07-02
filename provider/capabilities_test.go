@@ -65,6 +65,16 @@ func TestCapabilitiesFromModel(t *testing.T) {
 			want: CapabilitySet{ImageGen: true},
 		},
 		{
+			// A chat model that also emits images is BOTH a text model and
+			// an image generator — so it can be picked for the image slot.
+			name: "chat with image output — text in, text+image out",
+			in: ModelInfo{Modalities: &ModelModalities{
+				Input:  []string{"text", "image"},
+				Output: []string{"text", "image"},
+			}},
+			want: CapabilitySet{Text: true, Vision: true, ImageGen: true},
+		},
+		{
 			name: "model level never sets Search",
 			in: ModelInfo{Modalities: &ModelModalities{
 				Input:  []string{"text"},
