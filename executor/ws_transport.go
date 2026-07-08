@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -14,6 +15,54 @@ import (
 	"github.com/airlockrun/sol/bus"
 	"github.com/coder/websocket"
 )
+
+var errTransportClosed = errors.New("transport closed")
+
+// TransportError marks a broken tool runtime transport. It is fatal to the
+// run because the model cannot repair a dead websocket by retrying tool calls.
+type TransportError struct {
+	Op  string
+	Err error
+}
+
+func (e *TransportError) Error() string {
+	if e == nil {
+		return "tool runtime transport error"
+	}
+	if e.Op == "" {
+		return fmt.Sprintf("tool runtime transport error: %v", e.Err)
+	}
+	return fmt.Sprintf("tool runtime transport %s: %v", e.Op, e.Err)
+}
+
+func (e *TransportError) Unwrap() error { return e.Err }
+
+func (e *TransportError) FatalToolError() bool { return true }
+
+// IsTransportError reports whether err is a broken tool runtime transport.
+func IsTransportError(err error) bool {
+	var transportErr *TransportError
+	return errors.As(err, &transportErr)
+}
+
+func transportError(op string, err error) *TransportError {
+	if err == nil {
+		err = errTransportClosed
+	}
+	return &TransportError{Op: op, Err: err}
+}
+
+func isNormalWSClose(err error) bool {
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	switch websocket.CloseStatus(err) {
+	case websocket.StatusNormalClosure, websocket.StatusGoingAway:
+		return true
+	default:
+		return false
+	}
+}
 
 // WSTransport implements Transport using WebSocket.
 type WSTransport struct {
@@ -64,7 +113,7 @@ func NewWSTransport(url string, headers ...http.Header) (*WSTransport, error) {
 // Send implements Transport.
 func (t *WSTransport) Send(ctx context.Context, req tool.Request) (tool.Response, error) {
 	if t.closed.Load() {
-		return tool.Response{}, errors.New("transport closed")
+		return tool.Response{}, transportError("closed", errTransportClosed)
 	}
 
 	msg := message{
@@ -101,7 +150,7 @@ func (t *WSTransport) Send(ctx context.Context, req tool.Request) (tool.Response
 // FetchTools requests the tool definitions from the remote server.
 func (t *WSTransport) FetchTools(ctx context.Context) ([]tool.Info, error) {
 	if t.closed.Load() {
-		return nil, errors.New("transport closed")
+		return nil, transportError("closed", errTransportClosed)
 	}
 
 	resp, err := t.roundTrip(ctx, message{Type: "tools", ID: t.allocID()})
@@ -118,7 +167,7 @@ func (t *WSTransport) FetchTools(ctx context.Context) ([]tool.Info, error) {
 // SetRules sends permission rules to the remote ToolServer and waits for ack.
 func (t *WSTransport) SetRules(ctx context.Context, rules []bus.PermissionRule) error {
 	if t.closed.Load() {
-		return errors.New("transport closed")
+		return transportError("closed", errTransportClosed)
 	}
 
 	resp, err := t.roundTrip(ctx, message{Type: "set_rules", ID: t.allocID(), Rules: rules})
@@ -134,7 +183,7 @@ func (t *WSTransport) SetRules(ctx context.Context, rules []bus.PermissionRule) 
 // SetActiveTools tells the remote ToolServer which tools to expose and accept.
 func (t *WSTransport) SetActiveTools(ctx context.Context, toolNames []string) error {
 	if t.closed.Load() {
-		return errors.New("transport closed")
+		return transportError("closed", errTransportClosed)
 	}
 
 	resp, err := t.roundTrip(ctx, message{Type: "set_active_tools", ID: t.allocID(), ActiveTools: toolNames})
@@ -150,7 +199,7 @@ func (t *WSTransport) SetActiveTools(ctx context.Context, toolNames []string) er
 // PushAnswers sends pre-loaded answers to the remote ToolServer and waits for ack.
 func (t *WSTransport) PushAnswers(ctx context.Context, answers [][]string) error {
 	if t.closed.Load() {
-		return errors.New("transport closed")
+		return transportError("closed", errTransportClosed)
 	}
 
 	resp, err := t.roundTrip(ctx, message{Type: "push_answers", ID: t.allocID(), Answers: answers})
@@ -182,14 +231,15 @@ func (t *WSTransport) roundTrip(ctx context.Context, msg message) (message, erro
 	}()
 
 	if err := t.writeMsg(ctx, msg); err != nil {
-		return message{}, fmt.Errorf("failed to send: %w", err)
+		log.Printf("tool runtime websocket send failed: type=%s id=%s: %v", msg.Type, msg.ID, err)
+		return message{}, transportError("send", err)
 	}
 
 	select {
 	case <-ctx.Done():
 		return message{}, ctx.Err()
 	case <-t.done:
-		return message{}, errors.New("transport closed")
+		return message{}, transportError("closed", errTransportClosed)
 	case resp := <-respCh:
 		return resp, nil
 	}
@@ -211,12 +261,18 @@ func (t *WSTransport) writeMsg(ctx context.Context, msg message) error {
 
 // readLoop reads messages from the WebSocket and dispatches responses.
 func (t *WSTransport) readLoop() {
-	defer close(t.done)
-	defer t.cancel()
+	defer func() {
+		t.closed.Store(true)
+		close(t.done)
+		t.cancel()
+	}()
 
 	for {
 		_, data, err := t.conn.Read(t.ctx)
 		if err != nil {
+			if !t.closed.Load() && !isNormalWSClose(err) {
+				log.Printf("tool runtime websocket read failed: %v", err)
+			}
 			return // connection closed or error
 		}
 		var msg message
@@ -254,6 +310,9 @@ func (t *WSTransport) pingLoop() {
 			err := t.conn.Ping(pctx)
 			cancel()
 			if err != nil {
+				if !t.closed.Load() {
+					log.Printf("tool runtime websocket ping failed: %v", err)
+				}
 				t.cancel()
 				return
 			}

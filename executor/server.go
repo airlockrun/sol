@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -124,6 +125,9 @@ func (s *ToolServer) handleConnection(ws *websocket.Conn) {
 	for {
 		_, data, err := ws.Read(ctx)
 		if err != nil {
+			if !isNormalWSClose(err) {
+				log.Printf("build tool runtime connection read failed: %v", err)
+			}
 			return // connection closed or error
 		}
 		var msg message
@@ -149,6 +153,7 @@ func (s *ToolServer) pingLoop(ctx context.Context, ws *websocket.Conn, cancel co
 			err := ws.Ping(pctx)
 			c()
 			if err != nil {
+				log.Printf("build tool runtime connection ping failed: %v", err)
 				cancel()
 				return
 			}
@@ -214,18 +219,18 @@ func (s *ToolServer) handleRequest(ctx context.Context, sc *serverConn, msg mess
 		var permErr *bus.ErrPermissionNeeded
 		var questErr *bus.ErrQuestionNeeded
 		if errors.As(err, &permErr) {
-			_ = sc.writeMsg(ctx, message{Type: "response", ID: msg.ID, PermissionNeeded: permErr})
+			s.writeMsg(ctx, sc, message{Type: "response", ID: msg.ID, PermissionNeeded: permErr})
 			return
 		}
 		if errors.As(err, &questErr) {
-			_ = sc.writeMsg(ctx, message{Type: "response", ID: msg.ID, QuestionNeeded: questErr})
+			s.writeMsg(ctx, sc, message{Type: "response", ID: msg.ID, QuestionNeeded: questErr})
 			return
 		}
 		s.sendError(ctx, sc, msg.ID, err.Error())
 		return
 	}
 
-	_ = sc.writeMsg(ctx, message{Type: "response", ID: msg.ID, Response: &resp})
+	s.writeMsg(ctx, sc, message{Type: "response", ID: msg.ID, Response: &resp})
 }
 
 // handleToolsRequest returns the available tool definitions.
@@ -247,13 +252,13 @@ func (s *ToolServer) handleToolsRequest(ctx context.Context, sc *serverConn, msg
 		filtered = allTools
 	}
 
-	_ = sc.writeMsg(ctx, message{Type: "tools", ID: msg.ID, Tools: filtered})
+	s.writeMsg(ctx, sc, message{Type: "tools", ID: msg.ID, Tools: filtered})
 }
 
 // handleSetRules sets the permission rules and sends an ack.
 func (s *ToolServer) handleSetRules(ctx context.Context, sc *serverConn, msg message) {
 	s.pm.SetRules(msg.Rules)
-	_ = sc.writeMsg(ctx, message{Type: "set_rules", ID: msg.ID})
+	s.writeMsg(ctx, sc, message{Type: "set_rules", ID: msg.ID})
 }
 
 // handleSetActiveTools restricts which tools the server exposes and accepts.
@@ -265,18 +270,24 @@ func (s *ToolServer) handleSetActiveTools(ctx context.Context, sc *serverConn, m
 	s.mu.Lock()
 	s.activeTools = active
 	s.mu.Unlock()
-	_ = sc.writeMsg(ctx, message{Type: "set_active_tools", ID: msg.ID})
+	s.writeMsg(ctx, sc, message{Type: "set_active_tools", ID: msg.ID})
 }
 
 // handlePushAnswers pushes pre-loaded answers and sends an ack.
 func (s *ToolServer) handlePushAnswers(ctx context.Context, sc *serverConn, msg message) {
 	s.qm.PushAnswers(msg.Answers)
-	_ = sc.writeMsg(ctx, message{Type: "push_answers", ID: msg.ID})
+	s.writeMsg(ctx, sc, message{Type: "push_answers", ID: msg.ID})
 }
 
 // sendError sends an error response.
 func (s *ToolServer) sendError(ctx context.Context, sc *serverConn, id, errMsg string) {
-	_ = sc.writeMsg(ctx, message{Type: "response", ID: id, Error: errMsg})
+	s.writeMsg(ctx, sc, message{Type: "response", ID: id, Error: errMsg})
+}
+
+func (s *ToolServer) writeMsg(ctx context.Context, sc *serverConn, msg message) {
+	if err := sc.writeMsg(ctx, msg); err != nil && !isNormalWSClose(err) {
+		log.Printf("build tool runtime connection write failed: %v", err)
+	}
 }
 
 // ListenAndServe starts the server on the given address.
