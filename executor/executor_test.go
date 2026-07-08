@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -192,5 +193,45 @@ func TestRemoteExecutor_MultipleRequests(t *testing.T) {
 		if resp.Title != name {
 			t.Errorf("Request %d: expected title '%s', got '%s'", i, name, resp.Title)
 		}
+	}
+}
+
+func TestRemoteExecutor_ClosedTransportIsFatal(t *testing.T) {
+	tools := make(tool.Set)
+	tools.Add(mockTool("test_tool"))
+	localExec := tool.NewLocalExecutor(tools, nil)
+	server := NewToolServer(localExec)
+	ts := httptest.NewServer(server.Handler())
+	defer ts.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http")
+	transport, err := NewWSTransport(wsURL)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	remote := NewRemoteExecutor(transport, nil)
+
+	if err := transport.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = remote.Execute(ctx, tool.Request{
+		ToolCallID: "call_1",
+		ToolName:   "test_tool",
+		Input:      json.RawMessage(`{"input":"hello"}`),
+	})
+	if err == nil {
+		t.Fatal("expected fatal transport error, got nil")
+	}
+
+	var transportErr *TransportError
+	if !errors.As(err, &transportErr) {
+		t.Fatalf("expected TransportError, got %T: %v", err, err)
+	}
+	var fatalErr tool.FatalToolError
+	if !errors.As(err, &fatalErr) || !fatalErr.FatalToolError() {
+		t.Fatalf("expected FatalToolError, got %T: %v", err, err)
 	}
 }
