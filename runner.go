@@ -884,9 +884,15 @@ func (r *Runner) runStep(ctx context.Context) (*StepResult, error) {
 		}
 	}
 
-	finishReason := streamResult.FinishReason()
+	finishReason, err := streamResult.FinishReason()
+	if err != nil {
+		return nil, fmt.Errorf("stream finish reason: %w", err)
+	}
 	text := textBuilder.String()
-	usage := streamResult.Usage()
+	usage, err := streamResult.Usage()
+	if err != nil {
+		return nil, fmt.Errorf("stream usage: %w", err)
+	}
 
 	stepResult := &StepResult{
 		Text:         text,
