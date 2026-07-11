@@ -120,6 +120,100 @@ func TestToolServer_ExecuteThroughPipeline(t *testing.T) {
 	}
 }
 
+func TestToolServer_ReadsPongsWhileToolRuns(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	ts := make(tool.Set)
+	ts.Add(tool.Tool{
+		Name:        "block",
+		Description: "blocks until released",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{}}`),
+		Execute: func(ctx context.Context, input json.RawMessage, opts tool.CallOptions) (tool.Result, error) {
+			close(started)
+			select {
+			case <-release:
+				return tool.Result{Output: "released"}, nil
+			case <-ctx.Done():
+				return tool.Result{}, ctx.Err()
+			}
+		},
+	})
+	_, transport, remote, cleanup := setupPipeline(t, ts)
+	defer cleanup()
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := remote.Execute(context.Background(), tool.Request{
+			ToolCallID: "call_block",
+			ToolName:   "block",
+			Input:      json.RawMessage(`{}`),
+		})
+		result <- err
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("tool did not start")
+	}
+
+	pingCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := transport.conn.Ping(pingCtx); err != nil {
+		t.Fatalf("Ping while tool runs: %v", err)
+	}
+	close(release)
+
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("tool did not return")
+	}
+}
+
+func TestToolServer_DisconnectCancelsTool(t *testing.T) {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	ts := make(tool.Set)
+	ts.Add(tool.Tool{
+		Name:        "block",
+		Description: "blocks until canceled",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{}}`),
+		Execute: func(ctx context.Context, input json.RawMessage, opts tool.CallOptions) (tool.Result, error) {
+			close(started)
+			<-ctx.Done()
+			close(canceled)
+			return tool.Result{}, ctx.Err()
+		},
+	})
+	_, transport, remote, cleanup := setupPipeline(t, ts)
+	defer cleanup()
+
+	go remote.Execute(context.Background(), tool.Request{
+		ToolCallID: "call_block",
+		ToolName:   "block",
+		Input:      json.RawMessage(`{}`),
+	})
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("tool did not start")
+	}
+	if err := transport.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("tool context was not canceled")
+	}
+}
+
 // panicTool panics when executed — used to verify a tool panic doesn't tear
 // the toolserver connection.
 func panicTool() tool.Tool {
