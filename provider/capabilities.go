@@ -1,46 +1,18 @@
 package provider
 
-import "strings"
-
-// ModelKind classifies a model by its primary purpose. Derived by the catalog
-// (AllProviders) from each model's own properties: embeddings by name, image
-// models by output modality, and speech/transcription from OpenRouter's
-// output_modalities tags. Empty means a plain language/text model — the default
-// for chat models and the openai-compat bucket (groq, xai, cerebras, fireworks,
-// deepseek, perplexity, togetherai, etc.). Callers treat empty as KindLanguage
-// when filtering.
+// ModelKind classifies a model's primary purpose as published by the catalog.
 type ModelKind string
 
 const (
 	KindLanguage      ModelKind = "language"
 	KindEmbedding     ModelKind = "embedding"
 	KindImage         ModelKind = "image"
+	KindAudio         ModelKind = "audio"
+	KindVideo         ModelKind = "video"
 	KindSpeech        ModelKind = "speech"        // text-to-speech
 	KindTranscription ModelKind = "transcription" // speech-to-text
 	KindReranking     ModelKind = "reranking"
 )
-
-// modalitiesForKind returns the default input/output modalities for a model
-// known only by its kind — the OpenRouter modality catalog, which classifies by
-// output modality but carries no per-model modality detail. Reflects the
-// typical shape per kind.
-func modalitiesForKind(k ModelKind) *ModelModalities {
-	switch k {
-	case KindLanguage:
-		return &ModelModalities{Input: []string{"text"}, Output: []string{"text"}}
-	case KindEmbedding:
-		return &ModelModalities{Input: []string{"text"}, Output: []string{}}
-	case KindImage:
-		return &ModelModalities{Input: []string{"text"}, Output: []string{"image"}}
-	case KindSpeech:
-		return &ModelModalities{Input: []string{"text"}, Output: []string{"audio"}}
-	case KindTranscription:
-		return &ModelModalities{Input: []string{"audio"}, Output: []string{"text"}}
-	case KindReranking:
-		return &ModelModalities{Input: []string{"text"}, Output: []string{}}
-	}
-	return nil
-}
 
 // Capability constants. These are the strings exposed over the API and used
 // as keys in the UI capability matrix. Keep them lowercase snake_case.
@@ -64,7 +36,7 @@ const (
 )
 
 // CapabilitySet is the set of high-level capabilities a model or provider
-// offers. Derived from models.dev modalities, goai-supplied kind, and the
+// offers. Derived from catalog modalities, model kind, and the
 // overlay's extras.
 type CapabilitySet struct {
 	Text          bool
@@ -109,33 +81,19 @@ func (c CapabilitySet) List() []string {
 }
 
 // CapabilitiesFromModel derives the capability set for a single model from
-// its kind (goai-sourced) plus its modality list (models.dev-sourced).
+// its kind plus its catalog modality list.
 // Search is never set at the model level — it's a provider capability (see
 // ProviderCapabilities).
 //
-// Embedding is special-cased and detected by NAME: models.dev exposes no
-// embedding modality or type, so an embedding model is indistinguishable from
-// a text→text model by its catalog entry. Any model whose id/name contains
-// "embed" is treated as embedding-only — it must not also report text, or it
-// would surface as a chat model and land in the text/build/exec pickers.
-// AllProviders() stamps Kind=embedding for the same models (the picker-grouping
-// axis); this name check keeps the pure function correct on its own. A false
-// positive (a chat model named "…embed…") just errors when called the wrong
-// way at runtime — an acceptable trade for zero hand-maintained lists.
-//
-// Other kind-derived caps fire whenever Kind is set; modality-derived caps
-// fire independently — a Kind=Language model with image input still gets
-// Vision. Modality-only classification is the fallback for catalog entries
-// whose Kind wasn't derived (a plain language model with rich input modalities).
+// Kind-derived capabilities trust the catalog. Modalities add orthogonal
+// capabilities to language models, such as vision and image output.
 func CapabilitiesFromModel(m ModelInfo) CapabilitySet {
-	if m.Kind == KindEmbedding || isEmbeddingModel(m.ID, m.Name) {
-		return CapabilitySet{Embedding: true}
-	}
-
 	var cs CapabilitySet
 	switch m.Kind {
 	case KindLanguage:
 		cs.Text = true
+	case KindEmbedding:
+		cs.Embedding = true
 	case KindImage:
 		cs.ImageGen = true
 	case KindSpeech:
@@ -149,26 +107,12 @@ func CapabilitiesFromModel(m ModelInfo) CapabilitySet {
 	if m.Modalities == nil {
 		return cs
 	}
-	inText := containsStr(m.Modalities.Input, "text")
-	outText := containsStr(m.Modalities.Output, "text")
 	inImage := containsStr(m.Modalities.Input, "image")
 	outImage := containsStr(m.Modalities.Output, "image")
-	inAudio := containsStr(m.Modalities.Input, "audio")
-	outAudio := containsStr(m.Modalities.Output, "audio")
-
-	if inText && outText {
-		cs.Text = true
-	}
-	if inImage && outText {
+	if m.Kind == KindLanguage && inImage {
 		cs.Vision = true
 	}
-	if inAudio && outText {
-		cs.Transcription = true
-	}
-	if inText && outAudio {
-		cs.Speech = true
-	}
-	if inText && outImage {
+	if m.Kind == KindLanguage && outImage {
 		cs.ImageGen = true
 	}
 	return cs
@@ -200,18 +144,6 @@ func ProviderCapabilities(p *ModelsDevProvider) CapabilitySet {
 		cs.Search = true
 	}
 	return cs
-}
-
-// isEmbeddingModel reports whether a model is an embedding model, detected
-// purely by its id or name containing "embed" (case-insensitive). models.dev
-// exposes no embedding modality or type, so the name is the only signal that
-// works across every provider; goai's per-provider EmbeddingModels() lists are
-// a redundant subset of this. A false positive surfaces as a runtime error
-// when the model is invoked as a chat (or the Embed call returns non-vector
-// output) — an acceptable trade for not hand-maintaining lists.
-func isEmbeddingModel(id, name string) bool {
-	return strings.Contains(strings.ToLower(id), "embed") ||
-		strings.Contains(strings.ToLower(name), "embed")
 }
 
 func containsStr(haystack []string, needle string) bool {

@@ -17,7 +17,7 @@ import (
 // for latency: web search runs through the Responses API and a full gpt-5 with
 // default reasoning takes 30-60s on terse queries, while nano returns comparable
 // citation coverage in ~10s. Online, pickSearchModel resolves the current nano
-// from models.dev, so this rarely fires; callers can still override via
+// from the active catalog, so this rarely fires; callers can still override via
 // Options.Model.
 const defaultOpenAIModel = "gpt-5.4-nano"
 

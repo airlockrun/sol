@@ -1,87 +1,75 @@
 package provider
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
 )
 
 const (
-	// ModelsDevURL is the URL for the models.dev API
-	ModelsDevURL = "https://models.dev/api.json"
-
-	// RefreshInterval is the cadence of the background catalog refresh
-	// when StartPeriodicRefresh is in use. Also the freshness window
-	// that the lazy LoadProviders() path uses to skip re-fetching.
-	RefreshInterval = 12 * time.Hour
+	CatalogURL             = "https://models.airlock.run/models.json"
+	RefreshInterval        = 12 * time.Hour
+	failedRefreshRetry     = 5 * time.Minute
+	maxCatalogResponseSize = 16 << 20
+	minimumProviderCount   = 100
+	minimumModelCount      = 1000
 )
 
-// ModelsDevProvider represents a provider from models.dev
+// ModelsDevProvider represents one provider in the models.dev-compatible
+// Airlock model catalog.
 type ModelsDevProvider struct {
-	ID     string               `json:"id"`
-	Name   string               `json:"name"`
-	API    string               `json:"api,omitempty"`
-	NPM    string               `json:"npm,omitempty"`
-	Env    []string             `json:"env"`
-	Models map[string]ModelInfo `json:"models"`
+	ID      string               `json:"id"`
+	Name    string               `json:"name"`
+	API     string               `json:"api,omitempty"`
+	NPM     string               `json:"npm,omitempty"`
+	Env     []string             `json:"env"`
+	Aliases []string             `json:"aliases,omitempty"`
+	Models  map[string]ModelInfo `json:"models"`
 }
 
-// ModelInfo represents a model from models.dev or OpenRouter, optionally
-// enriched with a sol-derived Kind classification by AllProviders().
+// ModelInfo represents a model in the Airlock catalog.
 type ModelInfo struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-	// Kind classifies the model's primary purpose. Set by AllProviders():
-	// embeddings by name, image models by output modality, speech/
-	// transcription from OpenRouter's output_modalities tags. Empty for a
-	// plain language model — clients treat empty as KindLanguage.
-	Kind        ModelKind        `json:"kind,omitempty"`
-	Family      string           `json:"family,omitempty"`
-	ReleaseDate string           `json:"release_date,omitempty"`
-	Attachment  bool             `json:"attachment,omitempty"`
-	Reasoning   bool             `json:"reasoning,omitempty"`
-	Temperature bool             `json:"temperature,omitempty"`
-	ToolCall    bool             `json:"tool_call,omitempty"`
-	Modalities  *ModelModalities `json:"modalities,omitempty"`
-	Cost        *ModelCost       `json:"cost,omitempty"`
-	Limit       *ModelLimit      `json:"limit,omitempty"`
-	Status      string           `json:"status,omitempty"` // alpha, beta, deprecated
-	// models.dev's `experimental` field was historically a bool but now
-	// ships as an object (or absent) depending on the model. We don't
-	// currently consume it; capturing it as RawMessage keeps the struct
-	// schema-flexible — future consumers can json.Unmarshal it into
-	// whatever typed shape they need without breaking the catalog parse
-	// when upstream changes the wire shape again.
-	Experimental json.RawMessage `json:"experimental,omitempty"`
+	ID           string           `json:"id"`
+	Name         string           `json:"name"`
+	Kind         ModelKind        `json:"kind,omitempty"`
+	Family       string           `json:"family,omitempty"`
+	ReleaseDate  string           `json:"release_date,omitempty"`
+	Attachment   bool             `json:"attachment,omitempty"`
+	Reasoning    bool             `json:"reasoning,omitempty"`
+	Temperature  bool             `json:"temperature,omitempty"`
+	ToolCall     bool             `json:"tool_call,omitempty"`
+	Modalities   *ModelModalities `json:"modalities,omitempty"`
+	Cost         *ModelCost       `json:"cost,omitempty"`
+	Limit        *ModelLimit      `json:"limit,omitempty"`
+	Status       string           `json:"status,omitempty"`
+	Experimental json.RawMessage  `json:"experimental,omitempty"`
 }
 
-// ModelModalities describes what input/output types a model supports.
 type ModelModalities struct {
-	Input  []string `json:"input"`  // e.g. ["text", "image", "pdf", "audio", "video"]
-	Output []string `json:"output"` // e.g. ["text"]
+	Input  []string `json:"input"`
+	Output []string `json:"output"`
 }
 
-// SupportsInput returns true if the model accepts the given input modality.
 func (m *ModelModalities) SupportsInput(modality string) bool {
 	if m == nil {
 		return false
 	}
-	for _, v := range m.Input {
-		if v == modality {
+	for _, value := range m.Input {
+		if value == modality {
 			return true
 		}
 	}
 	return false
 }
 
-// ModelCost represents the cost structure for a model
 type ModelCost struct {
 	Input      float64 `json:"input"`
 	Output     float64 `json:"output"`
@@ -89,187 +77,218 @@ type ModelCost struct {
 	CacheWrite float64 `json:"cache_write,omitempty"`
 }
 
-// ModelLimit represents token limits for a model
 type ModelLimit struct {
 	Context int `json:"context"`
 	Input   int `json:"input,omitempty"`
 	Output  int `json:"output"`
 }
 
-// modelsState holds the cached models data
 type modelsState struct {
-	mu        sync.RWMutex
-	providers map[string]*ModelsDevProvider
-	loaded    bool
-	lastFetch time.Time
-	// refresherStarted guards StartPeriodicRefresh against multiple
-	// callers spawning duplicate ticker goroutines.
+	mu               sync.RWMutex
+	providers        map[string]*ModelsDevProvider
+	etag             string
+	refreshing       bool
 	refresherStarted bool
+	lastAttempt      time.Time
+	lastSuccess      time.Time
 }
 
-var state = &modelsState{}
+var state = &modelsState{providers: mustDecodeEmbeddedCatalog()}
 
-// getCacheDir returns the cache directory for sol
-func getCacheDir() string {
-	// Try XDG_CACHE_HOME first
-	if cacheDir := os.Getenv("XDG_CACHE_HOME"); cacheDir != "" {
-		return filepath.Join(cacheDir, "sol")
-	}
-	// Fall back to ~/.cache/sol
-	if home, err := os.UserHomeDir(); err == nil {
-		return filepath.Join(home, ".cache", "sol")
-	}
-	return ""
-}
+var catalogHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
-// getCachePath returns the path to the models cache file
-func getCachePath() string {
-	cacheDir := getCacheDir()
-	if cacheDir == "" {
-		return ""
-	}
-	return filepath.Join(cacheDir, "models.json")
-}
-
-// loadFromCache tries to load providers from the cache file
-func loadFromCache() (map[string]*ModelsDevProvider, error) {
-	cachePath := getCachePath()
-	if cachePath == "" {
-		return nil, fmt.Errorf("no cache path")
-	}
-
-	data, err := os.ReadFile(cachePath)
+func mustDecodeEmbeddedCatalog() map[string]*ModelsDevProvider {
+	providers, err := decodeCatalog(embeddedCatalogJSON, true)
 	if err != nil {
-		return nil, err
+		panic("sol/provider: invalid embedded catalog: " + err.Error())
 	}
+	return providers
+}
 
+func decodeCatalog(data []byte, enforceSizeFloor bool) (map[string]*ModelsDevProvider, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
 	var providers map[string]*ModelsDevProvider
-	if err := json.Unmarshal(data, &providers); err != nil {
+	if err := decoder.Decode(&providers); err != nil {
+		return nil, fmt.Errorf("decode catalog: %w", err)
+	}
+	if err := ensureJSONEOF(decoder); err != nil {
 		return nil, err
 	}
-
+	if err := validateCatalog(providers, enforceSizeFloor); err != nil {
+		return nil, err
+	}
 	return providers, nil
 }
 
-// saveToCache saves providers to the cache file
-func saveToCache(providers map[string]*ModelsDevProvider) error {
-	cachePath := getCachePath()
-	if cachePath == "" {
-		return fmt.Errorf("no cache path")
-	}
-
-	// Ensure cache directory exists
-	cacheDir := filepath.Dir(cachePath)
-	if err := os.MkdirAll(cacheDir, 0755); err != nil {
-		return err
-	}
-
-	data, err := json.Marshal(providers)
-	if err != nil {
-		return err
-	}
-
-	return os.WriteFile(cachePath, data, 0644)
+// ValidateCatalogJSON validates a candidate for the embedded catalog snapshot.
+func ValidateCatalogJSON(data []byte) error {
+	_, err := decodeCatalog(data, true)
+	return err
 }
 
-// fetchFromModelsDev fetches provider data from models.dev API
-func fetchFromModelsDev() (map[string]*ModelsDevProvider, error) {
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(ModelsDevURL)
+func ensureJSONEOF(decoder *json.Decoder) error {
+	var extra any
+	if err := decoder.Decode(&extra); errors.Is(err, io.EOF) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("decode trailing catalog data: %w", err)
+	}
+	return errors.New("catalog contains multiple JSON values")
+}
+
+func validateCatalog(providers map[string]*ModelsDevProvider, enforceSizeFloor bool) error {
+	if len(providers) == 0 {
+		return errors.New("catalog is empty")
+	}
+	models := 0
+	for providerID, provider := range providers {
+		if providerID == "" || provider == nil || provider.ID != providerID || provider.Name == "" || provider.Models == nil {
+			return fmt.Errorf("provider %q is invalid", providerID)
+		}
+		for modelID, model := range provider.Models {
+			models++
+			if modelID == "" || model.ID != modelID || model.Name == "" {
+				return fmt.Errorf("model %q/%q is invalid", providerID, modelID)
+			}
+			if !validModelKind(model.Kind) {
+				return fmt.Errorf("model %q/%q has invalid kind %q", providerID, modelID, model.Kind)
+			}
+			if model.Status != "" && model.Status != "alpha" && model.Status != "beta" && model.Status != "deprecated" {
+				return fmt.Errorf("model %q/%q has invalid status %q", providerID, modelID, model.Status)
+			}
+			if model.Modalities != nil {
+				for _, modality := range append(append([]string{}, model.Modalities.Input...), model.Modalities.Output...) {
+					if !validModality(modality) {
+						return fmt.Errorf("model %q/%q has invalid modality %q", providerID, modelID, modality)
+					}
+				}
+			}
+			if model.Cost != nil && (!validNumber(model.Cost.Input) || !validNumber(model.Cost.Output) || !validNumber(model.Cost.CacheRead) || !validNumber(model.Cost.CacheWrite)) {
+				return fmt.Errorf("model %q/%q has invalid cost", providerID, modelID)
+			}
+			if model.Limit != nil && (model.Limit.Context < 0 || model.Limit.Input < 0 || model.Limit.Output < 0) {
+				return fmt.Errorf("model %q/%q has invalid limit", providerID, modelID)
+			}
+		}
+	}
+	for _, required := range []string{"openai", "anthropic", "google"} {
+		if providers[required] == nil {
+			return fmt.Errorf("catalog is missing provider %q", required)
+		}
+	}
+	if enforceSizeFloor && (len(providers) < minimumProviderCount || models < minimumModelCount) {
+		return fmt.Errorf("catalog has %d providers / %d models; minimum is %d / %d", len(providers), models, minimumProviderCount, minimumModelCount)
+	}
+	return nil
+}
+
+func validModelKind(kind ModelKind) bool {
+	switch kind {
+	case KindLanguage, KindEmbedding, KindImage, KindAudio, KindVideo, KindSpeech, KindTranscription, KindReranking:
+		return true
+	default:
+		return false
+	}
+}
+
+func validModality(modality string) bool {
+	switch modality {
+	case "text", "image", "audio", "video", "pdf", "file", "embeddings", "speech", "transcription", "rerank":
+		return true
+	default:
+		return false
+	}
+}
+
+func validNumber(value float64) bool {
+	return value >= 0 && !math.IsNaN(value) && !math.IsInf(value, 0)
+}
+
+func fetchCatalog(ctx context.Context, client *http.Client, url, etag string) (map[string]*ModelsDevProvider, string, bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch models.dev: %w", err)
+		return nil, "", false, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "sol-model-catalog/1")
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, "", false, fmt.Errorf("fetch catalog: %w", err)
 	}
 	defer resp.Body.Close()
-
+	if resp.StatusCode == http.StatusNotModified {
+		return nil, etag, true, nil
+	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("models.dev returned status %d", resp.StatusCode)
+		return nil, "", false, fmt.Errorf("catalog returned status %d", resp.StatusCode)
 	}
-
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxCatalogResponseSize+1))
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
+		return nil, "", false, fmt.Errorf("read catalog: %w", err)
 	}
-
-	var providers map[string]*ModelsDevProvider
-	if err := json.Unmarshal(body, &providers); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
+	if len(body) > maxCatalogResponseSize {
+		return nil, "", false, fmt.Errorf("catalog exceeds %d bytes", maxCatalogResponseSize)
 	}
-
-	return providers, nil
+	providers, err := decodeCatalog(body, true)
+	if err != nil {
+		return nil, "", false, err
+	}
+	return providers, resp.Header.Get("ETag"), false, nil
 }
 
-// LoadProviders loads providers from cache or fetches from models.dev
-// This is called lazily on first access
+// LoadProviders returns the active validated catalog immediately. The embedded
+// snapshot is always available; the first call starts a non-blocking refresh.
 func LoadProviders() (map[string]*ModelsDevProvider, error) {
-	state.mu.Lock()
-	defer state.mu.Unlock()
-
-	// Return cached data if available and not stale
-	if state.loaded && time.Since(state.lastFetch) < RefreshInterval {
-		return state.providers, nil
-	}
-
-	// Try loading from cache first
-	if providers, err := loadFromCache(); err == nil && len(providers) > 0 {
-		state.providers = providers
-		state.loaded = true
-		state.lastFetch = time.Now()
-
-		// Trigger background refresh if cache is older than refresh interval
-		go func() {
-			if providers, err := fetchFromModelsDev(); err == nil {
-				state.mu.Lock()
-				state.providers = providers
-				state.lastFetch = time.Now()
-				state.mu.Unlock()
-				saveToCache(providers)
-			}
-		}()
-
-		return state.providers, nil
-	}
-
-	// Fetch from models.dev
-	providers, err := fetchFromModelsDev()
-	if err != nil {
-		// Loud log so operators see degraded catalogs instead of
-		// silently running on the empty builtin fallback.
-		log.Printf("sol/provider: models.dev fetch failed (lazy load): %v", err)
-		// If fetch fails and we have no cache, use built-in fallback
-		if !state.loaded {
-			state.providers = getBuiltinProviders()
-			state.loaded = true
-		}
-		return state.providers, nil
-	}
-
-	state.providers = providers
-	state.loaded = true
-	state.lastFetch = time.Now()
-
-	// Save to cache
-	go saveToCache(providers)
-
+	triggerRefresh(context.Background(), "lazy", false)
+	state.mu.RLock()
+	defer state.mu.RUnlock()
 	return state.providers, nil
 }
 
-// StartPeriodicRefresh launches a background ticker that refreshes the
-// models.dev catalog every RefreshInterval. Idempotent — calling more
-// than once spawns at most one ticker (subsequent calls are no-ops).
-//
-// Pre-flight steps before the ticker runs:
-//
-//  1. LoadProviders() is invoked synchronously so state.providers is
-//     populated from disk cache (or builtin fallback) before the
-//     function returns. Callers can then serve catalog requests
-//     immediately, even while the network fetch below is in flight.
-//
-//  2. A non-blocking refresh kicks off in a goroutine — picks up any
-//     models.dev changes since the on-disk cache was baked. Failures
-//     here are logged but non-fatal: the cache from step 1 stays
-//     authoritative.
-//
-// The ticker honors ctx.Done() and exits cleanly on shutdown.
+func triggerRefresh(ctx context.Context, tag string, force bool) {
+	state.mu.Lock()
+	if state.refreshing {
+		state.mu.Unlock()
+		return
+	}
+	if !force && !state.lastAttempt.IsZero() {
+		retryAfter := failedRefreshRetry
+		if !state.lastSuccess.IsZero() {
+			retryAfter = RefreshInterval
+		}
+		if time.Since(state.lastAttempt) < retryAfter {
+			state.mu.Unlock()
+			return
+		}
+	}
+	state.refreshing = true
+	state.lastAttempt = time.Now()
+	etag := state.etag
+	state.mu.Unlock()
+
+	go func() {
+		providers, nextETag, notModified, err := fetchCatalog(ctx, catalogHTTPClient, CatalogURL, etag)
+		state.mu.Lock()
+		defer state.mu.Unlock()
+		state.refreshing = false
+		if err != nil {
+			log.Printf("sol/provider: catalog %s refresh failed: %v", tag, err)
+			return
+		}
+		if notModified {
+			state.lastSuccess = time.Now()
+			return
+		}
+		state.providers = providers
+		state.etag = nextETag
+		state.lastSuccess = time.Now()
+	}()
+}
+
+// StartPeriodicRefresh starts one immediate refresh and one periodic ticker.
 func StartPeriodicRefresh(ctx context.Context) {
 	state.mu.Lock()
 	if state.refresherStarted {
@@ -279,62 +298,42 @@ func StartPeriodicRefresh(ctx context.Context) {
 	state.refresherStarted = true
 	state.mu.Unlock()
 
-	// Ensure cached state is populated synchronously so concurrent
-	// catalog requests during the goroutine's first fetch don't see
-	// nil providers.
-	_, _ = LoadProviders()
-
+	triggerRefresh(ctx, "startup", true)
 	go func() {
-		// Immediate refresh on startup.
-		refreshOnce("startup")
-
-		t := time.NewTicker(RefreshInterval)
-		defer t.Stop()
+		ticker := time.NewTicker(RefreshInterval)
+		defer ticker.Stop()
+		defer func() {
+			state.mu.Lock()
+			state.refresherStarted = false
+			state.mu.Unlock()
+		}()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-t.C:
-				refreshOnce("periodic")
+			case <-ticker.C:
+				triggerRefresh(ctx, "periodic", true)
 			}
 		}
 	}()
 }
 
-// refreshOnce performs a single fetch + cache swap. Failures are logged
-// with the supplied tag so operators can tell startup from periodic
-// failures in the logs.
-func refreshOnce(tag string) {
-	providers, err := fetchFromModelsDev()
-	if err != nil {
-		log.Printf("sol/provider: models.dev %s refresh failed: %v", tag, err)
-		return
-	}
-	state.mu.Lock()
-	state.providers = providers
-	state.loaded = true
-	state.lastFetch = time.Now()
-	state.mu.Unlock()
-	if err := saveToCache(providers); err != nil {
-		log.Printf("sol/provider: failed to save models cache: %v", err)
-	}
-	// Warm OpenRouter's modality catalog (embedding/image/speech/transcription,
-	// one request) on the same cadence so the first catalog request after
-	// startup already has it. Best-effort.
-	refreshOpenRouterModels()
-}
-
-// GetProviderInfo returns provider info from the models.dev data
 func GetProviderInfo(providerID string) (*ModelsDevProvider, bool) {
-	providers, err := LoadProviders()
-	if err != nil {
-		return nil, false
+	providers, _ := LoadProviders()
+	provider, ok := providers[providerID]
+	if ok {
+		return provider, true
 	}
-	p, ok := providers[providerID]
-	return p, ok
+	for _, candidate := range providers {
+		for _, alias := range candidate.Aliases {
+			if alias == providerID {
+				return candidate, true
+			}
+		}
+	}
+	return nil, false
 }
 
-// GetModelInfo returns model info for a specific provider and model
 func GetModelInfo(providerID, modelID string) (*ModelInfo, bool) {
 	provider, ok := GetProviderInfo(providerID)
 	if !ok {
@@ -347,88 +346,6 @@ func GetModelInfo(providerID, modelID string) (*ModelInfo, bool) {
 	return &model, true
 }
 
-// getBuiltinProviders returns a fallback set of providers when models.dev is unavailable
-func getBuiltinProviders() map[string]*ModelsDevProvider {
-	return map[string]*ModelsDevProvider{
-		"openai": {
-			ID:   "openai",
-			Name: "OpenAI",
-			Env:  []string{"OPENAI_API_KEY"},
-		},
-		"anthropic": {
-			ID:   "anthropic",
-			Name: "Anthropic",
-			Env:  []string{"ANTHROPIC_API_KEY"},
-		},
-		"google": {
-			ID:   "google",
-			Name: "Google",
-			Env:  []string{"GOOGLE_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY"},
-		},
-		"azure": {
-			ID:   "azure",
-			Name: "Azure OpenAI",
-			Env:  []string{"AZURE_OPENAI_API_KEY"},
-		},
-		"groq": {
-			ID:   "groq",
-			Name: "Groq",
-			Env:  []string{"GROQ_API_KEY"},
-		},
-		"mistral": {
-			ID:   "mistral",
-			Name: "Mistral",
-			Env:  []string{"MISTRAL_API_KEY"},
-		},
-		"xai": {
-			ID:   "xai",
-			Name: "xAI",
-			Env:  []string{"XAI_API_KEY"},
-		},
-		"deepseek": {
-			ID:   "deepseek",
-			Name: "DeepSeek",
-			Env:  []string{"DEEPSEEK_API_KEY"},
-		},
-		"github-copilot": {
-			ID:   "github-copilot",
-			Name: "GitHub Copilot",
-			Env:  []string{"GITHUB_TOKEN"},
-		},
-		"openrouter": {
-			ID:   "openrouter",
-			Name: "OpenRouter",
-			Env:  []string{"OPENROUTER_API_KEY"},
-		},
-		"together": {
-			ID:   "together",
-			Name: "Together AI",
-			Env:  []string{"TOGETHER_API_KEY"},
-		},
-		"perplexity": {
-			ID:   "perplexity",
-			Name: "Perplexity",
-			Env:  []string{"PERPLEXITY_API_KEY"},
-		},
-		"cohere": {
-			ID:   "cohere",
-			Name: "Cohere",
-			Env:  []string{"COHERE_API_KEY"},
-		},
-		"amazon-bedrock": {
-			ID:   "amazon-bedrock",
-			Name: "Amazon Bedrock",
-			Env:  []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"},
-		},
-		"google-vertex": {
-			ID:   "google-vertex",
-			Name: "Google Vertex AI",
-			Env:  []string{"GOOGLE_APPLICATION_CREDENTIALS"},
-		},
-	}
-}
-
-// ListProviders returns all available provider IDs
 func ListProviders() []string {
 	providers, _ := LoadProviders()
 	ids := make([]string, 0, len(providers))
@@ -438,8 +355,6 @@ func ListProviders() []string {
 	return ids
 }
 
-// GetContextLimit returns the context limit for a model.
-// Returns 0 if the model is not found or has no limit defined.
 func GetContextLimit(providerID, modelID string) int {
 	model, ok := GetModelInfo(providerID, modelID)
 	if !ok || model.Limit == nil {
@@ -448,8 +363,6 @@ func GetContextLimit(providerID, modelID string) int {
 	return model.Limit.Context
 }
 
-// GetModalities returns the model's input/output modalities.
-// Returns nil if the model is not found or has no modalities defined.
 func GetModalities(providerID, modelID string) *ModelModalities {
 	model, ok := GetModelInfo(providerID, modelID)
 	if !ok || model.Modalities == nil {
@@ -458,18 +371,14 @@ func GetModalities(providerID, modelID string) *ModelModalities {
 	return model.Modalities
 }
 
-// SupportsInputModality returns true if the model supports the given input type.
-// Returns true if model info is unavailable (optimistic fallback).
 func SupportsInputModality(providerID, modelID, modality string) bool {
-	m := GetModalities(providerID, modelID)
-	if m == nil {
-		return true // optimistic: allow if we don't know
+	modalities := GetModalities(providerID, modelID)
+	if modalities == nil {
+		return true
 	}
-	return m.SupportsInput(modality)
+	return modalities.SupportsInput(modality)
 }
 
-// GetOutputLimit returns the output limit for a model.
-// Returns 0 if the model is not found or has no limit defined.
 func GetOutputLimit(providerID, modelID string) int {
 	model, ok := GetModelInfo(providerID, modelID)
 	if !ok || model.Limit == nil {

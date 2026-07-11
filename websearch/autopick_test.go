@@ -7,7 +7,7 @@ import (
 )
 
 // TestPickSearchModel_Live asserts the autopicker resolves a current default
-// web-search model for every LLM backend against the live models.dev catalog.
+// web-search model for every LLM backend against the active catalog.
 // It FAILS if a backend's filters (language + tool_call + non-deprecated +
 // tier token) leave nothing pickable — the regression we want to catch when a
 // provider deprecates or renames the model the backend used to hardcode.
@@ -16,14 +16,14 @@ import (
 // LoadProviders falls back to the model-less builtin set).
 func TestPickSearchModel_Live(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping live models.dev autopick in -short mode")
+		t.Skip("skipping live catalog autopick in -short mode")
 	}
 	cat, err := provider.AllProviders()
 	if err != nil {
 		t.Skipf("catalog unavailable: %v", err)
 	}
 	if op := cat["openai"]; op == nil || len(op.Models) == 0 {
-		t.Skip("models.dev catalog unavailable (offline / builtin fallback)")
+		t.Skip("catalog unavailable")
 	}
 
 	cases := []struct {

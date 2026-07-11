@@ -27,11 +27,11 @@ func TestSearchBackends(t *testing.T) {
 }
 
 // TestSearchOnlyProviders ensures every search-only provider (absent from
-// models.dev) has both a display name (for the synthesized stub) and a search
+// the source catalog) has both a display name (for the synthesized stub) and a search
 // backend — declaring one without the other is a silent misconfiguration.
 func TestSearchOnlyProviders(t *testing.T) {
 	if _, ok := searchOnlyProviders["brave"]; !ok {
-		t.Error("brave should be a search-only provider (it has no models.dev entry)")
+		t.Error("brave should be a search-only provider")
 	}
 	for id, displayName := range searchOnlyProviders {
 		if displayName == "" {

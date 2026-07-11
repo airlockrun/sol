@@ -1,13 +1,12 @@
 package provider
 
-// Catalog enrichment that models.dev can't express. models.dev describes
-// models and their modalities, but it has no notion of which providers serve
+// Catalog enrichment owned by Sol. Model catalogs describe models and their
+// modalities, but have no notion of which providers serve
 // web search, and it doesn't list search-only providers (e.g. Brave) at all.
 // Those two facts live here as small hand-maintained tables.
 //
-// Embedding models are handled separately (openrouter.go for OpenRouter's
-// dedicated endpoint, plus name-based classification in capabilities.go) and
-// per-model attachment quirks live in attachment_policy.go.
+// Model kind enrichment lives in capabilities.go, and per-model attachment
+// quirks live in attachment_policy.go.
 
 // searchBackends maps a provider_id to the sol/websearch client name that
 // serves web search for it. Presence in this map IS the "search" capability:
@@ -24,7 +23,7 @@ var searchBackends = map[string]string{
 	"brave":      "brave",
 }
 
-// searchOnlyProviders are search providers models.dev doesn't list at all (no
+// searchOnlyProviders are search providers the source catalog doesn't list (no
 // chat/embedding models of their own). AllProviders synthesizes a stub catalog
 // entry for each so they still surface as a configurable provider. Maps
 // provider_id → display name.
