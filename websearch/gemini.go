@@ -14,7 +14,7 @@ import (
 // defaultGeminiModel is the last-resort gemini web-search model, used only when
 // pickSearchModel can't reach the live catalog (offline). The flash-lite tier
 // supports the google_search grounding tool and is the latency pick; online,
-// pickSearchModel resolves the current flash-lite from models.dev.
+// pickSearchModel resolves the current flash-lite from the active catalog.
 const defaultGeminiModel = "gemini-3.1-flash-lite"
 
 // searchGemini runs a search-grounded generation through goai's Google

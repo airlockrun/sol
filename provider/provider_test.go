@@ -32,12 +32,12 @@ func TestParseModel(t *testing.T) {
 func TestGetEnvVarName(t *testing.T) {
 	tests := []struct {
 		provider string
-		wantAny  []string // accept any of these values (models.dev data may vary)
+		wantAny  []string // accept any of these catalog values
 	}{
 		{"openai", []string{"OPENAI_API_KEY"}},
 		{"anthropic", []string{"ANTHROPIC_API_KEY"}},
-		{"google", []string{"GOOGLE_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY"}}, // models.dev may use either
-		{"unknown", []string{"UNKNOWN_API_KEY"}},                               // falls back to uppercased name
+		{"google", []string{"GOOGLE_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY"}},
+		{"unknown", []string{"UNKNOWN_API_KEY"}}, // falls back to uppercased name
 	}
 
 	for _, tt := range tests {

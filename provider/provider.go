@@ -1,6 +1,6 @@
 // Package provider implements the multi-provider system for sol.
 // This matches opencode's provider architecture for supporting multiple LLM providers.
-// Provider information is fetched dynamically from models.dev API.
+// Provider information comes from the validated Airlock model catalog.
 package provider
 
 import (
@@ -178,7 +178,7 @@ var providerFactories = map[string]providerFactory{
 // createProvider instantiates a goai provider by ID. A provider with no
 // dedicated factory above is treated as OpenAI-compatible (the common case for
 // gateways): it routes through openaicompat's /chat/completions wire format at
-// the configured base URL, falling back to the provider's models.dev API root.
+// the configured base URL, falling back to the catalog provider's API root.
 // It must NOT fall through to the openai package — that speaks the Responses
 // API at api.openai.com and would send a foreign API key to OpenAI.
 func createProvider(providerID string, opts Options) provider.Provider {
@@ -215,7 +215,7 @@ func CreateTranscriptionModel(providerID, modelID string, opts Options) model.Tr
 }
 
 // GetEnvVarName returns the primary environment variable name for a provider's API key.
-// Uses dynamic data from models.dev when available.
+// Uses the active model catalog when available.
 func GetEnvVarName(providerID string) string {
 	if info, ok := GetProviderInfo(providerID); ok && len(info.Env) > 0 {
 		return info.Env[0]
@@ -225,7 +225,7 @@ func GetEnvVarName(providerID string) string {
 }
 
 // GetDisplayName returns the display name for a provider.
-// Uses dynamic data from models.dev when available.
+// Uses the active model catalog when available.
 func GetDisplayName(providerID string) string {
 	if info, ok := GetProviderInfo(providerID); ok {
 		return info.Name

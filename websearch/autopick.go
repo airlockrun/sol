@@ -19,7 +19,7 @@ var datedSnapshot = regexp.MustCompile(`-\d{4}-\d{2}-\d{2}$`)
 // general web-search synthesizers (e.g. kimi-k2.7-code).
 var searchExcludeTokens = []string{"code"}
 
-// pickSearchModel chooses a default web-search model for a models.dev provider
+// pickSearchModel chooses a default web-search model for a catalog provider
 // id from the live catalog, so a deprecated or renamed model never requires a
 // code change. It keeps non-deprecated language models that support tool calling
 // (web search runs as a hosted tool), then requires a match against the

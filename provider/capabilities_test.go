@@ -18,7 +18,7 @@ func TestCapabilitiesFromModel(t *testing.T) {
 		},
 		{
 			name: "text only",
-			in: ModelInfo{Modalities: &ModelModalities{
+			in: ModelInfo{Kind: KindLanguage, Modalities: &ModelModalities{
 				Input:  []string{"text"},
 				Output: []string{"text"},
 			}},
@@ -26,7 +26,7 @@ func TestCapabilitiesFromModel(t *testing.T) {
 		},
 		{
 			name: "vision model — image + text in, text out",
-			in: ModelInfo{Modalities: &ModelModalities{
+			in: ModelInfo{Kind: KindLanguage, Modalities: &ModelModalities{
 				Input:  []string{"text", "image"},
 				Output: []string{"text"},
 			}},
@@ -34,15 +34,15 @@ func TestCapabilitiesFromModel(t *testing.T) {
 		},
 		{
 			name: "multimodal — image + audio + text in, text + audio out",
-			in: ModelInfo{Modalities: &ModelModalities{
+			in: ModelInfo{Kind: KindLanguage, Modalities: &ModelModalities{
 				Input:  []string{"text", "image", "audio"},
 				Output: []string{"text", "audio"},
 			}},
-			want: CapabilitySet{Text: true, Vision: true, Speech: true, Transcription: true},
+			want: CapabilitySet{Text: true, Vision: true},
 		},
 		{
 			name: "pure STT — audio in, text out",
-			in: ModelInfo{Modalities: &ModelModalities{
+			in: ModelInfo{Kind: KindTranscription, Modalities: &ModelModalities{
 				Input:  []string{"audio"},
 				Output: []string{"text"},
 			}},
@@ -50,7 +50,7 @@ func TestCapabilitiesFromModel(t *testing.T) {
 		},
 		{
 			name: "pure TTS — text in, audio out",
-			in: ModelInfo{Modalities: &ModelModalities{
+			in: ModelInfo{Kind: KindSpeech, Modalities: &ModelModalities{
 				Input:  []string{"text"},
 				Output: []string{"audio"},
 			}},
@@ -58,7 +58,7 @@ func TestCapabilitiesFromModel(t *testing.T) {
 		},
 		{
 			name: "image gen — text in, image out",
-			in: ModelInfo{Modalities: &ModelModalities{
+			in: ModelInfo{Kind: KindImage, Modalities: &ModelModalities{
 				Input:  []string{"text"},
 				Output: []string{"image"},
 			}},
@@ -68,7 +68,7 @@ func TestCapabilitiesFromModel(t *testing.T) {
 			// A chat model that also emits images is BOTH a text model and
 			// an image generator — so it can be picked for the image slot.
 			name: "chat with image output — text in, text+image out",
-			in: ModelInfo{Modalities: &ModelModalities{
+			in: ModelInfo{Kind: KindLanguage, Modalities: &ModelModalities{
 				Input:  []string{"text", "image"},
 				Output: []string{"text", "image"},
 			}},
@@ -76,20 +76,23 @@ func TestCapabilitiesFromModel(t *testing.T) {
 		},
 		{
 			name: "model level never sets Search",
-			in: ModelInfo{Modalities: &ModelModalities{
+			in: ModelInfo{Kind: KindLanguage, Modalities: &ModelModalities{
 				Input:  []string{"text"},
 				Output: []string{"text"},
 			}},
 			want: CapabilitySet{Text: true},
 		},
 
-		// Kind-derived cases: a set Kind sets the canonical flag regardless of
-		// modalities. Empty modalities (typical for embedding/reranking models
-		// on models.dev) still classify by Kind alone.
+		// Kind sets the canonical capability regardless of modalities.
 		{
 			name: "kind=embedding (empty modalities)",
 			in:   ModelInfo{ID: "text-embedding-3-small", Kind: KindEmbedding},
 			want: CapabilitySet{Embedding: true},
+		},
+		{
+			name: "name does not override catalog kind",
+			in:   ModelInfo{ID: "looks-like-an-embedding", Name: "Embedding", Kind: KindLanguage},
+			want: CapabilitySet{Text: true},
 		},
 		{
 			name: "kind=reranking (empty modalities)",
@@ -153,13 +156,13 @@ func TestCapabilitiesFromModel(t *testing.T) {
 }
 
 func TestProviderCapabilities(t *testing.T) {
-	textModel := ModelInfo{ID: "text-only", Modalities: &ModelModalities{
+	textModel := ModelInfo{ID: "text-only", Kind: KindLanguage, Modalities: &ModelModalities{
 		Input: []string{"text"}, Output: []string{"text"},
 	}}
-	visionModel := ModelInfo{ID: "vision", Modalities: &ModelModalities{
+	visionModel := ModelInfo{ID: "vision", Kind: KindLanguage, Modalities: &ModelModalities{
 		Input: []string{"text", "image"}, Output: []string{"text"},
 	}}
-	imgGenModel := ModelInfo{ID: "image-gen", Modalities: &ModelModalities{
+	imgGenModel := ModelInfo{ID: "image-gen", Kind: KindImage, Modalities: &ModelModalities{
 		Input: []string{"text"}, Output: []string{"image"},
 	}}
 
