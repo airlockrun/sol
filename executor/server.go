@@ -121,6 +121,14 @@ func (s *ToolServer) handleConnection(ws *websocket.Conn) {
 
 	sc := &serverConn{ws: ws}
 	go s.pingLoop(ctx, ws, cancel)
+	messages := make(chan message)
+	dispatches := make(chan message)
+	go queueMessages(ctx, messages, dispatches)
+	go func() {
+		for msg := range dispatches {
+			s.dispatch(ctx, sc, msg)
+		}
+	}()
 
 	for {
 		_, data, err := ws.Read(ctx)
@@ -135,7 +143,36 @@ func (s *ToolServer) handleConnection(ws *websocket.Conn) {
 			s.sendError(ctx, sc, "", fmt.Sprintf("invalid message: %v", err))
 			continue
 		}
-		s.dispatch(ctx, sc, msg)
+		select {
+		case messages <- msg:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// queueMessages keeps the socket reader independent from serial tool execution.
+// coder/websocket processes control frames during Read, so reads must continue
+// while a tool is running for ping/pong keepalives to work.
+func queueMessages(ctx context.Context, in <-chan message, out chan<- message) {
+	defer close(out)
+	var queue []message
+	for {
+		var send chan<- message
+		var next message
+		if len(queue) > 0 {
+			send = out
+			next = queue[0]
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case msg := <-in:
+			queue = append(queue, msg)
+		case send <- next:
+			queue = queue[1:]
+		}
 	}
 }
 
@@ -207,8 +244,10 @@ func (s *ToolServer) handleRequest(ctx context.Context, sc *serverConn, msg mess
 		}
 	}
 
-	// Inject Bus/PM/QM into context so tools can call AskPermission/AskQuestion
-	execCtx := context.Background()
+	// Inject Bus/PM/QM into context so tools can call AskPermission/AskQuestion.
+	// A broken connection cancels the tool because no client remains to receive
+	// its result.
+	execCtx := ctx
 	execCtx = bus.WithBus(execCtx, s.bus)
 	execCtx = bus.WithPermissionManager(execCtx, s.pm)
 	execCtx = bus.WithQuestionManager(execCtx, s.qm)
