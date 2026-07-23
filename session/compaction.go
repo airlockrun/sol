@@ -308,6 +308,9 @@ const DefaultCompactionSystemPrompt = "You are a helpful AI assistant tasked wit
 // This matches MessageV2.toModelMessages() behavior for compaction parts.
 const CompactionTriggerPrompt = "What did we do so far?"
 
+// CompactionContinuationPrompt tells the model how to interpret the summary and resume the conversation.
+const CompactionContinuationPrompt = "The preceding assistant message is an internal compaction summary for context, not a user-visible assistant reply. Continue with the next steps if there are any, or ask the user for clarification if needed."
+
 // CompactOptions contains options for compaction requests.
 // This matches opencode's behavior of passing the same provider options to compaction.
 type CompactOptions struct {
@@ -372,19 +375,18 @@ func (s *Session) Compact(ctx context.Context, model stream.Model, conversationM
 		return "", fmt.Errorf("compaction stream error: %w", err)
 	}
 
-	// Collect the response
-	var summary strings.Builder
-	for event := range result.FullStream {
-		if e, ok := event.Data.(stream.TextDeltaEvent); ok {
-			summary.WriteString(e.Text)
-		}
+	for range result.FullStream {
+	}
+	summary, err := result.Text()
+	if err != nil {
+		return "", fmt.Errorf("compaction stream error: %w", err)
 	}
 
 	// Mark this as a compaction summary
 	s.mu.Lock()
 	s.Messages = append(s.Messages, Message{
 		Role:    "assistant",
-		Content: summary.String(),
+		Content: summary,
 		Summary: true,
 	})
 	s.mu.Unlock()
@@ -396,10 +398,10 @@ func (s *Session) Compact(ctx context.Context, model stream.Model, conversationM
 		})
 	}
 
-	return summary.String(), nil
+	return summary, nil
 }
 
-// CompactAndContinue performs compaction and adds a synthetic continue message.
+// CompactAndContinue performs compaction and adds a continuation instruction.
 // This is used for automatic compaction during the thinking loop.
 // conversationMessages should be the current conversation history (from the runner).
 func (s *Session) CompactAndContinue(ctx context.Context, model stream.Model, conversationMessages []goai.Message, opts *CompactOptions) error {
@@ -447,10 +449,10 @@ func (s *Session) CompactAndContinue(ctx context.Context, model stream.Model, co
 		Summary: true,
 	})
 
-	// Add synthetic continue message
+	// Add the instruction that resumes the conversation after the internal summary.
 	s.Messages = append(s.Messages, Message{
 		Role:    "user",
-		Content: "Continue if you have next steps",
+		Content: CompactionContinuationPrompt,
 	})
 	s.mu.Unlock()
 

@@ -38,6 +38,12 @@ type Sink interface {
 	// approval before a gated tool runs. Implementations typically
 	// surface this as a confirmation prompt.
 	OnPermissionAsked(bus.PermissionAskedPayload)
+	// OnAutomaticCompactionStarted marks the start of an overflow-triggered
+	// compaction attempt.
+	OnAutomaticCompactionStarted(bus.AutomaticCompactionStartedPayload)
+	// OnAutomaticCompactionFinished carries the result of an
+	// overflow-triggered compaction attempt.
+	OnAutomaticCompactionFinished(bus.AutomaticCompactionFinishedPayload)
 	// OnSuspension carries the run-suspended snapshot the resume
 	// path will consume. Implementations may serialize it to the
 	// wire or use it to drive UI state.
@@ -75,6 +81,14 @@ func Forward(b *bus.Bus, sink Sink) func() {
 		case bus.PermissionAsked:
 			if v, ok := e.Properties.(bus.PermissionAskedPayload); ok {
 				sink.OnPermissionAsked(v)
+			}
+		case bus.AutomaticCompactionStarted:
+			if v, ok := e.Properties.(bus.AutomaticCompactionStartedPayload); ok {
+				sink.OnAutomaticCompactionStarted(v)
+			}
+		case bus.AutomaticCompactionFinished:
+			if v, ok := e.Properties.(bus.AutomaticCompactionFinishedPayload); ok {
+				sink.OnAutomaticCompactionFinished(v)
 			}
 		}
 	})
