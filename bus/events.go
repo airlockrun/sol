@@ -34,6 +34,10 @@ const (
 	StreamToolCall     = "stream.tool_call"
 	StreamToolResult   = "stream.tool_result"
 	StreamStepComplete = "stream.step_complete"
+
+	// Automatic compaction lifecycle events
+	AutomaticCompactionStarted  = "automatic_compaction.started"
+	AutomaticCompactionFinished = "automatic_compaction.finished"
 )
 
 // QuestionAskedPayload is the payload for question.asked events.
@@ -104,6 +108,17 @@ type SessionUpdatedPayload struct {
 // SessionCompactedPayload is the payload for session.compacted events.
 type SessionCompactedPayload struct {
 	SessionID string `json:"sessionID"`
+}
+
+// AutomaticCompactionStartedPayload marks the start of an overflow-triggered
+// compaction attempt.
+type AutomaticCompactionStartedPayload struct{}
+
+// AutomaticCompactionFinishedPayload describes the result of an
+// overflow-triggered compaction attempt.
+type AutomaticCompactionFinishedPayload struct {
+	TokensFreed int    `json:"tokensFreed"`
+	Error       string `json:"error"`
 }
 
 // ErrPermissionNeeded is returned when no permission rule matches.

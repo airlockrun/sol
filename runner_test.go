@@ -3,6 +3,7 @@ package sol
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -21,6 +22,7 @@ import (
 type testStore struct {
 	messages    []session.Message
 	tokensFreed int
+	compactErr  error
 }
 
 func (s *testStore) Load(context.Context) ([]session.Message, error) {
@@ -33,6 +35,9 @@ func (s *testStore) Append(_ context.Context, msgs []session.Message) error {
 }
 
 func (s *testStore) Compact(_ context.Context, summary []session.Message, tokensFreed int) error {
+	if s.compactErr != nil {
+		return s.compactErr
+	}
 	s.messages = make([]session.Message, len(summary))
 	copy(s.messages, summary)
 	s.tokensFreed = tokensFreed
@@ -1259,10 +1264,18 @@ func TestRunner_Compact(t *testing.T) {
 		StreamResponse: testutil.MockTextResponse("Conversation summary: user asked about topic X.", testutil.MockUsage(800, 40)),
 	})
 
+	eventBus := bus.New()
+	var automaticEvents []bus.Event
+	eventBus.SubscribeAll(func(event bus.Event) {
+		if event.Type == bus.AutomaticCompactionStarted || event.Type == bus.AutomaticCompactionFinished {
+			automaticEvents = append(automaticEvents, event)
+		}
+	})
 	runner := NewRunner(RunnerOptions{
 		Agent:        testAgent(tool.Set{}),
 		Model:        mockModel,
 		SessionStore: store,
+		Bus:          eventBus,
 		Quiet:        true,
 	})
 
@@ -1298,6 +1311,84 @@ func TestRunner_Compact(t *testing.T) {
 	if !foundSummary {
 		t.Error("store messages should include the summary message flagged Summary=true")
 	}
+	if len(automaticEvents) != 0 {
+		t.Fatalf("explicit Compact emitted automatic lifecycle events: %+v", automaticEvents)
+	}
+}
+
+func TestRunner_AutomaticCompactionLifecycle(t *testing.T) {
+	tests := []struct {
+		name        string
+		model       stream.Model
+		store       *testStore
+		wantErr     bool
+		wantErrText string
+	}{
+		{
+			name: "success",
+			model: testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
+				StreamResponse: testutil.MockTextResponse("short summary", testutil.MockUsage(100, 10)),
+			}),
+			store: &testStore{messages: []session.Message{
+				{Role: "user", Content: "question " + strings.Repeat("a", 500)},
+				{Role: "assistant", Content: "answer " + strings.Repeat("b", 500)},
+			}},
+		},
+		{
+			name: "failure",
+			model: testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
+				StreamResponse: testutil.MockErrorResponse(errors.New("summary failed")),
+			}),
+			store:       &testStore{messages: []session.Message{{Role: "user", Content: "question"}}},
+			wantErr:     true,
+			wantErrText: "summary failed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			eventBus := bus.New()
+			var events []bus.Event
+			eventBus.SubscribeAll(func(event bus.Event) {
+				if event.Type == bus.AutomaticCompactionStarted || event.Type == bus.AutomaticCompactionFinished {
+					events = append(events, event)
+				}
+			})
+
+			runner := NewRunner(RunnerOptions{
+				Agent:        testAgent(tool.Set{}),
+				Model:        tt.model,
+				SessionStore: tt.store,
+				Bus:          eventBus,
+				Quiet:        true,
+			})
+			runner.session = session.NewWithOptions(session.SessionOptions{Bus: eventBus})
+			runner.session.Messages = append([]session.Message(nil), tt.store.messages...)
+			runner.session.Tokens.Input = session.EstimateMessagesTokens(tt.store.messages)
+			runner.messages = append([]goai.Message{goai.NewSystemMessage("system")}, session.MessagesToGoAI(tt.store.messages)...)
+
+			tokensFreed, err := runner.compactAutomatically(context.Background(), "system")
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("compactAutomatically error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if len(events) != 2 {
+				t.Fatalf("events = %+v, want started then finished", events)
+			}
+			if events[0].Type != bus.AutomaticCompactionStarted || events[1].Type != bus.AutomaticCompactionFinished {
+				t.Fatalf("event order = %q, %q", events[0].Type, events[1].Type)
+			}
+			finished, ok := events[1].Properties.(bus.AutomaticCompactionFinishedPayload)
+			if !ok {
+				t.Fatalf("finished payload type = %T", events[1].Properties)
+			}
+			if finished.TokensFreed != tokensFreed {
+				t.Errorf("finished tokensFreed = %d, want %d", finished.TokensFreed, tokensFreed)
+			}
+			if !strings.Contains(finished.Error, tt.wantErrText) {
+				t.Errorf("finished error = %q, want substring %q", finished.Error, tt.wantErrText)
+			}
+		})
+	}
 }
 
 // TestRunner_Compact_NoStore verifies Compact rejects when no SessionStore
@@ -1313,6 +1404,31 @@ func TestRunner_Compact_NoStore(t *testing.T) {
 	})
 	if _, err := runner.Compact(context.Background()); err == nil {
 		t.Fatal("expected error when store is nil")
+	}
+}
+
+func TestRunner_Compact_StoreError(t *testing.T) {
+	compactErr := errors.New("compact store failed")
+	store := &testStore{
+		messages:   []session.Message{{Role: "user", Content: "request"}},
+		compactErr: compactErr,
+	}
+	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
+		StreamResponse: testutil.MockTextResponse("summary", testutil.MockUsage(10, 3)),
+	})
+	runner := NewRunner(RunnerOptions{
+		Agent:        testAgent(tool.Set{}),
+		Model:        model,
+		SessionStore: store,
+		Quiet:        true,
+	})
+
+	result, err := runner.Compact(context.Background())
+	if !errors.Is(err, compactErr) {
+		t.Fatalf("Compact error = %v, want %v", err, compactErr)
+	}
+	if result != nil {
+		t.Errorf("Compact result = %#v, want nil", result)
 	}
 }
 

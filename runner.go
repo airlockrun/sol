@@ -395,7 +395,7 @@ func (r *Runner) Run(ctx context.Context, prompt string) (*RunResult, error) {
 			}
 
 			if r.session.IsOverflow() {
-				if _, err := r.compactNow(ctx, systemPrompt); err != nil {
+				if _, err := r.compactAutomatically(ctx, systemPrompt); err != nil {
 					result.Status = RunFailed
 					result.Messages = r.copyMessages()
 					result.NewMessages = r.copyNewMessages()
@@ -546,10 +546,25 @@ func (r *Runner) compactNow(ctx context.Context, systemPrompt string) (int, erro
 			tokensFreed = 0
 		}
 		if err := r.store.Compact(ctx, postCheckpoint, tokensFreed); err != nil {
-			r.log("[%s] Warning: store compact failed: %v\n", r.agent.Name, err)
+			return 0, fmt.Errorf("store compact: %w", err)
 		}
 	}
 	return tokensFreed, nil
+}
+
+// compactAutomatically emits lifecycle events around an overflow-triggered
+// compaction attempt. User-triggered Compact calls compactNow directly.
+func (r *Runner) compactAutomatically(ctx context.Context, systemPrompt string) (tokensFreed int, err error) {
+	r.bus.Publish(bus.AutomaticCompactionStarted, bus.AutomaticCompactionStartedPayload{})
+	defer func() {
+		payload := bus.AutomaticCompactionFinishedPayload{TokensFreed: tokensFreed}
+		if err != nil {
+			payload.Error = err.Error()
+		}
+		r.bus.Publish(bus.AutomaticCompactionFinished, payload)
+	}()
+
+	return r.compactNow(ctx, systemPrompt)
 }
 
 // copyMessages returns a snapshot of the current thread messages.
@@ -656,7 +671,7 @@ func (r *Runner) Continue(ctx context.Context, prompt string) (*RunResult, error
 			}
 
 			if r.session.IsOverflow() {
-				if _, err := r.compactNow(ctx, systemPrompt); err != nil {
+				if _, err := r.compactAutomatically(ctx, systemPrompt); err != nil {
 					result.Status = RunFailed
 					result.Messages = r.copyMessages()
 					result.NewMessages = r.copyNewMessages()
