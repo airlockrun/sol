@@ -135,3 +135,6 @@ type PermissionDeniedError struct {
 func (e *PermissionDeniedError) Error() string {
 	return fmt.Sprintf("permission denied: %s for %s (%s)", e.Permission, e.Pattern, e.Reason)
 }
+
+// ToolDenialReason classifies a rule denial as a denied tool execution.
+func (e *PermissionDeniedError) ToolDenialReason() string { return e.Reason }
