@@ -237,6 +237,42 @@ Examples:
 
 				sc := result.SuspensionContext
 				fmt.Printf("\n[%s] Suspended: %s\n", selectedAgent.Name, sc.Reason)
+				if sc.Reason == "permission" {
+					for sc != nil {
+						if len(sc.PendingToolCalls) == 0 {
+							fmt.Fprintf(os.Stderr, "[%s] Permission suspension has no pending tool call\n", selectedAgent.Name)
+							os.Exit(1)
+						}
+						tc := sc.PendingToolCalls[0]
+						fmt.Printf("[%s] Pending tool: %s (call %s)\n", selectedAgent.Name, tc.Name, tc.ID)
+						fmt.Printf("[%s] Allow? [y]es / [a]lways / [n]o: ", selectedAgent.Name)
+
+						scanner := bufio.NewScanner(os.Stdin)
+						if !scanner.Scan() {
+							fmt.Fprintf(os.Stderr, "[%s] Failed to read input\n", selectedAgent.Name)
+							os.Exit(1)
+						}
+
+						response := strings.ToLower(strings.TrimSpace(scanner.Text()))
+						approved := response != "n" && response != "no"
+						if response == "a" || response == "always" {
+							rule := bus.PermissionRule{Permission: "*", Pattern: "*", Action: "allow"}
+							rules = append(rules, rule)
+							runner.PermissionManager().AddRule(rule)
+						}
+
+						resolution, resolveErr := runner.ResolvePermissionSuspension(ctx, sc, approved)
+						if resolveErr != nil {
+							fmt.Fprintf(os.Stderr, "[%s] Failed to resolve permission: %s\n", selectedAgent.Name, resolveErr)
+							os.Exit(1)
+						}
+						messages = append(messages, resolution.Messages...)
+						sc = resolution.SuspensionContext
+					}
+
+					prompt = ""
+					continue
+				}
 
 				for _, tc := range sc.PendingToolCalls {
 					fmt.Printf("[%s] Pending tool: %s (call %s)\n", selectedAgent.Name, tc.Name, tc.ID)

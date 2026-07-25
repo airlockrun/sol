@@ -1213,38 +1213,16 @@ func (r *Runner) handleSuspension(err error, stepResult *StepResult, result *Run
 		completed = stepResult.ToolResults
 	}
 
-	suspend := func(reason string, data any) (*RunResult, bool) {
-		result.Status = RunSuspended
-		result.Messages = r.copyMessages()
-		result.NewMessages = r.copyNewMessages()
-		result.CompactionState = r.compactionState
-		result.SuspensionContext = &SuspensionContext{
-			Reason:           reason,
-			Data:             data,
-			PendingToolCalls: pending,
-			CompletedResults: completed,
-		}
-		return result, true
+	suspension, ok := suspensionContextFromError(err, pending, completed)
+	if !ok {
+		return nil, false
 	}
-
-	var permErr *bus.ErrPermissionNeeded
-	if errors.As(err, &permErr) {
-		return suspend("permission", permErr)
-	}
-	var questErr *bus.ErrQuestionNeeded
-	if errors.As(err, &questErr) {
-		return suspend("question", questErr)
-	}
-	var delErr *bus.ErrDelegatedSuspend
-	if errors.As(err, &delErr) {
-		// A delegated child (Task subagent / A2A sibling) suspended.
-		// The resume dispatcher re-drives the child via
-		// SuspensionContext.Data (keyed by Transport) — it does not
-		// rely on PendingToolCalls, so the nil-stepResult case (empty
-		// pending/completed) is correct, not lossy, here.
-		return suspend("delegated", delErr)
-	}
-	return nil, false
+	result.Status = RunSuspended
+	result.Messages = r.copyMessages()
+	result.NewMessages = r.copyNewMessages()
+	result.CompactionState = r.compactionState
+	result.SuspensionContext = suspension
+	return result, true
 }
 
 // pendingToolCalls returns tool calls that have not yet completed.
@@ -1511,6 +1489,7 @@ const (
 type SuspensionContext struct {
 	Reason           string                   `json:"reason"`
 	Data             any                      `json:"data,omitempty"`
+	ToolCallID       string                   `json:"toolCallID,omitempty"`
 	PendingToolCalls []stream.ToolCall        `json:"pendingToolCalls,omitempty"`
 	CompletedResults []stream.ToolResultEvent `json:"completedResults,omitempty"`
 }

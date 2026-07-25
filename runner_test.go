@@ -365,6 +365,9 @@ func TestRunner_SuspensionOnPermissionNeeded(t *testing.T) {
 	if result.SuspensionContext.Reason != "permission" {
 		t.Errorf("expected reason 'permission', got %q", result.SuspensionContext.Reason)
 	}
+	if result.SuspensionContext.ToolCallID != "call_1" {
+		t.Errorf("expected current tool call ID 'call_1', got %q", result.SuspensionContext.ToolCallID)
+	}
 	if len(result.SuspensionContext.PendingToolCalls) != 1 {
 		t.Errorf("expected 1 pending tool call, got %d", len(result.SuspensionContext.PendingToolCalls))
 	}
@@ -933,6 +936,9 @@ func TestRunner_InterruptResumeEquivalence(t *testing.T) {
 		}
 		if result2a.SuspensionContext == nil || result2a.SuspensionContext.Reason != "question" {
 			t.Fatal("Path B phase 1: expected question suspension")
+		}
+		if result2a.SuspensionContext.ToolCallID != "call_1" {
+			t.Errorf("Path B phase 1: tool call ID = %q, want call_1", result2a.SuspensionContext.ToolCallID)
 		}
 
 		data, err := json.Marshal(result2a)
