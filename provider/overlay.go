@@ -1,9 +1,9 @@
 package provider
 
 // Catalog enrichment owned by Sol. Model catalogs describe models and their
-// modalities, but have no notion of which providers serve
-// web search, and it doesn't list search-only providers (e.g. Brave) at all.
-// Those two facts live here as small hand-maintained tables.
+// modalities, but have no notion of which providers serve web search or which
+// runtime-configured providers have no static model list. Those facts live here
+// as small hand-maintained tables.
 //
 // Model kind enrichment lives in capabilities.go, and per-model attachment
 // quirks live in attachment_policy.go.
@@ -23,12 +23,21 @@ var searchBackends = map[string]string{
 	"brave":      "brave",
 }
 
-// searchOnlyProviders are search providers the source catalog doesn't list (no
-// chat/embedding models of their own). AllProviders synthesizes a stub catalog
-// entry for each so they still surface as a configurable provider. Maps
-// provider_id → display name.
-var searchOnlyProviders = map[string]string{
-	"brave": "Brave Search",
+type reservedProvider struct {
+	name         string
+	capabilities CapabilitySet
+}
+
+// reservedProviders are Sol-owned catalog entries. Their IDs take precedence
+// over source-catalog IDs and aliases, and never expose static models.
+var reservedProviders = map[string]reservedProvider{
+	"brave": {
+		name: "Brave Search",
+	},
+	"openai-compatible": {
+		name:         "OpenAI Compatible",
+		capabilities: CapabilitySet{Text: true},
+	},
 }
 
 // SearchBackend returns the sol/websearch backend client name for a provider,

@@ -118,16 +118,23 @@ func CapabilitiesFromModel(m ModelInfo) CapabilitySet {
 	return cs
 }
 
-// ProviderCapabilities unions per-model capabilities across every model in the
-// provider, then ORs in "search" when the provider has a web-search backend
-// (SearchBackend). Search is a provider feature, not derivable from any single
-// model's modalities, so it's the one capability sourced outside the models.
+// ProviderCapabilities returns declared capabilities for reserved providers.
+// For catalog providers it unions capabilities across every model, then ORs in
+// "search" when the provider has a web-search backend (SearchBackend). Search
+// is a provider feature, not derivable from any single model's modalities.
 //
 // A provider with no models is valid — e.g. brave, a search-only stub — in
 // which case the result is just its search capability.
 func ProviderCapabilities(p *ModelsDevProvider) CapabilitySet {
 	var cs CapabilitySet
 	if p == nil {
+		return cs
+	}
+	if entry, ok := reservedProviders[p.ID]; ok {
+		cs = entry.capabilities
+		if SearchBackend(p.ID) != "" {
+			cs.Search = true
+		}
 		return cs
 	}
 	for _, m := range p.Models {

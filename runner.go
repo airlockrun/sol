@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -34,10 +35,13 @@ type Runner struct {
 	modelID    string
 
 	// Runtime options
-	apiKey  string
-	baseURL string
-	workDir string
-	quiet   bool
+	apiKey                    string
+	baseURL                   string
+	httpClient                *http.Client
+	supportsStructuredOutputs *bool
+	includeUsage              *bool
+	workDir                   string
+	quiet                     bool
 
 	// Model and tools
 	model    stream.Model
@@ -77,8 +81,21 @@ type RunnerOptions struct {
 	// APIKey is the API key for the provider implied by Agent.Model.
 	APIKey string
 
-	// BaseURL is an optional override for OpenAI-compatible endpoints.
+	// BaseURL overrides OpenAI-compatible endpoints and is required when the
+	// provider ID is openai-compatible.
 	BaseURL string
+
+	// HTTPClient sends requests for the explicit openai-compatible provider.
+	HTTPClient *http.Client
+
+	// SupportsStructuredOutputs controls native json_schema response formats for
+	// the explicit openai-compatible provider. Nil defaults to false for that
+	// provider.
+	SupportsStructuredOutputs *bool
+
+	// IncludeUsage controls stream_options.include_usage for the explicit
+	// openai-compatible provider. Nil defaults to false for that provider.
+	IncludeUsage *bool
 
 	// WorkDir is the tool execution working directory.
 	WorkDir string
@@ -139,8 +156,11 @@ func NewRunner(opts RunnerOptions) *Runner {
 	model := opts.Model
 	if model == nil && opts.Agent.Model != "" {
 		model = provider.CreateModel(providerID, modelID, provider.Options{
-			APIKey:  opts.APIKey,
-			BaseURL: opts.BaseURL,
+			APIKey:                    opts.APIKey,
+			BaseURL:                   opts.BaseURL,
+			HTTPClient:                opts.HTTPClient,
+			SupportsStructuredOutputs: opts.SupportsStructuredOutputs,
+			IncludeUsage:              opts.IncludeUsage,
 		})
 	}
 
@@ -166,24 +186,27 @@ func NewRunner(opts RunnerOptions) *Runner {
 	}
 
 	r := &Runner{
-		agent:            opts.Agent,
-		providerID:       providerID,
-		modelID:          modelID,
-		apiKey:           opts.APIKey,
-		baseURL:          opts.BaseURL,
-		workDir:          opts.WorkDir,
-		quiet:            opts.Quiet,
-		model:            model,
-		toolSet:          toolSet,
-		executor:         opts.Executor,
-		initialMessages:  opts.InitialMessages,
-		store:            opts.SessionStore,
-		compactionConfig: opts.CompactionConfig,
-		sessionID:        generateSessionID(),
-		bus:              b,
-		permissionMgr:    bus.NewPermissionManager(b),
-		questionMgr:      bus.NewQuestionManager(b),
-		exitState:        opts.ExitState,
+		agent:                     opts.Agent,
+		providerID:                providerID,
+		modelID:                   modelID,
+		apiKey:                    opts.APIKey,
+		baseURL:                   opts.BaseURL,
+		httpClient:                opts.HTTPClient,
+		supportsStructuredOutputs: opts.SupportsStructuredOutputs,
+		includeUsage:              opts.IncludeUsage,
+		workDir:                   opts.WorkDir,
+		quiet:                     opts.Quiet,
+		model:                     model,
+		toolSet:                   toolSet,
+		executor:                  opts.Executor,
+		initialMessages:           opts.InitialMessages,
+		store:                     opts.SessionStore,
+		compactionConfig:          opts.CompactionConfig,
+		sessionID:                 generateSessionID(),
+		bus:                       b,
+		permissionMgr:             bus.NewPermissionManager(b),
+		questionMgr:               bus.NewQuestionManager(b),
+		exitState:                 opts.ExitState,
 	}
 
 	return r
@@ -1293,13 +1316,16 @@ func (r *Runner) SpawnSubagent(ctx context.Context, agentName string, prompt str
 	subagent.Model = r.agent.Model // inherit parent's model
 
 	subRunner := NewRunner(RunnerOptions{
-		Agent:   subagent,
-		APIKey:  r.apiKey,
-		BaseURL: r.baseURL,
-		WorkDir: r.workDir,
-		Bus:     r.bus,
-		Quiet:   true,
-		Model:   r.model,
+		Agent:                     subagent,
+		APIKey:                    r.apiKey,
+		BaseURL:                   r.baseURL,
+		HTTPClient:                r.httpClient,
+		SupportsStructuredOutputs: r.supportsStructuredOutputs,
+		IncludeUsage:              r.includeUsage,
+		WorkDir:                   r.workDir,
+		Bus:                       r.bus,
+		Quiet:                     true,
+		Model:                     r.model,
 	})
 	subRunner.parent = r
 

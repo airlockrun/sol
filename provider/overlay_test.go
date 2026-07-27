@@ -26,19 +26,13 @@ func TestSearchBackends(t *testing.T) {
 	}
 }
 
-// TestSearchOnlyProviders ensures every search-only provider (absent from
-// the source catalog) has both a display name (for the synthesized stub) and a search
-// backend — declaring one without the other is a silent misconfiguration.
-func TestSearchOnlyProviders(t *testing.T) {
-	if _, ok := searchOnlyProviders["brave"]; !ok {
-		t.Error("brave should be a search-only provider")
-	}
-	for id, displayName := range searchOnlyProviders {
-		if displayName == "" {
-			t.Errorf("searchOnlyProviders[%q] has empty display name", id)
+func TestReservedProviders(t *testing.T) {
+	for id, entry := range reservedProviders {
+		if entry.name == "" {
+			t.Errorf("reservedProviders[%q] has empty display name", id)
 		}
-		if SearchBackend(id) == "" {
-			t.Errorf("search-only provider %q has no SearchBackend", id)
+		if entry.capabilities == (CapabilitySet{}) && SearchBackend(id) == "" {
+			t.Errorf("reserved provider %q has no capabilities", id)
 		}
 	}
 }
