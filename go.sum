@@ -1,5 +1,5 @@
-github.com/airlockrun/goai v0.1.5 h1:oZObsx18bOz1Spw+N/IvC84AIC8nTBBCDRXFSu5GBfg=
-github.com/airlockrun/goai v0.1.5/go.mod h1:bwFi12cS+TAyr8SjW7s48WMnsuKWx8PeNcxbIWJ4drM=
+github.com/airlockrun/goai v0.1.6 h1:lVVwEan30ZsMUVba9xdf4TKtOICgOWc8iZmSzYg4lMM=
+github.com/airlockrun/goai v0.1.6/go.mod h1:bwFi12cS+TAyr8SjW7s48WMnsuKWx8PeNcxbIWJ4drM=
 github.com/coder/websocket v1.8.14 h1:9L0p0iKiNOibykf283eHkKUHHrpG7f65OE3BhhO7v9g=
 github.com/coder/websocket v1.8.14/go.mod h1:NX3SzP+inril6yawo5CQXx8+fk145lPDC6pumgx0mVg=
 golang.org/x/net v0.52.0 h1:He/TN1l0e4mmR3QqHMT2Xab3Aj3L9qjbhRm78/6jrW0=
