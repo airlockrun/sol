@@ -34,19 +34,17 @@ type openAICompatProvider struct {
 // must include the version path (e.g. ".../v1"); openaicompat appends
 // "/chat/completions". modalities supplies non-text models; pass nil to default
 // to the OpenAI provider at the same base URL.
-func newOpenAICompatProvider(id, baseURL, apiKey string, modalities provider.Provider) *openAICompatProvider {
+func newOpenAICompatProvider(id, baseURL, apiKey string, modalities provider.Provider, compatOptions openaicompat.Options) *openAICompatProvider {
 	if modalities == nil {
 		modalities = openai.New(provider.Options{APIKey: apiKey, BaseURL: baseURL})
 	}
+	compatOptions.ProviderID = id
+	compatOptions.BaseURL = baseURL
+	compatOptions.APIKey = apiKey
 	return &openAICompatProvider{
 		Provider: modalities,
 		id:       id,
-		compat: openaicompat.New(openaicompat.Options{
-			ProviderID:                id,
-			BaseURL:                   baseURL,
-			APIKey:                    apiKey,
-			SupportsStructuredOutputs: true,
-		}),
+		compat:   openaicompat.New(compatOptions),
 	}
 }
 

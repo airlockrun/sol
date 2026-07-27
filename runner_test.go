@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -120,14 +121,29 @@ func TestNewRunner_Options(t *testing.T) {
 	mockModel := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
 		StreamResponse: testutil.MockTextResponse("hi", testutil.MockUsage(1, 1)),
 	})
+	supportsStructuredOutputs := true
+	includeUsage := true
+	httpClient := &http.Client{}
 
 	runner := NewRunner(RunnerOptions{
-		Agent: a,
-		Model: mockModel,
+		Agent:                     a,
+		Model:                     mockModel,
+		SupportsStructuredOutputs: &supportsStructuredOutputs,
+		IncludeUsage:              &includeUsage,
+		HTTPClient:                httpClient,
 	})
 
 	if runner.agent.Name != "build" {
 		t.Errorf("expected agent name 'build', got %s", runner.agent.Name)
+	}
+	if runner.supportsStructuredOutputs == nil || !*runner.supportsStructuredOutputs {
+		t.Error("SupportsStructuredOutputs was not retained")
+	}
+	if runner.includeUsage == nil || !*runner.includeUsage {
+		t.Error("IncludeUsage was not retained")
+	}
+	if runner.httpClient != httpClient {
+		t.Error("HTTPClient was not retained")
 	}
 }
 

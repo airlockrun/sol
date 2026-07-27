@@ -4,6 +4,7 @@
 package provider
 
 import (
+	"net/http"
 	"strings"
 
 	"github.com/airlockrun/goai/model"
@@ -27,6 +28,7 @@ import (
 	"github.com/airlockrun/goai/provider/luma"
 	"github.com/airlockrun/goai/provider/mistral"
 	"github.com/airlockrun/goai/provider/openai"
+	"github.com/airlockrun/goai/provider/openaicompat"
 	goaiopenrouter "github.com/airlockrun/goai/provider/openrouter"
 	"github.com/airlockrun/goai/provider/perplexity"
 	"github.com/airlockrun/goai/provider/proxy"
@@ -56,6 +58,18 @@ func ParseModel(model string) (providerID, modelID string) {
 type Options struct {
 	APIKey  string
 	BaseURL string
+
+	// HTTPClient sends requests only for the explicit openai-compatible provider.
+	HTTPClient *http.Client
+
+	// SupportsStructuredOutputs controls native json_schema response formats for
+	// the explicit openai-compatible provider. Nil defaults to false for that
+	// provider.
+	SupportsStructuredOutputs *bool
+
+	// IncludeUsage controls stream_options.include_usage for the explicit
+	// openai-compatible provider. Nil defaults to false for that provider.
+	IncludeUsage *bool
 }
 
 // ProxyOptions holds configuration for creating a proxy-backed model.
@@ -150,7 +164,29 @@ var providerFactories = map[string]providerFactory{
 		// dedicated goai openrouter provider, whose wire shapes (POST /images,
 		// JSON-base64 transcription) differ from OpenAI's.
 		return newOpenAICompatProvider("openrouter", baseURL, o.APIKey,
-			goaiopenrouter.New(provider.Options{APIKey: o.APIKey, BaseURL: baseURL}))
+			goaiopenrouter.New(provider.Options{APIKey: o.APIKey, BaseURL: baseURL}),
+			openaicompat.Options{SupportsStructuredOutputs: true})
+	},
+	"openai-compatible": func(o Options) provider.Provider {
+		baseURL := strings.TrimSpace(o.BaseURL)
+		if baseURL == "" {
+			panic("provider openai-compatible requires BaseURL")
+		}
+		baseURL = strings.TrimRight(baseURL, "/")
+		includeUsage := false
+		if o.IncludeUsage != nil {
+			includeUsage = *o.IncludeUsage
+		}
+		supportsStructuredOutputs := false
+		if o.SupportsStructuredOutputs != nil {
+			supportsStructuredOutputs = *o.SupportsStructuredOutputs
+		}
+		return newOpenAICompatProvider("openai-compatible", baseURL, o.APIKey, nil,
+			openaicompat.Options{
+				SupportsStructuredOutputs: supportsStructuredOutputs,
+				IncludeUsage:              &includeUsage,
+				HTTPClient:                o.HTTPClient,
+			})
 	},
 
 	// Speech / audio / image providers.
@@ -191,7 +227,8 @@ func createProvider(providerID string, opts Options) provider.Provider {
 			baseURL = strings.TrimRight(info.API, "/")
 		}
 	}
-	return newOpenAICompatProvider(providerID, baseURL, opts.APIKey, nil)
+	return newOpenAICompatProvider(providerID, baseURL, opts.APIKey, nil,
+		openaicompat.Options{SupportsStructuredOutputs: true})
 }
 
 // CreateImageModel creates an image generation model from provider and model IDs.

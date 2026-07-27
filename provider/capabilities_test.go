@@ -208,6 +208,13 @@ func TestProviderCapabilities(t *testing.T) {
 			want: CapabilitySet{Search: true},
 		},
 		{
+			name: "reserved provider ignores catalog models",
+			p: &ModelsDevProvider{ID: "openai-compatible", Models: map[string]ModelInfo{
+				"remote-embedding": {ID: "remote-embedding", Kind: KindEmbedding},
+			}},
+			want: CapabilitySet{Text: true},
+		},
+		{
 			name: "empty non-search provider = empty set",
 			p:    &ModelsDevProvider{ID: "nosearch", Models: map[string]ModelInfo{}},
 			want: CapabilitySet{},

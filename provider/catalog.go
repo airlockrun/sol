@@ -1,22 +1,21 @@
 package provider
 
-// AllProviders returns the Airlock model catalog enriched with search-only
-// provider stubs. Callers that want the source
-// catalog unmodified should call LoadProviders directly.
+// AllProviders returns the Airlock model catalog enriched with reserved
+// provider stubs. Callers that want the source catalog unmodified should call
+// LoadProviders directly.
 //
 // The catalog is remotely refreshed and has an embedded fallback. The only
-// hand-maintained entries in Sol are search providers (overlay.go).
+// hand-maintained entries in Sol are reserved providers (overlay.go).
 //
-// Deprecated models (Status == "deprecated") are dropped so they
-// don't surface in pickers / catalogs. Runtime lookups via GetModelInfo go
-// through LoadProviders directly and so still resolve — agents configured on a
-// now-deprecated model keep running, they're just hidden from the dropdown.
+// Deprecated models (Status == "deprecated") are dropped so they don't surface
+// in pickers / catalogs. Runtime lookups for source-catalog providers use
+// LoadProviders and still resolve, so configured deprecated models keep running
+// while remaining hidden from the dropdown.
 //
 // Merge semantics, in order:
 //
 //  1. Start from LoadProviders().
-//  2. Synthesize stubs for search-only providers absent from the catalog
-//     (e.g. brave). Their search capability is derived from SearchBackend.
+//  2. Overlay reserved providers with model-free stubs.
 //  3. Drop deprecated entries from every provider in the merged set.
 //
 // The returned map's inner *ModelsDevProvider pointers are clones whenever
@@ -27,24 +26,19 @@ func AllProviders() (map[string]*ModelsDevProvider, error) {
 	if err != nil {
 		return nil, err
 	}
+	return mergeProviderCatalog(base), nil
+}
 
-	out := make(map[string]*ModelsDevProvider, len(base)+len(searchOnlyProviders))
+func mergeProviderCatalog(base map[string]*ModelsDevProvider) map[string]*ModelsDevProvider {
+	out := make(map[string]*ModelsDevProvider, len(base)+len(reservedProviders))
 	for id, p := range base {
 		out[id] = p
 	}
 
-	// Step 2: synthesize stubs for search-only providers that the source catalog
-	// doesn't list at all (e.g. Brave), so they still surface as configurable
-	// providers. Their "search" capability is derived later from SearchBackend.
-	for id, displayName := range searchOnlyProviders {
-		if _, ok := out[id]; ok {
-			continue
-		}
-		out[id] = &ModelsDevProvider{
-			ID:     id,
-			Name:   displayName,
-			Models: map[string]ModelInfo{},
-		}
+	// Step 2: overwrite source entries whose IDs are reserved by Sol. This keeps
+	// remotely supplied metadata and models out of runtime-configured providers.
+	for id, entry := range reservedProviders {
+		out[id] = reservedProviderInfo(id, entry)
 	}
 
 	// Step 3: drop deprecated models. We iterate every provider in the
@@ -70,7 +64,15 @@ func AllProviders() (map[string]*ModelsDevProvider, error) {
 		out[id] = clone
 	}
 
-	return out, nil
+	return out
+}
+
+func reservedProviderInfo(id string, entry reservedProvider) *ModelsDevProvider {
+	return &ModelsDevProvider{
+		ID:     id,
+		Name:   entry.name,
+		Models: map[string]ModelInfo{},
+	}
 }
 
 // cloneProvider returns a shallow copy of p with a fresh Models map so

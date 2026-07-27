@@ -320,6 +320,15 @@ func StartPeriodicRefresh(ctx context.Context) {
 
 func GetProviderInfo(providerID string) (*ModelsDevProvider, bool) {
 	providers, _ := LoadProviders()
+	return getProviderInfo(providers, providerID)
+}
+
+func getProviderInfo(providers map[string]*ModelsDevProvider, providerID string) (*ModelsDevProvider, bool) {
+	// Reserved IDs are authoritative even when the source catalog publishes the
+	// same ID or assigns it as an alias to another provider.
+	if entry, ok := reservedProviders[providerID]; ok {
+		return reservedProviderInfo(providerID, entry), true
+	}
 	provider, ok := providers[providerID]
 	if ok {
 		return provider, true
@@ -347,7 +356,7 @@ func GetModelInfo(providerID, modelID string) (*ModelInfo, bool) {
 }
 
 func ListProviders() []string {
-	providers, _ := LoadProviders()
+	providers, _ := AllProviders()
 	ids := make([]string, 0, len(providers))
 	for id := range providers {
 		ids = append(ids, id)
