@@ -71,12 +71,13 @@ type Message struct {
 
 // Part represents a part of a message (text, tool call, file, etc.)
 type Part struct {
-	ID        string    `json:"id"`
-	Type      string    `json:"type"` // "text", "tool", "reasoning", "compaction", "file"
-	Text      string    `json:"text,omitempty"`
-	Tool      *ToolPart `json:"tool,omitempty"`
-	File      *FilePart `json:"file,omitempty"`
-	Compacted bool      `json:"compacted,omitempty"` // True if output has been pruned
+	ID              string         `json:"id"`
+	Type            string         `json:"type"` // "text", "tool", "reasoning", "compaction", "file"
+	Text            string         `json:"text,omitempty"`
+	ProviderOptions map[string]any `json:"providerOptions,omitempty"`
+	Tool            *ToolPart      `json:"tool,omitempty"`
+	File            *FilePart      `json:"file,omitempty"`
+	Compacted       bool           `json:"compacted,omitempty"` // True if output has been pruned
 }
 
 // ToolPart represents a tool call and its result.

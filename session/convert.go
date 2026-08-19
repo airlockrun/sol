@@ -109,8 +109,9 @@ func FromGoAIMessage(m goai.Message) Message {
 			}
 		case message.ReasoningPart:
 			msg.Parts = append(msg.Parts, Part{
-				Type: "reasoning",
-				Text: v.Text,
+				Type:            "reasoning",
+				Text:            v.Text,
+				ProviderOptions: v.ProviderOptions,
 			})
 		}
 	}
@@ -148,6 +149,11 @@ func MessageToGoAI(msg Message) []goai.Message {
 					if p.Text != "" {
 						parts = append(parts, goai.TextPart{Text: p.Text})
 					}
+				case "reasoning":
+					parts = append(parts, goai.ReasoningPart{
+						Text:            p.Text,
+						ProviderOptions: p.ProviderOptions,
+					})
 				case "tool":
 					if p.Tool != nil {
 						parts = append(parts, goai.ToolCallPart{

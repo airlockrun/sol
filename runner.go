@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"sort"
 	"strings"
@@ -63,7 +64,6 @@ type Runner struct {
 	initialMessages  []goai.Message   // Pre-loaded thread history (ignored when store is set)
 	newMessages      []goai.Message   // append-only: messages generated during this run
 	compactionState  *CompactionState // set if compaction happened
-	retryStatus      session.RetryStatus
 	doomDetector     *session.DoomLoopDetector
 
 	// exitState is the optional "must call exit" hook. When non-nil the
@@ -344,8 +344,7 @@ func (r *Runner) Run(ctx context.Context, prompt string) (*RunResult, error) {
 		maxSteps = 50
 	}
 
-	// Initialize retry status and doom loop detector
-	r.retryStatus = session.NewRetryStatus()
+	// Initialize doom loop detector
 	r.doomDetector = session.NewDoomLoopDetector()
 
 	// Run the thinking loop
@@ -359,8 +358,15 @@ func (r *Runner) Run(ctx context.Context, prompt string) (*RunResult, error) {
 				return suspResult, nil
 			}
 
-			// Check for context cancellation
-			if ctx.Err() != nil {
+			// A failed durable write is a run failure even when cancellation
+			// triggered the step that was being persisted.
+			var appendErr *sessionStoreAppendError
+			if ctx.Err() != nil && !errors.As(err, &appendErr) {
+				if stepResult != nil {
+					result.Steps = append(result.Steps, stepResult)
+					result.TotalText += stepResult.Text
+					r.session.UpdateTokens(stepResult.Usage)
+				}
 				result.Status = RunCancelled
 				result.Messages = r.copyMessages()
 				result.NewMessages = r.copyNewMessages()
@@ -369,26 +375,10 @@ func (r *Runner) Run(ctx context.Context, prompt string) (*RunResult, error) {
 				return result, ctx.Err()
 			}
 
-			// Check if error is retryable
-			if reason := session.RetryableError(err); reason != "" && r.retryStatus.Attempt < session.MaxRetryAttempts {
-				r.retryStatus.Attempt++
-				delay := session.RetryDelay(r.retryStatus.Attempt, nil)
-				r.retryStatus.SetRetrying(r.retryStatus.Attempt, reason, time.Now().Add(delay))
-
-				r.log("[%s] Retry %d/%d in %v: %s\n",
-					r.agent.Name, r.retryStatus.Attempt, session.MaxRetryAttempts, delay, reason)
-
-				select {
-				case <-time.After(delay):
-					continue
-				case <-ctx.Done():
-					result.Status = RunCancelled
-					result.Messages = r.copyMessages()
-					result.NewMessages = r.copyNewMessages()
-					result.CompactionState = r.compactionState
-					result.Error = ctx.Err()
-					return result, ctx.Err()
-				}
+			if stepResult != nil {
+				result.Steps = append(result.Steps, stepResult)
+				result.TotalText += stepResult.Text
+				r.session.UpdateTokens(stepResult.Usage)
 			}
 
 			result.Status = RunFailed
@@ -398,9 +388,6 @@ func (r *Runner) Run(ctx context.Context, prompt string) (*RunResult, error) {
 			result.Error = err
 			return result, fmt.Errorf("step %d error: %w", step+1, err)
 		}
-
-		// Reset retry status on success
-		r.retryStatus.SetIdle()
 
 		result.Steps = append(result.Steps, stepResult)
 		result.TotalText += stepResult.Text
@@ -641,7 +628,13 @@ func (r *Runner) Continue(ctx context.Context, prompt string) (*RunResult, error
 				return suspResult, nil
 			}
 
-			if ctx.Err() != nil {
+			var appendErr *sessionStoreAppendError
+			if ctx.Err() != nil && !errors.As(err, &appendErr) {
+				if stepResult != nil {
+					result.Steps = append(result.Steps, stepResult)
+					result.TotalText += stepResult.Text
+					r.session.UpdateTokens(stepResult.Usage)
+				}
 				result.Status = RunCancelled
 				result.Messages = r.copyMessages()
 				result.NewMessages = r.copyNewMessages()
@@ -650,25 +643,10 @@ func (r *Runner) Continue(ctx context.Context, prompt string) (*RunResult, error
 				return result, ctx.Err()
 			}
 
-			if reason := session.RetryableError(err); reason != "" && r.retryStatus.Attempt < session.MaxRetryAttempts {
-				r.retryStatus.Attempt++
-				delay := session.RetryDelay(r.retryStatus.Attempt, nil)
-				r.retryStatus.SetRetrying(r.retryStatus.Attempt, reason, time.Now().Add(delay))
-
-				r.log("[%s] Retry %d/%d in %v: %s\n",
-					r.agent.Name, r.retryStatus.Attempt, session.MaxRetryAttempts, delay, reason)
-
-				select {
-				case <-time.After(delay):
-					continue
-				case <-ctx.Done():
-					result.Status = RunCancelled
-					result.Messages = r.copyMessages()
-					result.NewMessages = r.copyNewMessages()
-					result.CompactionState = r.compactionState
-					result.Error = ctx.Err()
-					return result, ctx.Err()
-				}
+			if stepResult != nil {
+				result.Steps = append(result.Steps, stepResult)
+				result.TotalText += stepResult.Text
+				r.session.UpdateTokens(stepResult.Usage)
 			}
 
 			result.Status = RunFailed
@@ -679,7 +657,6 @@ func (r *Runner) Continue(ctx context.Context, prompt string) (*RunResult, error
 			return result, fmt.Errorf("step %d error: %w", step+1, err)
 		}
 
-		r.retryStatus.SetIdle()
 		result.Steps = append(result.Steps, stepResult)
 		result.TotalText += stepResult.Text
 
@@ -770,9 +747,6 @@ func (r *Runner) runStep(ctx context.Context) (*StepResult, error) {
 	// Get provider-specific options
 	providerOpts := provider.ProviderOptions(r.providerID, r.modelID, r.sessionID)
 
-	// Get max output tokens
-	maxTokens := provider.MaxOutputTokens(r.modelID)
-
 	// Apply the agent's Redactor (sensitive-substring stripper)
 	// before the messages leave the agent. agentsdk wires this from
 	// its sensitiveSet. Best-effort; covers system prompt, env prompt,
@@ -780,11 +754,13 @@ func (r *Runner) runStep(ctx context.Context) (*StepResult, error) {
 	llmMessages := coalesceConsecutiveUser(redactMessages(r.messages, r.agent.Redactor))
 
 	input := stream.Input{
-		Model:           r.model,
-		Messages:        llmMessages,
-		Tools:           r.toolSet,
-		ActiveTools:     activeTools,
-		MaxOutputTokens: &maxTokens,
+		Model:       r.model,
+		Messages:    llmMessages,
+		Tools:       r.toolSet,
+		ActiveTools: activeTools,
+		// Match ai-sdk: leave the output limit unset unless the caller
+		// explicitly configures one, so the provider applies its model default.
+		MaxOutputTokens: nil,
 		ToolChoice:      "auto",
 		ProviderOptions: providerOpts,
 		Executor:        r.executor,
@@ -806,6 +782,10 @@ func (r *Runner) runStep(ctx context.Context) (*StepResult, error) {
 	var toolCalls []stream.ToolCall
 	var toolResults []stream.ToolResultEvent
 	var reasoningParts []goai.ReasoningPart
+	var reasoningID string
+	reasoningIndex := -1
+	var observedFinishReason stream.FinishReason
+	var observedUsage stream.Usage
 
 	for event := range streamResult.FullStream {
 		switch e := event.Data.(type) {
@@ -813,16 +793,49 @@ func (r *Runner) runStep(ctx context.Context) (*StepResult, error) {
 			r.bus.Publish(bus.StreamTextDelta, e)
 			r.logText(e.Text)
 			textBuilder.WriteString(e.Text)
+		case stream.ReasoningStartEvent:
+			reasoningParts = append(reasoningParts, goai.ReasoningPart{
+				ProviderOptions: reasoningProviderOptions(e.ProviderMetadata, e.ID),
+			})
+			reasoningIndex = len(reasoningParts) - 1
+			reasoningID = e.ID
+		case stream.ReasoningDeltaEvent:
+			if reasoningIndex < 0 || (reasoningID != "" && e.ID != "" && reasoningID != e.ID) {
+				reasoningParts = append(reasoningParts, goai.ReasoningPart{
+					ProviderOptions: reasoningProviderOptions(e.ProviderMetadata, e.ID),
+				})
+				reasoningIndex = len(reasoningParts) - 1
+				reasoningID = e.ID
+			} else {
+				mergeReasoningProviderOptions(reasoningParts[reasoningIndex].ProviderOptions, e.ProviderMetadata)
+				if reasoningID == "" && e.ID != "" {
+					reasoningID = e.ID
+					reasoningParts[reasoningIndex].ProviderOptions["itemId"] = e.ID
+				}
+			}
+			reasoningParts[reasoningIndex].Text += e.Text
 		case stream.ReasoningEndEvent:
-			providerOpts := e.ProviderMetadata
-			if providerOpts == nil {
-				providerOpts = make(map[string]any)
+			if reasoningIndex < 0 || (reasoningID != "" && e.ID != "" && reasoningID != e.ID) {
+				reasoningParts = append(reasoningParts, goai.ReasoningPart{
+					ProviderOptions: reasoningProviderOptions(e.ProviderMetadata, e.ID),
+				})
+				reasoningIndex = len(reasoningParts) - 1
+			} else {
+				mergeReasoningProviderOptions(reasoningParts[reasoningIndex].ProviderOptions, e.ProviderMetadata)
 			}
-			providerOpts["itemId"] = e.ID
-			rp := goai.ReasoningPart{
-				ProviderOptions: providerOpts,
+			if e.ID != "" {
+				reasoningParts[reasoningIndex].ProviderOptions["itemId"] = e.ID
 			}
-			reasoningParts = append(reasoningParts, rp)
+			reasoningID = ""
+			reasoningIndex = -1
+		case stream.FinishEvent:
+			observedFinishReason = e.FinishReason
+			observedUsage = e.Usage
+		case stream.FinishStepEvent:
+			if observedFinishReason == "" {
+				observedFinishReason = e.FinishReason
+			}
+			observedUsage = e.Usage
 		case stream.ToolCallEvent:
 			r.bus.Publish(bus.StreamToolCall, e)
 			toolCalls = append(toolCalls, stream.ToolCall{
@@ -877,7 +890,15 @@ func (r *Runner) runStep(ctx context.Context) (*StepResult, error) {
 				// the resume path's tool-result append forms a valid
 				// assistant→tool pair. A delegated suspend that skipped this
 				// left an orphaned tool message → next LLM turn 400s.
-				r.appendPartialStep(ctx, textBuilder.String(), reasoningParts, toolCalls, toolResults, stream.Usage{})
+				if err := r.appendPartialStep(ctx, textBuilder.String(), reasoningParts, toolCalls, toolResults, observedUsage); err != nil {
+					return &StepResult{
+						Text:         textBuilder.String(),
+						ToolCalls:    toolCalls,
+						ToolResults:  toolResults,
+						FinishReason: observedFinishReason,
+						Usage:        observedUsage,
+					}, err
+				}
 
 				// Re-publish permission/question suspension events on the
 				// runner's bus so the bridge forwards them in real-time (the
@@ -901,9 +922,11 @@ func (r *Runner) runStep(ctx context.Context) (*StepResult, error) {
 				}
 
 				return &StepResult{
-					Text:        textBuilder.String(),
-					ToolCalls:   toolCalls,
-					ToolResults: toolResults,
+					Text:         textBuilder.String(),
+					ToolCalls:    toolCalls,
+					ToolResults:  toolResults,
+					FinishReason: observedFinishReason,
+					Usage:        observedUsage,
 				}, fmt.Errorf("stream error: %w", e.Error)
 			}
 			// Cancellation surfaced as a stream error: persist the partial
@@ -911,14 +934,41 @@ func (r *Runner) runStep(ctx context.Context) (*StepResult, error) {
 			// result, added in appendMessages) so the interrupted work
 			// survives into the next turn's context instead of vanishing.
 			if ctx.Err() != nil || errors.Is(e.Error, context.Canceled) {
-				r.appendPartialStep(ctx, textBuilder.String(), reasoningParts, toolCalls, toolResults, stream.Usage{})
+				appendErr := r.appendPartialStep(ctx, textBuilder.String(), reasoningParts, toolCalls, toolResults, observedUsage)
+				if appendErr != nil {
+					return &StepResult{
+						Text:         textBuilder.String(),
+						ToolCalls:    toolCalls,
+						ToolResults:  toolResults,
+						FinishReason: observedFinishReason,
+						Usage:        observedUsage,
+					}, appendErr
+				}
 				return &StepResult{
-					Text:        textBuilder.String(),
-					ToolCalls:   toolCalls,
-					ToolResults: toolResults,
+					Text:         textBuilder.String(),
+					ToolCalls:    toolCalls,
+					ToolResults:  toolResults,
+					FinishReason: observedFinishReason,
+					Usage:        observedUsage,
 				}, fmt.Errorf("stream error: %w", e.Error)
 			}
-			return nil, fmt.Errorf("stream error: %w", e.Error)
+			appendErr := r.appendMessages(ctx, true, textBuilder.String(), reasoningParts, toolCalls, toolResults, observedUsage)
+			if appendErr != nil {
+				return &StepResult{
+					Text:         textBuilder.String(),
+					ToolCalls:    toolCalls,
+					ToolResults:  toolResults,
+					FinishReason: observedFinishReason,
+					Usage:        observedUsage,
+				}, appendErr
+			}
+			return &StepResult{
+				Text:         textBuilder.String(),
+				ToolCalls:    toolCalls,
+				ToolResults:  toolResults,
+				FinishReason: observedFinishReason,
+				Usage:        observedUsage,
+			}, fmt.Errorf("stream error: %w", e.Error)
 		}
 	}
 
@@ -940,22 +990,53 @@ func (r *Runner) runStep(ctx context.Context) (*StepResult, error) {
 		Usage:        usage,
 	}
 
+	if err := r.appendMessages(ctx, true, text, reasoningParts, toolCalls, toolResults, usage); err != nil {
+		return stepResult, err
+	}
 	r.bus.Publish(bus.StreamStepComplete, stepResult)
 
-	r.appendMessages(ctx, true, text, reasoningParts, toolCalls, toolResults, usage)
+	switch finishReason {
+	case stream.FinishReasonLength:
+		return stepResult, errors.New("model output incomplete: maximum output token limit reached")
+	case stream.FinishReasonError:
+		return stepResult, errors.New("model response failed")
+	}
 
 	return stepResult, nil
 }
 
-// appendPartialStep appends the assistant message and completed tool results to r.messages
-// for a partially completed step (e.g., when a tool needs permission/question). Usage is
-// typically zero here because the stream did not complete.
-func (r *Runner) appendPartialStep(ctx context.Context, text string, reasoningParts []goai.ReasoningPart, toolCalls []stream.ToolCall, toolResults []stream.ToolResultEvent, usage stream.Usage) {
+// appendPartialStep appends the assistant message and completed tool results to
+// r.messages for a resumable or cancelled step.
+func (r *Runner) appendPartialStep(ctx context.Context, text string, reasoningParts []goai.ReasoningPart, toolCalls []stream.ToolCall, toolResults []stream.ToolResultEvent, usage stream.Usage) error {
 	// completed=false: a suspended step (permission/question) deliberately
 	// leaves its pending tool-call unanswered for the resume path to fill, so
 	// orphan-synthesis must not run. The ctx-cancelled sub-case still gets a
 	// synthesized "Cancelled by user." result via appendMessages' own check.
-	r.appendMessages(ctx, false, text, reasoningParts, toolCalls, toolResults, usage)
+	return r.appendMessages(ctx, false, text, reasoningParts, toolCalls, toolResults, usage)
+}
+
+type sessionStoreAppendError struct {
+	err error
+}
+
+func (e *sessionStoreAppendError) Error() string { return "store append: " + e.err.Error() }
+func (e *sessionStoreAppendError) Unwrap() error { return e.err }
+
+func reasoningProviderOptions(metadata map[string]any, id string) map[string]any {
+	options := maps.Clone(metadata)
+	if options == nil {
+		options = make(map[string]any)
+	}
+	if id != "" {
+		options["itemId"] = id
+	}
+	return options
+}
+
+func mergeReasoningProviderOptions(destination, source map[string]any) {
+	for key, value := range source {
+		destination[key] = value
+	}
 }
 
 // appendMessages builds and appends assistant + tool result messages to r.messages and r.newMessages.
@@ -969,7 +1050,7 @@ func (r *Runner) appendPartialStep(ctx context.Context, text string, reasoningPa
 // call (OpenAI-compatible APIs reject an unanswered tool_call). Both that case
 // and a mid-step cancellation synthesize a placeholder result so the persisted
 // step is always a valid assistant→tool pair.
-func (r *Runner) appendMessages(ctx context.Context, completed bool, text string, reasoningParts []goai.ReasoningPart, toolCalls []stream.ToolCall, toolResults []stream.ToolResultEvent, usage stream.Usage) {
+func (r *Runner) appendMessages(ctx context.Context, completed bool, text string, reasoningParts []goai.ReasoningPart, toolCalls []stream.ToolCall, toolResults []stream.ToolResultEvent, usage stream.Usage) error {
 	if len(toolCalls) > 0 && (completed || ctx.Err() != nil) {
 		reason := "No tool result was recorded for this call."
 		if ctx.Err() != nil {
@@ -1099,10 +1180,11 @@ func (r *Runner) appendMessages(ctx context.Context, completed bool, text string
 			storeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 			defer cancel()
 			if err := r.store.Append(storeCtx, sessionMsgs); err != nil {
-				r.log("[%s] Warning: store append failed: %v\n", r.agent.Name, err)
+				return &sessionStoreAppendError{err: err}
 			}
 		}
 	}
+	return nil
 }
 
 // stripOldFilesFromHistory enforces HistoryPolicy.FilesRetainTurns by
@@ -1239,6 +1321,11 @@ func (r *Runner) handleSuspension(err error, stepResult *StepResult, result *Run
 	suspension, ok := suspensionContextFromError(err, pending, completed)
 	if !ok {
 		return nil, false
+	}
+	if stepResult != nil {
+		result.Steps = append(result.Steps, stepResult)
+		result.TotalText += stepResult.Text
+		r.session.UpdateTokens(stepResult.Usage)
 	}
 	result.Status = RunSuspended
 	result.Messages = r.copyMessages()
