@@ -24,6 +24,8 @@ type testStore struct {
 	messages    []session.Message
 	tokensFreed int
 	compactErr  error
+	appendCalls int
+	appendErrAt int
 }
 
 func (s *testStore) Load(context.Context) ([]session.Message, error) {
@@ -31,6 +33,10 @@ func (s *testStore) Load(context.Context) ([]session.Message, error) {
 }
 
 func (s *testStore) Append(_ context.Context, msgs []session.Message) error {
+	s.appendCalls++
+	if s.appendCalls == s.appendErrAt {
+		return errors.New("database unavailable")
+	}
 	s.messages = append(s.messages, msgs...)
 	return nil
 }
@@ -188,6 +194,236 @@ func TestRunner_Run_CompletedStatus(t *testing.T) {
 	}
 	if result.Messages[2].Role != "assistant" {
 		t.Errorf("msg[2] role = %s, want assistant", result.Messages[2].Role)
+	}
+}
+
+func TestRunner_DoesNotForceMaxOutputTokens(t *testing.T) {
+	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
+		DoStreamFunc: func(ctx context.Context, options *stream.CallOptions) (<-chan stream.Event, error) {
+			if options.MaxOutputTokens != nil {
+				t.Errorf("MaxOutputTokens = %d, want provider default", *options.MaxOutputTokens)
+			}
+			events := make(chan stream.Event, 4)
+			for _, event := range testutil.MockTextResponse("ok", testutil.MockUsage(1, 1)) {
+				events <- event
+			}
+			close(events)
+			return events, nil
+		},
+	})
+	runner := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Model: model, Quiet: true})
+	if _, err := runner.Run(context.Background(), "hi"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRunner_LengthFinishIsIncomplete(t *testing.T) {
+	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
+		StreamResponse: []stream.Event{
+			{Type: stream.EventTextDelta, Data: stream.TextDeltaEvent{Text: "partial"}},
+			{
+				Type: stream.EventFinish,
+				Data: stream.FinishEvent{FinishReason: stream.FinishReasonLength, Usage: testutil.MockUsage(10, 16_385)},
+			},
+		},
+	})
+	runner := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Model: model, Quiet: true})
+	result, err := runner.Run(context.Background(), "hi")
+	if err == nil || !strings.Contains(err.Error(), "maximum output token limit") {
+		t.Fatalf("error = %v, want output-limit error", err)
+	}
+	if result.Status != RunFailed {
+		t.Fatalf("status = %s, want %s", result.Status, RunFailed)
+	}
+	if len(result.Steps) != 1 || result.TotalText != "partial" {
+		t.Fatalf("partial result: steps = %d, text = %q", len(result.Steps), result.TotalText)
+	}
+	if result.Usage.OutputTokens.Total == nil || *result.Usage.OutputTokens.Total != 16_385 {
+		t.Fatalf("output token usage = %#v, want 16385", result.Usage.OutputTokens.Total)
+	}
+}
+
+func TestRunner_ErrorFinishFailsWithPartialResult(t *testing.T) {
+	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
+		StreamResponse: []stream.Event{
+			{Type: stream.EventTextDelta, Data: stream.TextDeltaEvent{Text: "partial"}},
+			{
+				Type: stream.EventFinish,
+				Data: stream.FinishEvent{FinishReason: stream.FinishReasonError, Usage: testutil.MockUsage(10, 4)},
+			},
+		},
+	})
+	runner := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Model: model, Quiet: true})
+	result, err := runner.Run(context.Background(), "hi")
+	if err == nil || !strings.Contains(err.Error(), "model response failed") {
+		t.Fatalf("error = %v, want model response failure", err)
+	}
+	if result.Status != RunFailed || len(result.Steps) != 1 || result.TotalText != "partial" {
+		t.Fatalf("partial failure result: status=%s steps=%d text=%q", result.Status, len(result.Steps), result.TotalText)
+	}
+	if result.Usage.OutputTokens.Total == nil || *result.Usage.OutputTokens.Total != 4 {
+		t.Fatalf("output token usage = %#v, want 4", result.Usage.OutputTokens.Total)
+	}
+}
+
+func TestRunner_AssistantStoreAppendFailureFailsRun(t *testing.T) {
+	store := &testStore{appendErrAt: 2}
+	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
+		StreamResponse: testutil.MockTextResponse("partial", testutil.MockUsage(2, 1)),
+	})
+	runner := NewRunner(RunnerOptions{
+		Agent:        testAgent(tool.Set{}),
+		Model:        model,
+		SessionStore: store,
+		Quiet:        true,
+	})
+	result, err := runner.Run(context.Background(), "hi")
+	if err == nil || !strings.Contains(err.Error(), "store append: database unavailable") {
+		t.Fatalf("error = %v, want store append error", err)
+	}
+	if result.Status != RunFailed || len(result.Steps) != 1 || result.TotalText != "partial" {
+		t.Fatalf("partial failure result: status=%s steps=%d text=%q", result.Status, len(result.Steps), result.TotalText)
+	}
+}
+
+func TestRunner_ContinueStoreAppendFailureWinsOverCancellation(t *testing.T) {
+	store := &testStore{}
+	runBus := bus.New()
+	var cancelContinue context.CancelFunc
+	runBus.Subscribe(bus.StreamTextDelta, func(bus.Event) {
+		if cancelContinue != nil {
+			cancelContinue()
+			cancelContinue = nil
+		}
+	})
+	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
+		StreamResponse: testutil.MockTextResponse("partial", testutil.MockUsage(2, 1)),
+	})
+	runner := NewRunner(RunnerOptions{
+		Agent:        testAgent(tool.Set{}),
+		Model:        model,
+		Bus:          runBus,
+		SessionStore: store,
+		Quiet:        true,
+	})
+	if _, err := runner.Run(context.Background(), "hi"); err != nil {
+		t.Fatal(err)
+	}
+	store.appendErrAt = 3
+	ctx, cancel := context.WithCancel(context.Background())
+	cancelContinue = cancel
+	result, err := runner.Continue(ctx, "continue")
+	if err == nil || !strings.Contains(err.Error(), "store append: database unavailable") {
+		t.Fatalf("error = %v, want store append error", err)
+	}
+	if result.Status != RunFailed {
+		t.Fatalf("status = %s, want %s", result.Status, RunFailed)
+	}
+}
+
+func TestRunner_StreamErrorRetainsPartialText(t *testing.T) {
+	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
+		StreamResponse: []stream.Event{
+			{Type: stream.EventTextDelta, Data: stream.TextDeltaEvent{Text: "partial"}},
+			{Type: stream.EventError, Data: stream.ErrorEvent{Error: errors.New("connection reset")}},
+		},
+	})
+	runner := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Model: model, Quiet: true})
+	result, err := runner.Run(context.Background(), "hi")
+	if err == nil || !strings.Contains(err.Error(), "connection reset") {
+		t.Fatalf("error = %v, want stream error", err)
+	}
+	if result.Status != RunFailed || len(result.Steps) != 1 || result.TotalText != "partial" {
+		t.Fatalf("partial failure result: status=%s steps=%d text=%q", result.Status, len(result.Steps), result.TotalText)
+	}
+	if len(result.NewMessages) != 1 || result.NewMessages[0].Role != message.RoleAssistant {
+		t.Fatalf("partial failure messages = %#v, want one assistant message", result.NewMessages)
+	}
+}
+
+func TestRunner_PreservesReasoningContent(t *testing.T) {
+	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
+		StreamResponse: []stream.Event{
+			{Type: stream.EventReasoningStart, Data: stream.ReasoningStartEvent{ID: "reasoning-0"}},
+			{Type: stream.EventReasoningDelta, Data: stream.ReasoningDeltaEvent{ID: "reasoning-0", Text: "considering"}},
+			{Type: stream.EventReasoningEnd, Data: stream.ReasoningEndEvent{ID: "reasoning-0"}},
+			{Type: stream.EventTextDelta, Data: stream.TextDeltaEvent{Text: "answer"}},
+			{Type: stream.EventFinish, Data: stream.FinishEvent{FinishReason: stream.FinishReasonStop, Usage: testutil.MockUsage(1, 2)}},
+		},
+	})
+	runner := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Model: model, Quiet: true})
+	result, err := runner.Run(context.Background(), "hi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := result.Messages[len(result.Messages)-1]
+	var reasoning string
+	for _, part := range last.Content.Parts {
+		if rp, ok := part.(goai.ReasoningPart); ok {
+			reasoning += rp.Text
+		}
+	}
+	if reasoning != "considering" {
+		t.Fatalf("reasoning = %q, want considering", reasoning)
+	}
+}
+
+func TestRunner_PreservesReasoningWithEmptyID(t *testing.T) {
+	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
+		StreamResponse: []stream.Event{
+			{Type: stream.EventReasoningDelta, Data: stream.ReasoningDeltaEvent{Text: "considering"}},
+			{Type: stream.EventReasoningEnd, Data: stream.ReasoningEndEvent{}},
+			{Type: stream.EventTextDelta, Data: stream.TextDeltaEvent{Text: "answer"}},
+			{Type: stream.EventFinish, Data: stream.FinishEvent{FinishReason: stream.FinishReasonStop, Usage: testutil.MockUsage(1, 2)}},
+		},
+	})
+	runner := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Model: model, Quiet: true})
+	result, err := runner.Run(context.Background(), "hi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := result.Messages[len(result.Messages)-1]
+	var reasoning string
+	for _, part := range last.Content.Parts {
+		if reasoningPart, ok := part.(goai.ReasoningPart); ok {
+			reasoning += reasoningPart.Text
+		}
+	}
+	if reasoning != "considering" {
+		t.Fatalf("reasoning = %q, want considering", reasoning)
+	}
+}
+
+func TestRunner_PreservesDistinctReasoningBlocksWithEmptyIDs(t *testing.T) {
+	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
+		StreamResponse: []stream.Event{
+			{Type: stream.EventReasoningStart, Data: stream.ReasoningStartEvent{ProviderMetadata: map[string]any{"phase": "first"}}},
+			{Type: stream.EventReasoningDelta, Data: stream.ReasoningDeltaEvent{Text: "one"}},
+			{Type: stream.EventReasoningEnd, Data: stream.ReasoningEndEvent{}},
+			{Type: stream.EventReasoningStart, Data: stream.ReasoningStartEvent{ProviderMetadata: map[string]any{"phase": "second"}}},
+			{Type: stream.EventReasoningDelta, Data: stream.ReasoningDeltaEvent{Text: "two"}},
+			{Type: stream.EventReasoningEnd, Data: stream.ReasoningEndEvent{}},
+			{Type: stream.EventTextDelta, Data: stream.TextDeltaEvent{Text: "answer"}},
+			{Type: stream.EventFinish, Data: stream.FinishEvent{FinishReason: stream.FinishReasonStop, Usage: testutil.MockUsage(1, 2)}},
+		},
+	})
+	runner := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Model: model, Quiet: true})
+	result, err := runner.Run(context.Background(), "hi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := result.Messages[len(result.Messages)-1]
+	var reasoning []goai.ReasoningPart
+	for _, part := range last.Content.Parts {
+		if reasoningPart, ok := part.(goai.ReasoningPart); ok {
+			reasoning = append(reasoning, reasoningPart)
+		}
+	}
+	if len(reasoning) != 2 || reasoning[0].Text != "one" || reasoning[1].Text != "two" {
+		t.Fatalf("reasoning blocks = %#v", reasoning)
+	}
+	if reasoning[0].ProviderOptions["phase"] != "first" || reasoning[1].ProviderOptions["phase"] != "second" {
+		t.Fatalf("reasoning metadata = %#v", reasoning)
 	}
 }
 
@@ -390,6 +626,9 @@ func TestRunner_SuspensionOnPermissionNeeded(t *testing.T) {
 	if len(result.Messages) == 0 {
 		t.Error("Messages should be populated on suspension")
 	}
+	if len(result.Steps) != 1 || result.Usage.OutputTokens.Total == nil || *result.Usage.OutputTokens.Total != 5 {
+		t.Fatalf("suspended usage = %#v across %d steps, want 5 output tokens", result.Usage.OutputTokens.Total, len(result.Steps))
+	}
 }
 
 // TestRunner_CancelMidTool_PersistsInterruptedStep verifies that cancelling a
@@ -427,6 +666,9 @@ func TestRunner_CancelMidTool_PersistsInterruptedStep(t *testing.T) {
 
 	if result.Status != RunCancelled {
 		t.Fatalf("status = %s, want %s", result.Status, RunCancelled)
+	}
+	if len(result.Steps) != 1 || result.Usage.OutputTokens.Total == nil || *result.Usage.OutputTokens.Total != 5 {
+		t.Fatalf("cancelled usage = %#v across %d steps, want 5 output tokens", result.Usage.OutputTokens.Total, len(result.Steps))
 	}
 
 	// The interrupted step must be durably recorded: the assistant tool-call

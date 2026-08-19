@@ -173,6 +173,25 @@ func TestRoundtrip_AssistantWithParts(t *testing.T) {
 	}
 }
 
+func TestRoundtrip_AssistantReasoningPreserved(t *testing.T) {
+	original := message.NewAssistantMessageWithParts(message.ReasoningPart{
+		Text: "considering", ProviderOptions: map[string]any{"itemId": "reasoning-0"},
+	})
+
+	sessionMessage := FromGoAIMessage(original)
+	result := MessageToGoAI(sessionMessage)
+	if len(result) != 1 || len(result[0].Content.Parts) != 1 {
+		t.Fatalf("round-trip result = %#v", result)
+	}
+	reasoning, ok := result[0].Content.Parts[0].(message.ReasoningPart)
+	if !ok {
+		t.Fatalf("part type = %T, want ReasoningPart", result[0].Content.Parts[0])
+	}
+	if reasoning.Text != "considering" || reasoning.ProviderOptions["itemId"] != "reasoning-0" {
+		t.Fatalf("reasoning = %#v", reasoning)
+	}
+}
+
 func TestRoundtrip_ToolResultWithImage(t *testing.T) {
 	original := message.Message{
 		Role: "tool",
