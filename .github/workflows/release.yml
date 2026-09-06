@@ -1,0 +1,83 @@
+name: release
+
+run-name: Release ${{ inputs.version }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version, such as v0.2.0 or v0.2.0-rc.1
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record gate start
+        run: echo "RELEASE_GATE_STARTED=$(date +%s)" >> "$GITHUB_ENV"
+      - uses: actions/create-github-app-token@v2
+        id: release-token
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ steps.release-token.outputs.token }}
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Validate release
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::releases must run from main"
+            exit 1
+          fi
+          if ! [[ "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(rc|alpha|beta|dev)\.(0|[1-9][0-9]*))?$ ]]; then
+            echo "::error::invalid release version: $VERSION"
+            exit 1
+          fi
+          if git rev-parse "$VERSION" >/dev/null 2>&1; then
+            echo "::error::tag $VERSION already exists"
+            exit 1
+          fi
+          source_version=$(awk -F'"' '/^const Version =/ {print $2; exit}' ./*.go)
+          if [ "v$source_version" != "$VERSION" ]; then
+            echo "::error::source Version is v$source_version, not $VERSION"
+            exit 1
+          fi
+      - name: Check provider catalog
+        run: |
+          GOWORK=off go generate ./provider
+          git diff --exit-code -- provider/catalogdata/catalog.json
+      - name: Vet
+        run: GOWORK=off go vet ./...
+      - name: Test
+        run: GOWORK=off go test -count=1 ./...
+      - name: Build
+        run: GOWORK=off go build ./...
+      - name: Create tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          now=$(date +%s)
+          if [ $((now - RELEASE_GATE_STARTED)) -gt 86400 ]; then
+            echo "::error::release gate started more than 24 hours ago"
+            exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git tag -a "$VERSION" "$GITHUB_SHA" -m "$VERSION"
+          git push origin "refs/tags/$VERSION"

@@ -6,9 +6,12 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/airlockrun/goai"
+	goaierrors "github.com/airlockrun/goai/errors"
 	"github.com/airlockrun/goai/message"
 	"github.com/airlockrun/goai/stream"
 	"github.com/airlockrun/goai/testutil"
@@ -90,15 +93,185 @@ func TestRunner_AgentToolSets_BuildAgent(t *testing.T) {
 func TestRunner_AgentToolSets_GeneralAgent(t *testing.T) {
 	generalAgent := agent.NewGeneralAgent("gpt-4o")
 
-	for _, name := range []string{"read", "write", "edit", "bash", "task"} {
+	for _, name := range []string{"read", "write", "edit", "bash"} {
 		if _, ok := generalAgent.Tools[name]; !ok {
 			t.Errorf("general agent should have %s tool", name)
 		}
 	}
-	for _, name := range []string{"todoread", "todowrite"} {
+	for _, name := range []string{"todoread", "todowrite", "task"} {
 		if _, ok := generalAgent.Tools[name]; ok {
 			t.Errorf("general agent should not have %s tool (denied)", name)
 		}
+	}
+}
+
+func TestRunner_TaskUsesActiveRunner(t *testing.T) {
+	taskTool := tools.Task()
+	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
+		StreamResponses: [][]stream.Event{
+			testutil.MockToolCallResponse("task-1", "task", map[string]string{
+				"description":   "inspect code",
+				"prompt":        "Inspect the code and report back.",
+				"subagent_type": "general",
+			}, testutil.MockUsage(1, 1)),
+			testutil.MockTextResponse("child result", testutil.MockUsage(1, 1)),
+			testutil.MockTextResponse("parent final", testutil.MockUsage(1, 1)),
+		},
+	})
+	runner := NewRunner(RunnerOptions{
+		Agent: testAgent(tool.Set{"task": taskTool}),
+		Model: model,
+		Quiet: true,
+	})
+
+	result, err := runner.Run(context.Background(), "delegate this")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.TotalText != "parent final" {
+		t.Fatalf("TotalText = %q, want parent final", result.TotalText)
+	}
+	if len(model.DoStreamCalls) != 3 {
+		t.Fatalf("model calls = %d, want parent, child, parent", len(model.DoStreamCalls))
+	}
+}
+
+type concurrentSubagentModel struct {
+	mu          sync.Mutex
+	parentCalls int
+	started     chan struct{}
+	release     chan struct{}
+}
+
+func (*concurrentSubagentModel) ID() string       { return "test-model" }
+func (*concurrentSubagentModel) Provider() string { return "test-provider" }
+
+func (m *concurrentSubagentModel) Stream(ctx context.Context, options *stream.CallOptions) (<-chan stream.Event, error) {
+	hasTask := false
+	for _, availableTool := range options.Tools {
+		if availableTool.Name == "task" {
+			hasTask = true
+			break
+		}
+	}
+	if hasTask {
+		m.mu.Lock()
+		m.parentCalls++
+		parentCall := m.parentCalls
+		m.mu.Unlock()
+		if parentCall == 1 {
+			return testEventStream(ctx, []stream.Event{
+				{Type: stream.EventToolCall, Data: stream.ToolCallEvent{
+					ToolCallID: "task-1",
+					ToolName:   "task",
+					Input:      json.RawMessage(`{"description":"first task","prompt":"first","subagent_type":"general"}`),
+				}},
+				{Type: stream.EventToolCall, Data: stream.ToolCallEvent{
+					ToolCallID: "task-2",
+					ToolName:   "task",
+					Input:      json.RawMessage(`{"description":"second task","prompt":"second","subagent_type":"explore"}`),
+				}},
+				{Type: stream.EventFinish, Data: stream.FinishEvent{
+					FinishReason: stream.FinishReasonToolCalls,
+					Usage:        testutil.MockUsage(1, 1),
+				}},
+			}), nil
+		}
+		return testEventStream(ctx, testutil.MockTextResponse("parent final", testutil.MockUsage(1, 1))), nil
+	}
+
+	select {
+	case m.started <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	select {
+	case <-m.release:
+		return testEventStream(ctx, testutil.MockTextResponse("child result", testutil.MockUsage(1, 1))), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func testEventStream(ctx context.Context, events []stream.Event) <-chan stream.Event {
+	result := make(chan stream.Event, len(events))
+	for _, event := range events {
+		select {
+		case result <- event:
+		case <-ctx.Done():
+			close(result)
+			return result
+		}
+	}
+	close(result)
+	return result
+}
+
+func TestRunner_RunsSubagentsConcurrentlyByDefault(t *testing.T) {
+	model := &concurrentSubagentModel{
+		started: make(chan struct{}, 2),
+		release: make(chan struct{}),
+	}
+	go func() {
+		<-model.started
+		<-model.started
+		close(model.release)
+	}()
+	runner := NewRunner(RunnerOptions{
+		Agent: testAgent(tool.Set{"task": tools.Task()}),
+		Model: model,
+		Quiet: true,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	result, err := runner.Run(ctx, "delegate both tasks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.TotalText != "parent final" {
+		t.Fatalf("TotalText = %q, want parent final", result.TotalText)
+	}
+}
+
+type recordingExecutor struct {
+	calls []tool.Request
+}
+
+func (e *recordingExecutor) Execute(_ context.Context, req tool.Request) (tool.Response, error) {
+	e.calls = append(e.calls, req)
+	return tool.Response{Output: "remote result"}, nil
+}
+
+func (*recordingExecutor) Tools() []tool.Info { return nil }
+
+func TestRunner_SubagentInheritsExecutor(t *testing.T) {
+	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
+		StreamResponses: [][]stream.Event{
+			testutil.MockToolCallResponse("read-1", "read", map[string]string{
+				"filePath": "/workspace/main.go",
+			}, testutil.MockUsage(1, 1)),
+			testutil.MockTextResponse("inspection complete", testutil.MockUsage(1, 1)),
+		},
+	})
+	executor := &recordingExecutor{}
+	runner := NewRunner(RunnerOptions{
+		Agent:    testAgent(tool.Set{}),
+		Model:    model,
+		Executor: executor,
+		WorkDir:  "/workspace",
+		Quiet:    true,
+	})
+
+	result, err := runner.SpawnSubagent(context.Background(), agent.AgentGeneral, "inspect")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.GetTotalText() != "inspection complete" {
+		t.Fatalf("TotalText = %q, want inspection complete", result.GetTotalText())
+	}
+	if len(executor.calls) != 1 || executor.calls[0].ToolName != "read" {
+		t.Fatalf("executor calls = %#v, want one read call", executor.calls)
 	}
 }
 
@@ -151,6 +324,30 @@ func TestNewRunner_Options(t *testing.T) {
 	if runner.httpClient != httpClient {
 		t.Error("HTTPClient was not retained")
 	}
+	if runner.toolCallExecutionMode != stream.ToolCallExecutionAsync {
+		t.Errorf("ToolCallExecutionMode = %q, want async default", runner.toolCallExecutionMode)
+	}
+
+	syncRunner := NewRunner(RunnerOptions{
+		Agent:                 a,
+		Model:                 mockModel,
+		ToolCallExecutionMode: stream.ToolCallExecutionSync,
+	})
+	if syncRunner.toolCallExecutionMode != stream.ToolCallExecutionSync {
+		t.Errorf("ToolCallExecutionMode = %q, want sync", syncRunner.toolCallExecutionMode)
+	}
+}
+
+func TestNewRunner_InvalidToolCallExecutionModePanics(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("NewRunner did not panic")
+		}
+	}()
+	NewRunner(RunnerOptions{
+		Agent:                 testAgent(tool.Set{}),
+		ToolCallExecutionMode: "parallel",
+	})
 }
 
 func TestRunner_Run_CompletedStatus(t *testing.T) {
@@ -339,6 +536,207 @@ func TestRunner_StreamErrorRetainsPartialText(t *testing.T) {
 	if len(result.NewMessages) != 1 || result.NewMessages[0].Role != message.RoleAssistant {
 		t.Fatalf("partial failure messages = %#v, want one assistant message", result.NewMessages)
 	}
+}
+
+func TestRunner_ContinuesRetryableStreamErrorWithPartialContext(t *testing.T) {
+	attempts := 0
+	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
+		DoStreamFunc: func(ctx context.Context, options *stream.CallOptions) (<-chan stream.Event, error) {
+			attempts++
+			if attempts == 1 {
+				return testEventStream(ctx, []stream.Event{
+					{Type: stream.EventTextDelta, Data: stream.TextDeltaEvent{Text: "partial"}},
+					{Type: stream.EventError, Data: stream.ErrorEvent{Error: goaierrors.NewAPICallError(goaierrors.APICallErrorOptions{
+						Message: "connection reset", IsRetryable: true, IsRetryableSet: true,
+					})}},
+				}), nil
+			}
+
+			sawPartial := false
+			sawRecovery := false
+			for _, msg := range options.Messages {
+				if msg.Role == message.RoleAssistant && msg.Content.Text == "partial" {
+					sawPartial = true
+				}
+				if msg.Role == message.RoleUser && strings.Contains(msg.Content.Text, "connection reset") {
+					sawRecovery = true
+				}
+			}
+			if !sawPartial || !sawRecovery {
+				t.Errorf("continuation context missing partial=%v recovery=%v", sawPartial, sawRecovery)
+			}
+			return testEventStream(ctx, testutil.MockTextResponse("finished", testutil.MockUsage(1, 1))), nil
+		},
+	})
+	runner := NewRunner(RunnerOptions{
+		Agent:                       testAgent(tool.Set{}),
+		Model:                       model,
+		Quiet:                       true,
+		MaxStreamErrorContinuations: 1,
+	})
+	runner.streamErrorBackoff = func(int) time.Duration { return 0 }
+
+	result, err := runner.Run(context.Background(), "complete the task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != RunCompleted {
+		t.Fatalf("status = %s, want %s", result.Status, RunCompleted)
+	}
+	if result.TotalText != "partialfinished" {
+		t.Fatalf("TotalText = %q, want partialfinished", result.TotalText)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+}
+
+func TestRunner_DoesNotExecuteToolCallFromInterruptedStream(t *testing.T) {
+	executions := 0
+	attempts := 0
+	testTool := tool.New("change").
+		Description("change state").
+		Execute(func(context.Context, json.RawMessage, tool.CallOptions) (tool.Result, error) {
+			executions++
+			return tool.Result{Output: "changed"}, nil
+		}).
+		Build()
+	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
+		DoStreamFunc: func(ctx context.Context, options *stream.CallOptions) (<-chan stream.Event, error) {
+			attempts++
+			if attempts == 1 {
+				return testEventStream(ctx, []stream.Event{
+					{Type: stream.EventToolCall, Data: stream.ToolCallEvent{
+						ToolCallID: "change-1", ToolName: "change", Input: json.RawMessage(`{}`),
+					}},
+					{Type: stream.EventError, Data: stream.ErrorEvent{Error: goaierrors.NewAPICallError(goaierrors.APICallErrorOptions{
+						Message: "broken pipe", IsRetryable: true, IsRetryableSet: true,
+					})}},
+				}), nil
+			}
+			sawSyntheticResult := false
+			for _, msg := range options.Messages {
+				if msg.Role == message.RoleTool {
+					sawSyntheticResult = true
+				}
+			}
+			if !sawSyntheticResult {
+				t.Error("continuation context has an unanswered interrupted tool call")
+			}
+			return testEventStream(ctx, testutil.MockTextResponse("recovered", testutil.MockUsage(1, 1))), nil
+		},
+	})
+	runner := NewRunner(RunnerOptions{
+		Agent:                       testAgent(tool.Set{"change": testTool}),
+		Model:                       model,
+		Quiet:                       true,
+		MaxStreamErrorContinuations: 1,
+	})
+	runner.streamErrorBackoff = func(int) time.Duration { return 0 }
+
+	if _, err := runner.Run(context.Background(), "make the change"); err != nil {
+		t.Fatal(err)
+	}
+	if executions != 0 {
+		t.Fatalf("tool executions = %d, want 0", executions)
+	}
+}
+
+func TestRunner_StopsAfterStreamErrorContinuationLimit(t *testing.T) {
+	attempts := 0
+	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
+		DoStreamFunc: func(ctx context.Context, _ *stream.CallOptions) (<-chan stream.Event, error) {
+			attempts++
+			return testEventStream(ctx, []stream.Event{
+				{Type: stream.EventTextDelta, Data: stream.TextDeltaEvent{Text: "partial"}},
+				{Type: stream.EventError, Data: stream.ErrorEvent{Error: goaierrors.NewAPICallError(goaierrors.APICallErrorOptions{
+					Message: "connection reset", IsRetryable: true, IsRetryableSet: true,
+				})}},
+			}), nil
+		},
+	})
+	runner := NewRunner(RunnerOptions{
+		Agent:                       testAgent(tool.Set{}),
+		Model:                       model,
+		Quiet:                       true,
+		MaxStreamErrorContinuations: 1,
+	})
+	runner.streamErrorBackoff = func(int) time.Duration { return 0 }
+
+	result, err := runner.Run(context.Background(), "complete the task")
+	if err == nil || !strings.Contains(err.Error(), "connection reset") {
+		t.Fatalf("error = %v, want connection reset", err)
+	}
+	if result.Status != RunFailed {
+		t.Fatalf("status = %s, want %s", result.Status, RunFailed)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+}
+
+func TestRunner_SuccessResetsStreamErrorContinuationLimit(t *testing.T) {
+	attempts := 0
+	echoTool := tool.New("echo").
+		Description("echo").
+		Execute(func(context.Context, json.RawMessage, tool.CallOptions) (tool.Result, error) {
+			return tool.Result{Output: "ok"}, nil
+		}).
+		Build()
+	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
+		DoStreamFunc: func(ctx context.Context, _ *stream.CallOptions) (<-chan stream.Event, error) {
+			attempts++
+			switch attempts {
+			case 1, 3:
+				return testEventStream(ctx, []stream.Event{
+					{Type: stream.EventTextDelta, Data: stream.TextDeltaEvent{Text: "partial"}},
+					{Type: stream.EventError, Data: stream.ErrorEvent{Error: goaierrors.NewAPICallError(goaierrors.APICallErrorOptions{
+						Message: "connection reset", IsRetryable: true, IsRetryableSet: true,
+					})}},
+				}), nil
+			case 2:
+				return testEventStream(ctx, testutil.MockToolCallResponse(
+					"echo-1", "echo", map[string]string{"text": "ok"}, testutil.MockUsage(1, 1),
+				)), nil
+			default:
+				return testEventStream(ctx, testutil.MockTextResponse("finished", testutil.MockUsage(1, 1))), nil
+			}
+		},
+	})
+	runner := NewRunner(RunnerOptions{
+		Agent:                       testAgent(tool.Set{"echo": echoTool}),
+		Model:                       model,
+		Quiet:                       true,
+		MaxStreamErrorContinuations: 1,
+	})
+	runner.streamErrorBackoff = func(int) time.Duration { return 0 }
+
+	result, err := runner.Run(context.Background(), "complete the task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != RunCompleted {
+		t.Fatalf("status = %s, want %s", result.Status, RunCompleted)
+	}
+	if attempts != 4 {
+		t.Fatalf("attempts = %d, want 4", attempts)
+	}
+	if runner.streamErrorContinuations != 0 {
+		t.Fatalf("stream error continuations = %d, want 0", runner.streamErrorContinuations)
+	}
+}
+
+func TestNewRunner_StreamErrorContinuationsRejectSessionStore(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("NewRunner did not panic")
+		}
+	}()
+	NewRunner(RunnerOptions{
+		Agent:                       testAgent(tool.Set{}),
+		SessionStore:                &testStore{},
+		MaxStreamErrorContinuations: 1,
+	})
 }
 
 func TestRunner_PreservesReasoningContent(t *testing.T) {
