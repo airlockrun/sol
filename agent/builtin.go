@@ -68,6 +68,7 @@ func NewGeneralAgent(modelID string) *Agent {
 	t := tools.CreateToolSetForModel(modelID)
 	delete(t, "todoread")
 	delete(t, "todowrite")
+	delete(t, "task")
 	return &Agent{
 		Name:     AgentGeneral,
 		Tools:    t,

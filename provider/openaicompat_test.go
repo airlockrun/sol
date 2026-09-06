@@ -99,7 +99,7 @@ func TestCreateProvider_OpenAICompatibleRoutesConservatively(t *testing.T) {
 		requests <- request
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("data: [DONE]\n\n"))
+		w.Write([]byte(`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\ndata: [DONE]\n\n"))
 	}))
 	defer server.Close()
 
@@ -146,7 +146,7 @@ func TestCreateProvider_OpenAICompatibleOptions(t *testing.T) {
 		requestBody <- body
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("data: [DONE]\n\n"))
+		w.Write([]byte(`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\ndata: [DONE]\n\n"))
 	}))
 	defer server.Close()
 
@@ -167,7 +167,10 @@ func TestCreateProvider_OpenAICompatibleOptions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for range events {
+	for event := range events {
+		if event.Type == stream.EventError {
+			t.Fatal(event.Data.(stream.ErrorEvent).Error)
+		}
 	}
 
 	body := <-requestBody
@@ -188,7 +191,7 @@ func TestCreateProvider_OpenAICompatibleUsesHTTPClient(t *testing.T) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-			Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+			Body:       io.NopCloser(strings.NewReader(`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\ndata: [DONE]\n\n")),
 			Request:    req,
 		}, nil
 	})}
@@ -202,7 +205,10 @@ func TestCreateProvider_OpenAICompatibleUsesHTTPClient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for range events {
+	for event := range events {
+		if event.Type == stream.EventError {
+			t.Fatal(event.Data.(stream.ErrorEvent).Error)
+		}
 	}
 	if !called {
 		t.Fatal("configured HTTP client was not called")

@@ -82,19 +82,19 @@ func TestNewPlanAgent_HasReadOnlyTools(t *testing.T) {
 	}
 }
 
-func TestNewGeneralAgent_DeniesTodo(t *testing.T) {
+func TestNewGeneralAgent_DeniesTodoAndTask(t *testing.T) {
 	a := NewGeneralAgent("gpt-4o")
 	if a.Name != AgentGeneral {
 		t.Errorf("Name = %s, want %s", a.Name, AgentGeneral)
 	}
-	// General should have bash, read, write, edit, task
-	for _, name := range []string{"read", "write", "edit", "bash", "task"} {
+	// General should have ordinary coding tools.
+	for _, name := range []string{"read", "write", "edit", "bash"} {
 		if _, ok := a.Tools[name]; !ok {
 			t.Errorf("general agent missing tool %s", name)
 		}
 	}
-	// General should NOT have todoread, todowrite
-	for _, name := range []string{"todoread", "todowrite"} {
+	// General should not manage parent todos or create nested subagents.
+	for _, name := range []string{"todoread", "todowrite", "task"} {
 		if _, ok := a.Tools[name]; ok {
 			t.Errorf("general agent should not have %s tool", name)
 		}

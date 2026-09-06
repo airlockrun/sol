@@ -14,9 +14,7 @@ import (
 type TaskInput struct {
 	Description  string `json:"description" description:"A short (3-5 words) description of the task"`
 	Prompt       string `json:"prompt" description:"The task for the agent to perform"`
-	SubagentType string `json:"subagent_type" description:"The type of specialized agent to use for this task"`
-	SessionID    string `json:"session_id,omitempty" description:"Existing Task session to continue"`
-	Command      string `json:"command,omitempty" description:"The command that triggered this task"`
+	SubagentType string `json:"subagent_type" description:"The type of specialized agent to use for this task" enum:"general,explore"`
 }
 
 // SubagentResult is the interface for subagent execution results.
@@ -37,7 +35,7 @@ func Task() tool.Tool {
 		Description(`Launch a new agent to handle complex, multistep tasks autonomously.
 
 Available agent types and the tools they have access to:
-- general: General-purpose agent for researching complex questions and executing multi-step tasks. Use this agent to execute multiple units of work in parallel.
+- general: General-purpose agent for researching complex questions and executing multi-step tasks.
 - explore: Fast agent specialized for exploring codebases. Use this when you need to quickly find files by patterns (eg. "src/components/**/*.tsx"), search code for keywords (eg. "API endpoints"), or answer questions about the codebase (eg. "how do API endpoints work?"). When calling this agent, specify the desired thoroughness level: "quick" for basic searches, "medium" for moderate exploration, or "very thorough" for comprehensive analysis across multiple locations and naming conventions.
 
 When using the Task tool, you must specify a subagent_type parameter to select which agent type to use.
@@ -53,9 +51,9 @@ When NOT to use the Task tool:
 
 
 Usage notes:
-1. Launch multiple agents concurrently whenever possible, to maximize performance; to do that, use a single message with multiple tool uses
+1. Launch multiple independent agents in the same response so they run concurrently.
 2. When the agent is done, it will return a single message back to you. The result returned by the agent is not visible to the user. To show the user the result, you should send a text message back to the user with a concise summary of the result.
-3. Each agent invocation is stateless unless you provide a session_id. Your prompt should contain a highly detailed task description for the agent to perform autonomously and you should specify exactly what information the agent should return back to you in its final and only message to you.
+3. Each agent invocation starts with a fresh context. Your prompt should contain a highly detailed task description for the agent to perform autonomously and you should specify exactly what information the agent should return back to you in its final and only message to you.
 4. The agent's outputs should generally be trusted
 5. Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, web fetches, etc.), since it is not aware of the user's intent
 6. If the agent description mentions that it should be used proactively, then you should try your best to use it without the user having to ask for it first. Use your judgement.
@@ -105,15 +103,12 @@ assistant: "I'm going to use the Task tool to launch the with the greeting-respo
 
 			spawner, ok := ctx.Value(RunnerKey).(SubagentSpawner)
 			if !ok || spawner == nil {
-				return tool.Result{
-					Output: fmt.Sprintf("[Task '%s' - subagent spawning not available in this context]", args.Description),
-					Title:  fmt.Sprintf("task: %s", args.Description),
-				}, nil
+				return tool.Result{}, errors.New("task requires a subagent spawner")
 			}
 
 			agentType := args.SubagentType
-			if agentType == "" {
-				agentType = "explore"
+			if agentType != "general" && agentType != "explore" {
+				return tool.Result{}, fmt.Errorf("unknown subagent type %q", agentType)
 			}
 
 			fmt.Printf("[%s] Spawning subagent '%s' for: %s\n", spawner.AgentName(), agentType, args.Description)

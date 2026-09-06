@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Version-invariant gate for sol. Enforces:
 #   const Version (in *.go) >= latest git tag
-# Catches "rolled the const back below a published tag." The tag-time
-# check (tag-being-created == const) belongs in the release script.
+# Catches "rolled the const back below a published tag." The release workflow
+# checks that the requested tag equals the const before creating it.
 #
 # Enable for this clone (one-time):
 #   git config core.hooksPath .githooks
