@@ -2,36 +2,12 @@ package session
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"github.com/airlockrun/goai"
 	"github.com/airlockrun/goai/message"
 )
-
-// stringFromFileData extracts the raw payload string from a goai FileData
-// union for the session model's flat string fields.
-func stringFromFileData(d message.FileData) string {
-	switch v := d.(type) {
-	case message.FileDataBytes:
-		return v.Data
-	case message.FileDataURL:
-		return v.URL
-	case message.FileDataText:
-		return v.Text
-	default:
-		return ""
-	}
-}
-
-// fileDataFromString rebuilds a goai FileData union from a session model's
-// flat string: http(s) and data URLs become a URL reference, everything else
-// is treated as inline base64 bytes.
-func fileDataFromString(s string) message.FileData {
-	if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") || strings.HasPrefix(s, "data:") {
-		return message.FileDataURL{URL: s}
-	}
-	return message.FileDataBytes{Data: s}
-}
 
 // FromGoAIMessages converts goai messages to session messages.
 func FromGoAIMessages(msgs []goai.Message) []Message {
@@ -42,85 +18,79 @@ func FromGoAIMessages(msgs []goai.Message) []Message {
 	return result
 }
 
-// FromGoAIMessage converts a single goai message to a session message.
+// FromGoAIMessage preserves message and part order, provider metadata, and
+// discriminated file and tool output types for persistence and replay.
 func FromGoAIMessage(m goai.Message) Message {
-	msg := Message{
-		Role: string(m.Role),
-	}
-
-	if !m.Content.IsMultiPart() {
-		msg.Content = m.Content.Text
-		return msg
-	}
-
+	msg := Message{Role: string(m.Role), ProviderOptions: m.ProviderOptions, Content: m.Content.Text}
 	for _, p := range m.Content.Parts {
+		var part Part
 		switch v := p.(type) {
 		case message.TextPart:
-			msg.Parts = append(msg.Parts, Part{
-				Type: "text",
-				Text: v.Text,
-			})
-		case message.FilePart:
-			msg.Parts = append(msg.Parts, Part{
-				Type: "file",
-				File: &FilePart{
-					Data:     stringFromFileData(v.Data),
-					MimeType: v.MimeType,
-					Filename: v.Filename,
-				},
-			})
-		case message.ToolCallPart:
-			msg.Parts = append(msg.Parts, Part{
-				Type: "tool",
-				Tool: &ToolPart{
-					CallID: v.ID,
-					Name:   v.Name,
-					Input:  string(v.Input),
-					Status: "pending",
-				},
-			})
-		case message.ToolResultPart:
-			msg.Parts = append(msg.Parts, Part{
-				Type: "tool",
-				Tool: &ToolPart{
-					CallID:  v.ToolCallID,
-					Name:    v.ToolName,
-					Output:  message.ToolOutputWire(v.Output),
-					Status:  "completed",
-					Outcome: message.ToolOutcome(v.Output),
-				},
-			})
-			// A content output carries file/image items inline; surface them
-			// as session image/file parts so the CLI can show attachments.
-			if co, ok := v.Output.(message.ContentOutput); ok {
-				for _, it := range co.Value {
-					switch it.Type {
-					case "image-data", "image-url", "file-data", "file-url":
-						data := it.Data
-						if data == "" {
-							data = it.URL
-						}
-						msg.Parts = append(msg.Parts, Part{
-							Type: "file",
-							File: &FilePart{Data: data, MimeType: it.MediaType, Filename: it.Filename, Source: it.Filename},
-						})
-					}
-				}
-			}
+			part = Part{Type: "text", Text: v.Text, ProviderOptions: v.ProviderOptions}
 		case message.ReasoningPart:
-			msg.Parts = append(msg.Parts, Part{
-				Type:            "reasoning",
-				Text:            v.Text,
-				ProviderOptions: v.ProviderOptions,
-			})
+			part = Part{Type: "reasoning", Text: v.Text, ProviderOptions: v.ProviderOptions}
+		case message.FilePart:
+			f := &FilePart{MimeType: v.MimeType, Filename: v.Filename}
+			switch d := v.Data.(type) {
+			case message.FileDataBytes:
+				f.DataType, f.Data = "data", d.Data
+				if source, ok := strings.CutPrefix(d.Data, "s3ref:"); ok {
+					f.Source = source
+				}
+			case message.FileDataURL:
+				f.DataType, f.Data = "url", d.URL
+				if source, ok := strings.CutPrefix(d.URL, "s3ref:"); ok {
+					f.Source = source
+				}
+			case message.FileDataText:
+				f.DataType, f.Data = "text", d.Text
+			case message.FileDataReference:
+				f.DataType, f.Reference = "reference", d.Reference
+			default:
+				panic(fmt.Sprintf("session: unsupported file data %T", v.Data))
+			}
+			part = Part{Type: "file", File: f, ProviderOptions: v.ProviderOptions}
+		case message.ToolCallPart:
+			part = Part{Type: "tool", ProviderOptions: v.ProviderOptions, Tool: &ToolPart{
+				CallID: v.ID, Name: v.Name, Input: string(v.Input), Status: "pending", ProviderExecuted: v.ProviderExecuted,
+			}}
+		case message.ToolResultPart:
+			tp := &ToolPart{CallID: v.ToolCallID, Name: v.ToolName, Status: "completed", Result: true,
+				ProviderExecuted: v.ProviderExecuted, Outcome: message.ToolOutcome(v.Output), Output: message.ToolOutputWire(v.Output)}
+			switch o := v.Output.(type) {
+			case message.TextOutput:
+				tp.OutputType, tp.OutputProviderOptions = "text", o.ProviderOptions
+			case message.ErrorTextOutput:
+				tp.OutputType, tp.OutputProviderOptions = "error-text", o.ProviderOptions
+			case message.JSONOutput:
+				tp.OutputType, tp.OutputProviderOptions = "json", o.ProviderOptions
+			case message.ErrorJSONOutput:
+				tp.OutputType, tp.OutputProviderOptions = "error-json", o.ProviderOptions
+			case message.ExecutionDeniedOutput:
+				tp.OutputType, tp.OutputProviderOptions, tp.Output = "execution-denied", o.ProviderOptions, o.Reason
+			case message.ContentOutput:
+				tp.OutputType = "content"
+			default:
+				panic(fmt.Sprintf("session: unsupported tool output %T", v.Output))
+			}
+			// Validate structured values rather than accepting a failed wire marshal.
+			if _, err := message.MarshalOutput(v.Output); err != nil {
+				panic(fmt.Errorf("session: tool output: %w", err))
+			}
+			part = Part{Type: "tool", Tool: tp, ProviderOptions: v.ProviderOptions}
+		case message.ToolApprovalRequestPart:
+			part = Part{Type: "tool-approval-request", ApprovalRequest: &v}
+		case message.ToolApprovalResponsePart:
+			part = Part{Type: "tool-approval-response", ApprovalResponse: &v}
+		default:
+			panic(fmt.Sprintf("session: unsupported message part %T", p))
 		}
+		msg.Parts = append(msg.Parts, part)
 	}
-
 	return msg
 }
 
 // MessagesToGoAI converts session messages to goai format.
-// This is the standalone version of Session.ToGoAIMessages().
 func MessagesToGoAI(msgs []Message) []goai.Message {
 	var result []goai.Message
 	for _, msg := range msgs {
@@ -129,126 +99,117 @@ func MessagesToGoAI(msgs []Message) []goai.Message {
 	return result
 }
 
-// MessageToGoAI converts a single session message to one or more goai messages.
-// Tool-role messages may produce multiple goai messages (one per tool result).
+// MessageToGoAI preserves multipart content on every role, including multiple
+// tool results in a single message. Compacted parts are omitted from replay.
 func MessageToGoAI(msg Message) []goai.Message {
-	switch msg.Role {
-	case "system":
-		return []goai.Message{goai.NewSystemMessage(msg.Content)}
-	case "user":
-		return []goai.Message{goai.NewUserMessage(msg.Content)}
-	case "assistant":
-		if len(msg.Parts) > 0 {
-			var parts []goai.Part
-			for _, p := range msg.Parts {
-				if p.Compacted {
-					continue
-				}
-				switch p.Type {
-				case "text":
-					if p.Text != "" {
-						parts = append(parts, goai.TextPart{Text: p.Text})
-					}
-				case "reasoning":
-					parts = append(parts, goai.ReasoningPart{
-						Text:            p.Text,
-						ProviderOptions: p.ProviderOptions,
-					})
-				case "tool":
-					if p.Tool != nil {
-						parts = append(parts, goai.ToolCallPart{
-							ID:    p.Tool.CallID,
-							Name:  p.Tool.Name,
-							Input: json.RawMessage(p.Tool.Input),
-						})
-					}
-				case "file":
-					if p.File != nil {
-						parts = append(parts, message.FilePart{
-							Data:     fileDataFromString(p.File.Data),
-							MimeType: p.File.MimeType,
-							Filename: p.File.Filename,
-						})
-					}
-				}
-			}
-			if len(parts) > 0 {
-				return []goai.Message{goai.NewAssistantMessageWithParts(parts...)}
-			}
-		} else if msg.Content != "" {
-			return []goai.Message{goai.NewAssistantMessage(msg.Content)}
+	m := goai.Message{Role: message.Role(msg.Role), ProviderOptions: msg.ProviderOptions, Content: message.Content{Text: msg.Content}}
+	for _, p := range msg.Parts {
+		if p.Compacted {
+			continue
 		}
-	case "tool":
-		var msgs []goai.Message
-		// Collect non-compacted attachments and text parts for this tool message.
-		var extras []goai.Part
-		for _, p := range msg.Parts {
-			if p.Compacted {
-				continue
+		switch p.Type {
+		case "text":
+			m.Content.Parts = append(m.Content.Parts, message.TextPart{Text: p.Text, ProviderOptions: p.ProviderOptions})
+		case "reasoning":
+			m.Content.Parts = append(m.Content.Parts, message.ReasoningPart{Text: p.Text, ProviderOptions: p.ProviderOptions})
+		case "file":
+			if p.File == nil {
+				panic("session: file part missing file")
 			}
-			switch p.Type {
+			var data message.FileData
+			switch p.File.DataType {
+			case "":
+				// Persisted flat file data uses URL prefixes to distinguish transport.
+				if strings.HasPrefix(p.File.Data, "http://") || strings.HasPrefix(p.File.Data, "https://") || strings.HasPrefix(p.File.Data, "data:") {
+					data = message.FileDataURL{URL: p.File.Data}
+				} else {
+					data = message.FileDataBytes{Data: p.File.Data}
+				}
+			case "data":
+				data = message.FileDataBytes{Data: p.File.Data}
+			case "url":
+				data = message.FileDataURL{URL: p.File.Data}
 			case "text":
-				if p.Text != "" {
-					extras = append(extras, message.TextPart{Text: p.Text})
-				}
-			case "file":
-				if p.File != nil {
-					extras = append(extras, message.FilePart{
-						Data:     fileDataFromString(p.File.Data),
-						MimeType: p.File.MimeType,
-						Filename: p.File.Filename,
-					})
-				}
+				data = message.FileDataText{Text: p.File.Data}
+			case "reference":
+				data = message.FileDataReference{Reference: p.File.Reference}
+			default:
+				panic("session: unknown file data type " + p.File.DataType)
 			}
-		}
-
-		for _, p := range msg.Parts {
-			if p.Type != "tool" || p.Tool == nil {
-				continue
+			m.Content.Parts = append(m.Content.Parts, message.FilePart{Data: data, MimeType: p.File.MimeType, Filename: p.File.Filename, ProviderOptions: p.ProviderOptions})
+		case "tool":
+			if p.Tool == nil {
+				panic("session: tool part missing tool")
 			}
-			output := p.Tool.Output
-			if p.Tool.Compacted {
-				output = "[Old tool result content cleared]"
-			}
-			// Rebuild the discriminated outcome (error/denied/success) so it
-			// survives the round-trip — the dot and provider is_error depend
-			// on it. JSON fidelity is intentionally not preserved; the wire
-			// string is what providers send anyway.
-			toolOut := toolOutputFromSession(p.Tool.Outcome, output)
-			if len(extras) > 0 && !p.Tool.Compacted {
-				toolResult := message.ToolResultPart{
-					ToolCallID: p.Tool.CallID,
-					ToolName:   p.Tool.Name,
-					Output:     toolOut,
-				}
-				allParts := []goai.Part{toolResult}
-				allParts = append(allParts, extras...)
-				msgs = append(msgs, goai.Message{
-					Role:    "tool",
-					Content: message.Content{Parts: allParts},
+			if p.Tool.Result || msg.Role == "tool" {
+				m.Content.Parts = append(m.Content.Parts, message.ToolResultPart{
+					ToolCallID: p.Tool.CallID, ToolName: p.Tool.Name, Output: toolOutputFromSession(p.Tool),
+					ProviderExecuted: p.Tool.ProviderExecuted, ProviderOptions: p.ProviderOptions,
 				})
 			} else {
-				msgs = append(msgs, goai.NewToolMessage(
-					p.Tool.CallID,
-					p.Tool.Name,
-					toolOut,
-				))
+				m.Content.Parts = append(m.Content.Parts, message.ToolCallPart{
+					ID: p.Tool.CallID, Name: p.Tool.Name, Input: json.RawMessage(p.Tool.Input),
+					ProviderExecuted: p.Tool.ProviderExecuted, ProviderOptions: p.ProviderOptions,
+				})
 			}
+		case "tool-approval-request":
+			if p.ApprovalRequest == nil {
+				panic("session: missing approval request")
+			}
+			m.Content.Parts = append(m.Content.Parts, *p.ApprovalRequest)
+		case "tool-approval-response":
+			if p.ApprovalResponse == nil {
+				panic("session: missing approval response")
+			}
+			m.Content.Parts = append(m.Content.Parts, *p.ApprovalResponse)
+		case "compaction":
+			m.Content.Parts = append(m.Content.Parts, message.TextPart{Text: CompactionTriggerPrompt})
+		default:
+			panic("session: unknown part type " + p.Type)
 		}
-		return msgs
 	}
-	return nil
+	return []goai.Message{m}
 }
 
-// toolOutputFromSession rebuilds a discriminated ToolResultOutput from the
-// session ToolPart's structured outcome + flattened output string.
-func toolOutputFromSession(outcome, output string) message.ToolResultOutput {
-	switch outcome {
-	case "error":
-		return message.ErrorTextOutput{Value: output}
-	case "denied":
-		return message.ExecutionDeniedOutput{Reason: output}
+func toolOutputFromSession(p *ToolPart) message.ToolResultOutput {
+	kind, output := p.OutputType, p.Output
+	if p.Compacted {
+		if kind == "" {
+			output = DefaultPrunedMessage(PrunedInfo{Type: "tool_output"})
+		}
+	}
+	if kind == "" {
+		switch p.Outcome {
+		case "error":
+			kind = "error-text"
+		case "denied":
+			kind = "execution-denied"
+		default:
+			kind = "text"
+		}
+	}
+	switch kind {
+	case "text":
+		return message.TextOutput{Value: output, ProviderOptions: p.OutputProviderOptions}
+	case "error-text":
+		return message.ErrorTextOutput{Value: output, ProviderOptions: p.OutputProviderOptions}
+	case "execution-denied":
+		return message.ExecutionDeniedOutput{Reason: output, ProviderOptions: p.OutputProviderOptions}
+	case "json", "error-json":
+		if !json.Valid([]byte(output)) {
+			panic("session: invalid JSON tool output")
+		}
+		if kind == "json" {
+			return message.JSONOutput{Value: json.RawMessage(output), ProviderOptions: p.OutputProviderOptions}
+		}
+		return message.ErrorJSONOutput{Value: json.RawMessage(output), ProviderOptions: p.OutputProviderOptions}
+	case "content":
+		var items []message.ToolContentItem
+		if err := json.Unmarshal([]byte(output), &items); err != nil {
+			panic(fmt.Errorf("session: content output: %w", err))
+		}
+		return message.ContentOutput{Value: items}
 	default:
-		return message.TextOutput{Value: output}
+		panic("session: unknown output type " + kind)
 	}
 }

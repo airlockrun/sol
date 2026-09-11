@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 	"github.com/airlockrun/goai/tool"
 	"github.com/airlockrun/sol/agent"
 	"github.com/airlockrun/sol/bus"
+	"github.com/airlockrun/sol/provider"
 	"github.com/airlockrun/sol/session"
 	"github.com/airlockrun/sol/tools"
 )
@@ -58,8 +60,530 @@ func (s *testStore) Compact(_ context.Context, summary []session.Message, tokens
 func testAgent(ts tool.Set) *agent.Agent {
 	return &agent.Agent{
 		Name:     "build",
+		Model:    "openai/gpt-4o",
 		MaxSteps: 10,
 		Tools:    ts,
+	}
+}
+
+func TestRunner_ModelLimits(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		model   string
+		limits  session.ModelLimits
+		config  *session.CompactionConfig
+		wantErr bool
+	}{
+		{"catalog", "openai/gpt-4o", session.ModelLimits{}, nil, false},
+		{"explicit unknown", "openai-compatible/private", session.ModelLimits{Context: 2000, Input: 1500, Output: 500}, nil, false},
+		{"unknown auto", "openai-compatible/private", session.ModelLimits{}, nil, false},
+		{"proxy auto", "", session.ModelLimits{}, nil, false},
+		{"unknown disabled", "openai-compatible/private", session.ModelLimits{}, &session.CompactionConfig{Auto: false}, false},
+		{"negative context", "openai/gpt-4o", session.ModelLimits{Context: -1}, nil, true},
+		{"negative input", "openai/gpt-4o", session.ModelLimits{Input: -1}, nil, true},
+		{"negative output", "openai/gpt-4o", session.ModelLimits{Context: 8192, Output: -1}, nil, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, entry := range []string{"Run", "Compact", "child"} {
+				t.Run(entry, func(t *testing.T) {
+					a := testAgent(tool.Set{})
+					a.Model = tt.model
+					model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponse: testutil.MockTextResponse("ok", testutil.MockUsage(1, 1))})
+					r := NewRunner(RunnerOptions{Agent: a, Model: model, ModelLimits: tt.limits, CompactionConfig: tt.config, SessionStore: &testStore{}, Quiet: true})
+					var err error
+					switch entry {
+					case "Run":
+						_, err = r.Run(context.Background(), "hi")
+					case "Compact":
+						_, err = r.Compact(context.Background())
+					case "child":
+						_, err = r.SpawnSubagent(context.Background(), "general", "hi")
+					}
+					if (err != nil) != tt.wantErr {
+						t.Fatalf("error = %v", err)
+					}
+					if tt.wantErr {
+						if !strings.Contains(err.Error(), "ModelLimits") || len(model.DoStreamCalls) != 0 {
+							t.Fatalf("validation was not before model call: %v", err)
+						}
+					} else if entry != "child" {
+						want := tt.limits
+						if tt.name == "catalog" {
+							info, _ := provider.GetModelInfo("openai", "gpt-4o")
+							want = session.ModelLimits{Context: info.Limit.Context, Input: info.Limit.Input, Output: info.Limit.Output}
+						}
+						if r.session.ModelLimits != want {
+							t.Fatalf("limits = %+v, want %+v", r.session.ModelLimits, want)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestRunner_CompactionOutputLimit(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		model  string
+		limits session.ModelLimits
+		want   int
+	}{
+		{"explicit", "openai/gpt-4o", session.ModelLimits{Input: 1000, Output: 2048}, 2048},
+		{"explicit unknown", "openai-compatible/private", session.ModelLimits{Input: 1000, Output: 2048}, 2048},
+		{"compaction cap", "openai-compatible/private", session.ModelLimits{Input: 1000, Output: 100_000}, session.OutputTokenMax},
+		{"unknown output", "openai-compatible/private", session.ModelLimits{Input: 1000}, session.OutputTokenMax},
+		{"catalog", "openai/gpt-4o", session.ModelLimits{}, 16384},
+		{"gpt-4 catalog", "openai/gpt-4", session.ModelLimits{}, 8192},
+		{"small context", "openai-compatible/private", session.ModelLimits{Context: 8192, Output: 8192}, 8192},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, entry := range []string{"Compact", "Run", "Continue", "child"} {
+				t.Run(entry, func(t *testing.T) {
+					a := testAgent(tool.Set{})
+					a.Model = tt.model
+					responses := [][]stream.Event{testutil.MockTextResponse("summary", testutil.MockUsage(10, 2))}
+					idx := 0
+					if entry != "Compact" {
+						responses = append([][]stream.Event{testutil.MockTextResponse("overflow", testutil.MockUsage(200_000, 1))}, responses...)
+						responses = append(responses, testutil.MockTextResponse("done", testutil.MockUsage(10, 2)))
+						idx++
+					}
+					if entry == "Continue" {
+						responses = append([][]stream.Event{testutil.MockTextResponse("first", testutil.MockUsage(10, 2))}, responses...)
+						idx++
+					}
+					model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponses: responses})
+					r := NewRunner(RunnerOptions{Agent: a, Model: model, ModelLimits: tt.limits, SessionStore: &testStore{}, Quiet: true})
+					var err error
+					switch entry {
+					case "Compact":
+						_, err = r.Compact(context.Background())
+					case "Run":
+						_, err = r.Run(context.Background(), "go")
+					case "Continue":
+						if _, err := r.Run(context.Background(), "go"); err != nil {
+							t.Fatal(err)
+						}
+						_, err = r.Continue(context.Background(), "again")
+					case "child":
+						_, err = r.SpawnSubagent(context.Background(), "general", "go")
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					if len(model.DoStreamCalls) <= idx {
+						t.Fatalf("model calls = %d, want compaction at %d", len(model.DoStreamCalls), idx)
+					}
+					got := model.DoStreamCalls[idx].MaxOutputTokens
+					if got == nil {
+						t.Fatal("missing compaction output limit")
+					}
+					if *got != tt.want {
+						t.Fatalf("MaxOutputTokens = %d, want %d", *got, tt.want)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestRunner_SmallContextCompactsOnce(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		model  string
+		limits session.ModelLimits
+	}{
+		{"gpt-4 catalog", "openai/gpt-4", session.ModelLimits{}},
+		{"equal maxima", "openai-compatible/private", session.ModelLimits{Context: 8192, Output: 8192}},
+		{"larger output", "openai-compatible/private", session.ModelLimits{Context: 8192, Output: 32768}},
+		{"unknown output", "openai-compatible/private", session.ModelLimits{Context: 8192}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			a := testAgent(tool.Set{})
+			a.Model = tt.model
+			model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponses: [][]stream.Event{
+				testutil.MockTextResponse("first", testutil.MockUsage(3000, 1)),
+				testutil.MockTextResponse("overflow", testutil.MockUsage(5000, 1)),
+				testutil.MockTextResponse("summary", testutil.MockUsage(5000, 100)),
+				testutil.MockTextResponse("done", testutil.MockUsage(3000, 1)),
+			}})
+			r := NewRunner(RunnerOptions{Agent: a, Model: model, ModelLimits: tt.limits, Quiet: true})
+			result, err := r.Run(context.Background(), "go")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Status != RunCompleted || result.CompactionState != nil || len(model.DoStreamCalls) != 1 {
+				t.Fatalf("premature compaction: status %s, calls %d", result.Status, len(model.DoStreamCalls))
+			}
+			want := tt.limits
+			if tt.name == "gpt-4 catalog" {
+				want = session.ModelLimits{Context: 8192, Output: 8192}
+			}
+			if r.session.ModelLimits != want {
+				t.Fatalf("model maxima = %+v, want %+v", r.session.ModelLimits, want)
+			}
+			result, err = r.Continue(context.Background(), "continue")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Status != RunCompleted || result.CompactionState == nil || len(model.DoStreamCalls) != 4 {
+				t.Fatalf("expected one compaction then completion: status %s, calls %d", result.Status, len(model.DoStreamCalls))
+			}
+			if r.session.IsOverflow() || r.session.ModelLimits != want {
+				t.Fatalf("continuation budget = %+v, tokens = %+v", r.session.ModelLimits, r.session.Tokens)
+			}
+		})
+	}
+}
+
+func TestRunner_StepLimit(t *testing.T) {
+	for _, entry := range []string{"Run", "Continue", "RunUntilExit"} {
+		t.Run(entry, func(t *testing.T) {
+			a := testAgent(tool.Set{"noop": tool.New("noop").Build()})
+			a.MaxSteps = 1
+			model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponse: testutil.MockToolCallResponse("c", "noop", map[string]any{}, testutil.MockUsage(10, 2))})
+			r := NewRunner(RunnerOptions{Agent: a, Model: model, Quiet: true, ExitState: &tools.ExitState{}})
+			var result *RunResult
+			var err error
+			switch entry {
+			case "Run":
+				result, err = r.Run(context.Background(), "go")
+			case "Continue":
+				if _, err := r.Run(context.Background(), "go"); err != nil {
+					t.Fatal(err)
+				}
+				result, err = r.Continue(context.Background(), "again")
+			case "RunUntilExit":
+				out, runErr := r.RunUntilExit(context.Background(), "go", RunUntilExitOptions{})
+				result, err = out.RunResult, runErr
+				if out.Nudges != 0 {
+					t.Fatalf("budget exhaustion triggered %d nudges", out.Nudges)
+				}
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Status != RunStepLimitReached || len(result.Steps) != 1 || result.Usage.InputTotal() != 10 {
+				t.Fatalf("result = %+v", result)
+			}
+		})
+	}
+}
+
+func TestRunner_PrunesLiveTranscript(t *testing.T) {
+	for _, persisted := range []bool{false, true} {
+		t.Run(map[bool]string{false: "initial", true: "store"}[persisted], func(t *testing.T) {
+			history := []goai.Message{
+				goai.NewUserMessage("old"),
+				goai.NewAssistantMessageWithParts(goai.ToolCallPart{ID: "old", Name: "noop", Input: json.RawMessage(`{}`)}),
+				goai.NewToolResultText("old", "noop", strings.Repeat("old-output", 40_000)),
+				goai.NewUserMessage("recent"), goai.NewAssistantMessage("recent answer"),
+			}
+			model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponses: [][]stream.Event{
+				testutil.MockToolCallResponse("new", "noop", map[string]any{}, testutil.MockUsage(100_000, 1)),
+				testutil.MockTextResponse("done", testutil.MockUsage(10, 2)),
+			}})
+			opts := RunnerOptions{Agent: testAgent(tool.Set{"noop": tool.New("noop").Build()}), Model: model, InitialMessages: history, ModelLimits: session.ModelLimits{Input: 80_000}, Quiet: true}
+			if persisted {
+				opts.SessionStore = &testStore{messages: session.FromGoAIMessages(history)}
+			}
+			r := NewRunner(opts)
+			result, err := r.Run(context.Background(), "latest")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(model.DoStreamCalls) != 2 || result.CompactionState != nil {
+				t.Fatal("prune should avoid summarization")
+			}
+			encoded, err := json.Marshal(model.DoStreamCalls[1])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(encoded), "old-output") || !strings.Contains(string(encoded), "Old tool result content cleared") {
+				t.Fatal("next model call did not use pruned transcript")
+			}
+			if result.Status != RunCompleted {
+				t.Fatalf("status = %s", result.Status)
+			}
+		})
+	}
+}
+
+func TestRunner_PrunePreservesFileSource(t *testing.T) {
+	config := session.DefaultCompactionConfig()
+	var files []session.PrunedInfo
+	config.PrunedMessage = func(info session.PrunedInfo) string {
+		if info.Type == "file" {
+			files = append(files, info)
+			return "Reload " + info.Source
+		}
+		return session.DefaultPrunedMessage(info)
+	}
+	r := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Model: testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{}), CompactionConfig: &config, Quiet: true})
+	if err := r.initSession(); err != nil {
+		t.Fatal(err)
+	}
+	stored := []session.Message{{Role: "user", Parts: []session.Part{{Type: "file", File: &session.FilePart{
+		DataType: "data", Data: "s3ref:tmp/id-report.pdf", Source: "tmp/id-report.pdf", MimeType: "application/pdf", Filename: "report.pdf",
+	}}}}}
+	r.messages = append([]goai.Message{goai.NewSystemMessage("system")}, session.MessagesToGoAI(stored)...)
+	r.messages = append(r.messages,
+		goai.NewToolResultText("c", "read", strings.Repeat("x", 240_000)),
+		goai.NewUserMessage("recent"), goai.NewUserMessage("latest"),
+	)
+	if got := r.prune(); got != 2 {
+		t.Fatalf("pruned = %d, want 2", got)
+	}
+	if len(files) != 1 || files[0].Source != "tmp/id-report.pdf" || files[0].Filename != "report.pdf" {
+		t.Fatalf("pruned files = %+v", files)
+	}
+	if got := r.messages[1].Content.Parts[0].(message.TextPart).Text; got != "Reload tmp/id-report.pdf" {
+		t.Fatalf("reload instruction = %q", got)
+	}
+}
+
+func TestStripFilesFromMessage_ContentSource(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		item   message.ToolContentItem
+		source string
+	}{
+		{"s3 data", message.ToolContentItem{Type: "file-data", Data: "s3ref:tmp/id-report.pdf"}, "tmp/id-report.pdf"},
+		{"s3 url", message.ToolContentItem{Type: "file-url", URL: "s3ref:tmp/id-report.pdf"}, "tmp/id-report.pdf"},
+		{"inline", message.ToolContentItem{Type: "file-data", Data: "cGRm"}, ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.item.Filename, tt.item.MediaType = "report.pdf", "application/pdf"
+			msg := session.FromGoAIMessage(goai.NewToolMessage("c", "read", message.ContentOutput{Value: []message.ToolContentItem{tt.item}}))
+			var files []session.PrunedInfo
+			stripped := stripFilesFromMessage(msg, func(info session.PrunedInfo) string {
+				files = append(files, info)
+				return "Reload " + info.Source
+			})
+			if len(files) != 1 || files[0].Source != tt.source || files[0].Filename != "report.pdf" {
+				t.Fatalf("pruned files = %+v, want source %q", files, tt.source)
+			}
+			output := session.MessageToGoAI(stripped)[0].Content.Parts[0].(message.ToolResultPart).Output.(message.ContentOutput)
+			if output.Value[0].Text != "Reload "+tt.source {
+				t.Fatalf("reload instruction = %+v", output)
+			}
+		})
+	}
+}
+
+func TestRunner_CompactionRedactsCompleteRequest(t *testing.T) {
+	for _, automatic := range []bool{false, true} {
+		t.Run(map[bool]string{false: "explicit", true: "automatic"}[automatic], func(t *testing.T) {
+			a := testAgent(tool.Set{"noop": tool.New("noop").Build()})
+			a.Redactor = func(s string) string { return strings.ReplaceAll(s, "secret", "[REDACTED]") }
+			config := session.DefaultCompactionConfig()
+			config.Agent = session.NewCompactionAgent("summarize secret", "")
+			store := &testStore{messages: session.FromGoAIMessages([]goai.Message{
+				goai.NewUserMessage("request secret"),
+				goai.NewToolMessage("c", "noop", message.JSONOutput{Value: map[string]any{"key": "secret"}}),
+			})}
+			responses := [][]stream.Event{testutil.MockTextResponse("summary", testutil.MockUsage(10, 2))}
+			if automatic {
+				responses = [][]stream.Event{
+					testutil.MockToolCallResponse("new", "noop", map[string]any{}, testutil.MockUsage(2000, 1)),
+					responses[0], testutil.MockTextResponse("done", testutil.MockUsage(10, 2)),
+				}
+			}
+			model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponses: responses})
+			r := NewRunner(RunnerOptions{Agent: a, Model: model, SessionStore: store, CompactionConfig: &config, ModelLimits: session.ModelLimits{Input: 1000}, Quiet: true})
+			var err error
+			if automatic {
+				_, err = r.Run(context.Background(), "continue")
+			} else {
+				_, err = r.Compact(context.Background())
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			idx := 0
+			if automatic {
+				idx = 1
+			}
+			encoded, err := json.Marshal(model.DoStreamCalls[idx])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(encoded), "secret") || !strings.Contains(string(encoded), "summarize [REDACTED]") {
+				t.Fatalf("compaction request = %s", encoded)
+			}
+		})
+	}
+}
+
+func TestRunner_ContinuePersistsPromptAndScopesNewMessages(t *testing.T) {
+	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponses: [][]stream.Event{
+		testutil.MockTextResponse("first answer", testutil.MockUsage(10, 2)),
+		testutil.MockTextResponse("second answer", testutil.MockUsage(20, 3)),
+	}})
+	store := &testStore{}
+	r := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Model: model, SessionStore: store, Quiet: true})
+	if _, err := r.Run(context.Background(), "first"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := r.Continue(context.Background(), "second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(store.messages) != 4 || store.messages[2].Content != "second" {
+		t.Fatalf("store = %+v", store.messages)
+	}
+	if len(result.NewMessages) != 1 || result.NewMessages[0].Content.Text != "second answer" || result.Usage.InputTotal() != 20 {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
+func TestRunner_ProviderToolReplayOrder(t *testing.T) {
+	metadata := map[string]any{"itemId": "remote"}
+	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponse: []stream.Event{
+		{Type: stream.EventTextDelta, Data: stream.TextDeltaEvent{Text: "before", ProviderMetadata: metadata}},
+		{Type: stream.EventReasoningStart, Data: stream.ReasoningStartEvent{ID: "r", ProviderMetadata: metadata}},
+		{Type: stream.EventReasoningDelta, Data: stream.ReasoningDeltaEvent{ID: "r", Text: "thinking"}},
+		{Type: stream.EventReasoningEnd, Data: stream.ReasoningEndEvent{ID: "r"}},
+		{Type: stream.EventToolCall, Data: stream.ToolCallEvent{ToolCallID: "c", ToolName: "search", Input: json.RawMessage(`{}`), ProviderExecuted: true, ProviderMetadata: metadata}},
+		{Type: stream.EventToolResult, Data: stream.ToolResultEvent{ToolCallID: "c", ToolName: "search", Output: message.JSONOutput{Value: map[string]any{"ok": true}}, ProviderExecuted: true, ProviderMetadata: metadata}},
+		{Type: stream.EventTextDelta, Data: stream.TextDeltaEvent{Text: "after"}},
+		{Type: stream.EventFinish, Data: stream.FinishEvent{FinishReason: stream.FinishReasonStop, Usage: testutil.MockUsage(10, 2)}},
+	}})
+	store := &testStore{}
+	r := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Model: model, SessionStore: store, Quiet: true})
+	result, err := r.Run(context.Background(), "go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.NewMessages) != 1 {
+		t.Fatalf("messages = %+v", result.NewMessages)
+	}
+	parts := result.NewMessages[0].Content.Parts
+	if len(parts) != 5 {
+		t.Fatalf("parts = %+v", parts)
+	}
+	if parts[0].(goai.TextPart).Text != "before" || parts[1].(goai.ReasoningPart).Text != "thinking" || parts[4].(goai.TextPart).Text != "after" {
+		t.Fatal("part order lost")
+	}
+	call := parts[2].(goai.ToolCallPart)
+	output := parts[3].(message.ToolResultPart)
+	if !call.ProviderExecuted || !output.ProviderExecuted || call.ProviderOptions["itemId"] != "remote" || output.ProviderOptions["itemId"] != "remote" {
+		t.Fatal("provider execution metadata lost")
+	}
+	live, _ := json.Marshal(result.NewMessages[0])
+	replay, _ := json.Marshal(session.MessageToGoAI(store.messages[1])[0])
+	if string(live) != string(replay) {
+		t.Fatalf("replay = %s, want %s", replay, live)
+	}
+}
+
+func TestRunner_ExitIsTerminalAtContextAndStepLimits(t *testing.T) {
+	a := testAgent(tool.Set{})
+	a.MaxSteps = 1
+	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponse: testutil.MockToolCallResponse("exit", "exit", map[string]string{"status": "success", "message": "done"}, testutil.MockUsage(2000, 1))})
+	r := NewRunner(RunnerOptions{Agent: a, Model: model, ModelLimits: session.ModelLimits{Input: 1000}, ExitState: &tools.ExitState{}, Quiet: true})
+	result, err := r.Run(context.Background(), "go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != RunExited || len(model.DoStreamCalls) != 1 {
+		t.Fatalf("result = %+v, calls = %d", result, len(model.DoStreamCalls))
+	}
+}
+
+func TestRunner_ProviderCallWithoutResultIsNotSynthesized(t *testing.T) {
+	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponse: []stream.Event{
+		{Type: stream.EventToolCall, Data: stream.ToolCallEvent{ToolCallID: "c", ToolName: "search", Input: json.RawMessage(`{}`), ProviderExecuted: true}},
+		{Type: stream.EventFinish, Data: stream.FinishEvent{FinishReason: stream.FinishReasonStop, Usage: testutil.MockUsage(1, 1)}},
+	}})
+	r := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Model: model, Quiet: true})
+	result, err := r.Run(context.Background(), "go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.NewMessages) != 1 || len(result.NewMessages[0].Content.Parts) != 1 {
+		t.Fatalf("synthesized provider result: %+v", result.NewMessages)
+	}
+	if pending := pendingToolCalls(result.Steps[0].ToolCalls, nil); len(pending) != 0 {
+		t.Fatalf("provider calls pending locally: %+v", pending)
+	}
+}
+
+func TestRunner_FilesRetainTurnsPreservesStoreAndStructuredResults(t *testing.T) {
+	output := message.ContentOutput{Value: []message.ToolContentItem{
+		{Type: "text", Text: "before"},
+		{Type: "image-data", Data: "old image payload", MediaType: "image/png"},
+		{Type: "text", Text: "after"},
+	}}
+	history := session.FromGoAIMessages([]goai.Message{
+		message.NewUserMessageWithParts(message.TextPart{Text: "old"}, message.FilePart{Data: message.FileDataText{Text: "old file payload"}, MimeType: "text/plain"}),
+		goai.NewToolMessage("c", "read", output),
+		goai.NewUserMessage("latest"),
+		goai.NewToolMessage("d", "read", message.JSONOutput{Value: map[string]any{"ok": true}}),
+	})
+	before, _ := json.Marshal(history)
+	store := &testStore{messages: history}
+	a := testAgent(tool.Set{})
+	a.HistoryPolicy.FilesRetainTurns = 1
+	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponse: testutil.MockTextResponse("ok", testutil.MockUsage(1, 1))})
+	r := NewRunner(RunnerOptions{Agent: a, Model: model, SessionStore: store, Quiet: true})
+	if _, err := r.Run(context.Background(), ""); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := json.Marshal(history)
+	if string(after) != string(before) {
+		t.Fatal("retention mutated loaded store history")
+	}
+	request, _ := json.Marshal(model.DoStreamCalls[0])
+	if strings.Contains(string(request), "old image payload") || strings.Contains(string(request), "old file payload") {
+		t.Fatalf("retained old attachment: %s", request)
+	}
+	if !strings.Contains(string(request), "Image removed from context") || !strings.Contains(string(request), "after") {
+		t.Fatalf("lost detach note or trailing text: %s", request)
+	}
+	if p := r.messages[4].Content.Parts[0].(message.ToolResultPart); p.Output.(message.JSONOutput).Value == nil {
+		t.Fatal("lost JSON result")
+	}
+}
+
+func TestFilterMessageParts_ExcludesNestedContentFiles(t *testing.T) {
+	m := goai.NewToolMessage("c", "read", message.ContentOutput{Value: []message.ToolContentItem{
+		{Type: "text", Text: "visible"},
+		{Type: "file-reference", ProviderReference: map[string]string{"openai": "private-file"}},
+	}})
+	filtered := filterMessageParts(m, agent.HistoryPolicy{ExcludeFiles: true})
+	encoded, err := json.Marshal(filtered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "private-file") || !strings.Contains(string(encoded), "visible") {
+		t.Fatalf("filtered = %s", encoded)
+	}
+	if original := m.Content.Parts[0].(message.ToolResultPart).Output.(message.ContentOutput); original.Value[1].Type != "file-reference" {
+		t.Fatal("mutated original output")
+	}
+}
+
+func TestRunner_FailedAppendRequiresFreshRun(t *testing.T) {
+	store := &testStore{appendErrAt: 2}
+	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponse: testutil.MockTextResponse("answer", testutil.MockUsage(1, 1))})
+	r := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Model: model, SessionStore: store, Quiet: true})
+	if _, err := r.Run(context.Background(), "first"); err == nil {
+		t.Fatal("expected append error")
+	}
+	if _, err := r.Continue(context.Background(), "unsafe"); err == nil {
+		t.Fatal("Continue accepted unpersisted history")
+	}
+	result, err := r.Run(context.Background(), "second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.NewMessages) != 1 || result.TotalText != "answer" || len(result.Steps) != 1 {
+		t.Fatalf("fresh result = %+v", result)
+	}
+	if len(result.Messages) != 4 {
+		t.Fatalf("fresh Run reused unpersisted history: %+v", result.Messages)
 	}
 }
 
@@ -272,6 +796,31 @@ func TestRunner_SubagentInheritsExecutor(t *testing.T) {
 	}
 	if len(executor.calls) != 1 || executor.calls[0].ToolName != "read" {
 		t.Fatalf("executor calls = %#v, want one read call", executor.calls)
+	}
+}
+
+func TestRunner_SubagentStepLimitPropagatesThroughTask(t *testing.T) {
+	maxSteps := agent.NewGeneralAgent("gpt-4o").MaxSteps
+	responses := make([][]stream.Event, maxSteps)
+	for i := range responses {
+		responses[i] = testutil.MockToolCallResponse(fmt.Sprintf("read-%d", i), "read", map[string]string{
+			"filePath": fmt.Sprintf("/workspace/file-%d.go", i),
+		}, testutil.MockUsage(1, 1))
+	}
+	executor := &recordingExecutor{}
+	runner := NewRunner(RunnerOptions{
+		Agent:    testAgent(tool.Set{}),
+		Model:    testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponses: responses}),
+		Executor: executor,
+		Quiet:    true,
+	})
+	ctx := context.WithValue(context.Background(), tools.RunnerKey, runner)
+	result, err := tools.Task().Execute(ctx, json.RawMessage(`{"description":"inspect files","prompt":"inspect","subagent_type":"general"}`), tool.CallOptions{})
+	if err == nil || !strings.Contains(err.Error(), "step limit reached") || result.Output != "" {
+		t.Fatalf("exhausted child task returned result=%+v err=%v", result, err)
+	}
+	if len(executor.calls) != maxSteps {
+		t.Fatalf("executed %d calls, want %d", len(executor.calls), maxSteps)
 	}
 }
 
@@ -506,7 +1055,7 @@ func TestRunner_ContinueStoreAppendFailureWinsOverCancellation(t *testing.T) {
 	if _, err := runner.Run(context.Background(), "hi"); err != nil {
 		t.Fatal(err)
 	}
-	store.appendErrAt = 3
+	store.appendErrAt = 4
 	ctx, cancel := context.WithCancel(context.Background())
 	cancelContinue = cancel
 	result, err := runner.Continue(ctx, "continue")

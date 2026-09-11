@@ -13,18 +13,17 @@ import "github.com/airlockrun/goai/message"
 // Collapsing here, at the single point where messages leave for the
 // model, makes every provider behave the same.
 //
-// Multipart user messages (images / files) are left as-is: concatenating
-// their parts would be lossy and they aren't the adjacent-text case this
-// guards. Output is always a fresh slice; the merged message is a copy,
-// so the runner's retained r.messages is never mutated.
+// Messages with provider options and multipart messages are left as-is:
+// merging must not change the scope of metadata or attachment parts.
+// Merged messages are copies, so the retained transcript is never mutated.
 func coalesceConsecutiveUser(msgs []message.Message) []message.Message {
 	if len(msgs) < 2 {
 		return msgs
 	}
 	out := make([]message.Message, 0, len(msgs))
 	for _, m := range msgs {
-		if m.Role == "user" && !m.Content.IsMultiPart() && len(out) > 0 {
-			if last := &out[len(out)-1]; last.Role == "user" && !last.Content.IsMultiPart() {
+		if m.Role == "user" && !m.Content.IsMultiPart() && len(m.ProviderOptions) == 0 && len(out) > 0 {
+			if last := &out[len(out)-1]; last.Role == "user" && !last.Content.IsMultiPart() && len(last.ProviderOptions) == 0 {
 				switch {
 				case last.Content.Text == "":
 					last.Content.Text = m.Content.Text

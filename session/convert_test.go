@@ -1,12 +1,79 @@
 package session
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/airlockrun/goai/message"
 )
+
+func TestRoundtrip_PersistedStructuredMessages(t *testing.T) {
+	metadata := map[string]any{"provider": map[string]any{"id": "item-1"}}
+	tests := []struct {
+		name string
+		msg  message.Message
+	}{
+		{"multipart user", message.NewUserMessageWithParts(
+			message.TextPart{Text: "inspect", ProviderOptions: metadata},
+			message.FilePart{Data: message.FileDataBytes{Data: "aW1hZ2U="}, MimeType: "image/png", ProviderOptions: metadata},
+			message.TextPart{Text: "then this"},
+			message.FilePart{Data: message.FileDataText{Text: "plain content"}, MimeType: "text/plain", Filename: "note.txt"},
+			message.FilePart{Data: message.FileDataURL{URL: "https://example.com/doc.pdf"}, MimeType: "application/pdf"},
+			message.FilePart{Data: message.FileDataReference{Reference: map[string]any{"openai": "file-123"}}, MimeType: "application/pdf"},
+		)},
+		{"assistant provider tools", message.NewAssistantMessageWithParts(
+			message.TextPart{Text: "before"},
+			message.ReasoningPart{Text: "reason", ProviderOptions: metadata},
+			message.ToolCallPart{ID: "c", Name: "search", Input: json.RawMessage(`{"q":"x"}`), ProviderExecuted: true, ProviderOptions: metadata},
+			message.ToolResultPart{ToolCallID: "c", ToolName: "search", ProviderExecuted: true, ProviderOptions: metadata,
+				Output: message.JSONOutput{Value: json.RawMessage(`{"large":9007199254740993,"ok":true,"empty":null}`), ProviderOptions: metadata}},
+			message.TextPart{Text: "after"},
+		)},
+		{"ordered tool results", message.Message{Role: message.RoleTool, Content: message.Content{Parts: []message.Part{
+			message.TextPart{Text: "before"},
+			message.ToolResultPart{ToolCallID: "a", ToolName: "first", Output: message.ErrorJSONOutput{Value: []any{true, nil, "error"}, ProviderOptions: metadata}},
+			message.FilePart{Data: message.FileDataBytes{Data: "data"}, MimeType: "image/png"},
+			message.ToolResultPart{ToolCallID: "b", ToolName: "second", Output: message.ContentOutput{Value: []message.ToolContentItem{
+				{Type: "text", Text: "one"},
+				{Type: "image-url", URL: "https://example.com/image", ProviderOptions: metadata},
+				{Type: "text", Text: "two"},
+				{Type: "file-reference", ProviderReference: map[string]string{"openai": "f"}},
+			}}},
+		}}}},
+		{"empty denial", message.NewToolMessage("denied", "t", message.ExecutionDeniedOutput{ProviderOptions: metadata})},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.msg.ProviderOptions = metadata
+			sm := FromGoAIMessage(tt.msg)
+			data, err := json.Marshal(sm)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var loaded Message
+			if err := json.Unmarshal(data, &loaded); err != nil {
+				t.Fatal(err)
+			}
+			got := MessageToGoAI(loaded)
+			if len(got) != 1 {
+				t.Fatalf("message count = %d", len(got))
+			}
+			wantJSON, err := json.Marshal(tt.msg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			gotJSON, err := json.Marshal(got[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(gotJSON, wantJSON) {
+				t.Fatalf("round trip:\n%s\nwant:\n%s", gotJSON, wantJSON)
+			}
+		})
+	}
+}
 
 // TestRoundtrip_ToolOutcomePreserved guards the regression where the
 // goai→session→goai round-trip flattened every tool result to a success
@@ -49,6 +116,51 @@ func TestRoundtrip_ToolOutcomePreserved(t *testing.T) {
 			b, _ := message.MarshalOutput(trp.Output)
 			if !json.Valid(b) || !strings.Contains(string(b), `"type":"`+tc.wantType+`"`) {
 				t.Fatalf("round-trip output = %s, want type %q", b, tc.wantType)
+			}
+		})
+	}
+}
+
+func TestRoundtrip_FileSource(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		data   message.FileData
+		source string
+	}{
+		{"s3 data", message.FileDataBytes{Data: "s3ref:tmp/id-report.pdf"}, "tmp/id-report.pdf"},
+		{"s3 url", message.FileDataURL{URL: "s3ref:tmp/id-report.pdf"}, "tmp/id-report.pdf"},
+		{"inline", message.FileDataBytes{Data: "cGRm"}, ""},
+		{"text", message.FileDataText{Text: "s3ref:tmp/id-report.pdf"}, ""},
+		{"provider reference", message.FileDataReference{Reference: map[string]any{"openai": "file-123"}}, ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			original := message.NewUserMessageWithParts(message.FilePart{Data: tt.data, MimeType: "application/pdf", Filename: "report.pdf"})
+			converted := FromGoAIMessage(original)
+			for range 2 {
+				data, err := json.Marshal(converted)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var loaded Message
+				if err := json.Unmarshal(data, &loaded); err != nil {
+					t.Fatal(err)
+				}
+				converted = FromGoAIMessage(MessageToGoAI(loaded)[0])
+				file := converted.Parts[0].File
+				if file.Source != tt.source || file.Filename != "report.pdf" {
+					t.Fatalf("file = %+v, want source %q and filename report.pdf", file, tt.source)
+				}
+				got, err := json.Marshal(MessageToGoAI(converted)[0])
+				if err != nil {
+					t.Fatal(err)
+				}
+				want, err := json.Marshal(original)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(got, want) {
+					t.Fatalf("round trip = %s, want %s", got, want)
+				}
 			}
 		})
 	}

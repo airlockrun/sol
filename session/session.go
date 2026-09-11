@@ -4,9 +4,11 @@ package session
 
 import (
 	"context"
+	"errors"
 	"sync"
 
 	"github.com/airlockrun/goai"
+	"github.com/airlockrun/goai/message"
 	"github.com/airlockrun/goai/stream"
 	"github.com/airlockrun/sol/bus"
 )
@@ -50,38 +52,82 @@ type Tokens struct {
 	} `json:"cache"`
 }
 
-// ModelLimits defines the model's context window limits.
+// ModelLimits records model capability maxima, not per-call token allocations.
+// Zero means the corresponding limit is unknown.
 type ModelLimits struct {
 	Context int // Total context window size
-	Input   int // Max input tokens (if different from context - output)
+	Input   int // Independent max input tokens
 	Output  int // Max output tokens
+}
+
+// Validate rejects invalid budgets and requires a usable limit for auto compaction.
+func (l ModelLimits) Validate(auto bool) error {
+	if l.Context < 0 || l.Input < 0 || l.Output < 0 {
+		return errors.New("model limits must not be negative")
+	}
+	if l.Context > 0 && l.Input > l.Context {
+		return errors.New("input limit exceeds context limit")
+	}
+	if auto && l.inputBudget() <= 0 {
+		return errors.New("automatic compaction requires a positive input budget: set Input or Context, or disable Auto")
+	}
+	return nil
+}
+
+// inputBudget is shared by validation and overflow detection. It leaves the
+// declared maxima intact; Output is not a reservation made by every call.
+func (l ModelLimits) inputBudget() int {
+	if l.Context == 0 {
+		return l.Input
+	}
+	reserve := OutputTokenMax
+	if l.Output > 0 {
+		reserve = min(reserve, l.Output)
+	}
+	// Keep the default output cap, but reserve at most half a known context so
+	// small windows retain room for history and do not compact every response.
+	usable := l.Context - min(reserve, l.Context/2)
+	if l.Input > 0 {
+		usable = min(usable, l.Input)
+	}
+	return usable
 }
 
 // Message represents a message in the session history.
 type Message struct {
-	ID        string `json:"id"`
-	Role      string `json:"role"` // "system", "user", "assistant", "tool"
-	Content   string `json:"content,omitempty"`
-	Parts     []Part `json:"parts,omitempty"`
-	ParentID  string `json:"parentId,omitempty"`  // For assistant messages, links to user message
-	Summary   bool   `json:"summary,omitempty"`   // True if this is a compaction summary
-	Tokens    Tokens `json:"tokens,omitempty"`    // Token usage for this message
-	Compacted bool   `json:"compacted,omitempty"` // True if tool outputs have been pruned
+	ProviderOptions map[string]any `json:"providerOptions,omitempty"`
+	ID              string         `json:"id"`
+	Role            string         `json:"role"` // "system", "user", "assistant", "tool"
+	Content         string         `json:"content,omitempty"`
+	Parts           []Part         `json:"parts,omitempty"`
+	ParentID        string         `json:"parentId,omitempty"`  // For assistant messages, links to user message
+	Summary         bool           `json:"summary,omitempty"`   // True if this is a compaction summary
+	Tokens          Tokens         `json:"tokens,omitempty"`    // Token usage for this message
+	Compacted       bool           `json:"compacted,omitempty"` // True if tool outputs have been pruned
 }
 
 // Part represents a part of a message (text, tool call, file, etc.)
 type Part struct {
-	ID              string         `json:"id"`
-	Type            string         `json:"type"` // "text", "tool", "reasoning", "compaction", "file"
-	Text            string         `json:"text,omitempty"`
-	ProviderOptions map[string]any `json:"providerOptions,omitempty"`
-	Tool            *ToolPart      `json:"tool,omitempty"`
-	File            *FilePart      `json:"file,omitempty"`
-	Compacted       bool           `json:"compacted,omitempty"` // True if output has been pruned
+	ID               string                            `json:"id"`
+	Type             string                            `json:"type"` // "text", "tool", "reasoning", "compaction", "file"
+	Text             string                            `json:"text,omitempty"`
+	ProviderOptions  map[string]any                    `json:"providerOptions,omitempty"`
+	Tool             *ToolPart                         `json:"tool,omitempty"`
+	File             *FilePart                         `json:"file,omitempty"`
+	Compacted        bool                              `json:"compacted,omitempty"` // True if output has been pruned
+	ApprovalRequest  *message.ToolApprovalRequestPart  `json:"approvalRequest,omitempty"`
+	ApprovalResponse *message.ToolApprovalResponsePart `json:"approvalResponse,omitempty"`
 }
 
 // ToolPart represents a tool call and its result.
 type ToolPart struct {
+	// OutputType preserves the discriminated result type. Empty uses Outcome
+	// and Output for persisted records without a discriminant.
+	OutputType            string         `json:"outputType,omitempty"`
+	OutputProviderOptions map[string]any `json:"outputProviderOptions,omitempty"`
+	ProviderExecuted      bool           `json:"providerExecuted,omitempty"`
+	// Result distinguishes assistant-side provider results from calls.
+	Result bool   `json:"result,omitempty"`
 	CallID string `json:"callId"`
 	Name   string `json:"name"`
 	Input  string `json:"input,omitempty"`
@@ -95,13 +141,15 @@ type ToolPart struct {
 	Compacted bool   `json:"compacted,omitempty"` // True if output has been pruned
 }
 
-// FilePart represents a file attachment, including images. Data holds
-// base64-encoded content or a URL; MimeType drives rendering (an image/*
-// type renders as an image). Mirrors goai's unified message.FilePart.
+// FilePart represents an attachment, including images. DataType is data, url,
+// text, or reference. Reference carries provider handles; Data carries the
+// other payloads. MimeType determines rendering.
 type FilePart struct {
-	Data     string `json:"data"`               // base64-encoded content or URL
-	MimeType string `json:"mimeType"`           // e.g., "application/pdf", "image/png"
-	Filename string `json:"filename,omitempty"` // optional filename
+	DataType  string         `json:"dataType,omitempty"`
+	Reference map[string]any `json:"reference,omitempty"`
+	Data      string         `json:"data"`               // base64-encoded content, text, or URL
+	MimeType  string         `json:"mimeType"`           // e.g., "application/pdf", "image/png"
+	Filename  string         `json:"filename,omitempty"` // optional filename
 	// Source identifies where this file came from (e.g. a file key, URL, or ID).
 	// Session-level metadata only — not passed to goai or LLM providers.
 	Source string `json:"source,omitempty"`
