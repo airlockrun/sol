@@ -1,12 +1,17 @@
 package sol
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"slices"
+
 	"github.com/airlockrun/goai/message"
 )
 
 // redactMessages returns a copy of msgs with text content stripped of
 // any sensitive substrings via redactor. ToolCallPart.Input and
-// ToolResultPart.Result are scanned too — agents that echo a secret in
+// ToolResultPart.Output are scanned too — agents that echo a secret in
 // a tool argument or return value shouldn't leak it into the next
 // step's history. nil redactor → return msgs unchanged.
 //
@@ -42,16 +47,16 @@ func redactPart(p message.Part, redactor func(string) string) message.Part {
 		v.Text = redactor(v.Text)
 		return v
 	case message.ToolCallPart:
-		// Input is a json.RawMessage; redact as bytes and trust it's
-		// still valid JSON (substring replace doesn't break shape since
-		// [REDACTED] is non-special).
-		v.Input = []byte(redactor(string(v.Input)))
+		v.Input = redactJSON(v.Input, redactor)
 		return v
 	case message.ToolResultPart:
-		// Redact the text-bearing output variants; JSON variants pass
-		// through (agents packing secrets into typed output opt into
-		// manual redaction).
 		switch o := v.Output.(type) {
+		case message.JSONOutput:
+			o.Value = redactJSON(o.Value, redactor)
+			v.Output = o
+		case message.ErrorJSONOutput:
+			o.Value = redactJSON(o.Value, redactor)
+			v.Output = o
 		case message.TextOutput:
 			o.Value = redactor(o.Value)
 			v.Output = o
@@ -62,6 +67,7 @@ func redactPart(p message.Part, redactor func(string) string) message.Part {
 			o.Reason = redactor(o.Reason)
 			v.Output = o
 		case message.ContentOutput:
+			o.Value = slices.Clone(o.Value)
 			for i := range o.Value {
 				if o.Value[i].Type == "text" {
 					o.Value[i].Text = redactor(o.Value[i].Text)
@@ -74,10 +80,38 @@ func redactPart(p message.Part, redactor func(string) string) message.Part {
 	return p
 }
 
-// redactString is a small adaptor — applies the redactor when non-nil.
-func redactString(s string, redactor func(string) string) string {
-	if redactor == nil {
-		return s
+// Redact string values inside JSON, preserving numbers and escaping replacements.
+func redactJSON(value any, redactor func(string) string) json.RawMessage {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		panic(fmt.Errorf("redact JSON: %w", err))
 	}
-	return redactor(s)
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&value); err != nil {
+		panic(fmt.Errorf("redact JSON: %w", err))
+	}
+	var redact func(any) any
+	redact = func(v any) any {
+		switch x := v.(type) {
+		case string:
+			return redactor(x)
+		case []any:
+			for i := range x {
+				x[i] = redact(x[i])
+			}
+		case map[string]any:
+			result := make(map[string]any, len(x))
+			for k, item := range x {
+				result[redactor(k)] = redact(item)
+			}
+			return result
+		}
+		return v
+	}
+	raw, err = json.Marshal(redact(value))
+	if err != nil {
+		panic(fmt.Errorf("redact JSON: %w", err))
+	}
+	return raw
 }

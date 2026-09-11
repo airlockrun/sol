@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -32,9 +33,10 @@ type Runner struct {
 	// Agent configuration
 	agent *agent.Agent
 
-	// Parsed from Agent.Model
-	providerID string
-	modelID    string
+	// Provider/model identity and the context budget.
+	providerID  string
+	modelID     string
+	modelLimits session.ModelLimits
 
 	// Runtime options
 	apiKey                      string
@@ -67,6 +69,7 @@ type Runner struct {
 	compactionConfig *session.CompactionConfig // nil = use defaults
 	messages         []goai.Message
 	initialMessages  []goai.Message   // Pre-loaded thread history (ignored when store is set)
+	canContinue      bool             // true after Run initializes a complete transcript
 	newMessages      []goai.Message   // append-only: messages generated during this run
 	compactionState  *CompactionState // set if compaction happened
 	doomDetector     *session.DoomLoopDetector
@@ -146,6 +149,12 @@ type RunnerOptions struct {
 	// Used for testing with mock models.
 	Model stream.Model
 
+	// ModelLimits defines the context budget for automatic compaction. A zero
+	// value infers limits from the known provider catalog. If the catalog has
+	// no budget, automatic overflow detection is unavailable; manual compaction
+	// still works. Nonzero explicit limits are validated before model calls.
+	ModelLimits session.ModelLimits
+
 	// ExitState, when set, opts the runner into "agent must call exit"
 	// semantics. After every step the runner checks ExitState.Called() and,
 	// if true, breaks the loop with RunResult.Status = RunExited. The exit
@@ -216,6 +225,7 @@ func NewRunner(opts RunnerOptions) *Runner {
 		agent:                       opts.Agent,
 		providerID:                  providerID,
 		modelID:                     modelID,
+		modelLimits:                 opts.ModelLimits,
 		apiKey:                      opts.APIKey,
 		baseURL:                     opts.BaseURL,
 		httpClient:                  opts.HTTPClient,
@@ -267,28 +277,15 @@ func (r *Runner) logText(text string) {
 func (r *Runner) Run(ctx context.Context, prompt string) (*RunResult, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.canContinue = false
 
 	// Create cancellable context
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Create session for message history and compaction
-	contextLimit := provider.GetContextLimit(r.providerID, r.modelID)
-	outputLimit := provider.GetOutputLimit(r.providerID, r.modelID)
-	if outputLimit == 0 {
-		outputLimit = session.OutputTokenMax
+	if err := r.initSession(); err != nil {
+		return nil, err
 	}
-	r.session = session.NewWithOptions(session.SessionOptions{
-		ID:               r.sessionID,
-		AgentName:        r.agent.Name,
-		ModelID:          r.modelID,
-		CompactionConfig: r.compactionConfig,
-		Limits: session.ModelLimits{
-			Context: contextLimit,
-			Output:  outputLimit,
-		},
-		Bus: r.bus,
-	})
 
 	// Build system prompt
 	systemPrompt := r.buildSystemPrompt()
@@ -362,12 +359,14 @@ func (r *Runner) Run(ctx context.Context, prompt string) (*RunResult, error) {
 			goai.NewUserMessage(prompt),
 		}
 	}
-	r.newMessages = nil
-	r.compactionState = nil
-	r.streamErrorContinuations = 0
+	if r.store == nil {
+		r.session.Messages = session.FromGoAIMessages(r.messages[1:])
+	}
+	r.canContinue = true
 
 	result := &RunResult{
 		AgentName: r.agent.Name,
+		Status:    RunStepLimitReached,
 	}
 	// Fill result.Usage from completed Steps before returning, regardless of
 	// which branch (complete/fail/cancel/suspend) we took. Callers publishing
@@ -436,11 +435,20 @@ func (r *Runner) Run(ctx context.Context, prompt string) (*RunResult, error) {
 		r.streamErrorContinuations = 0
 		r.recordStep(result, stepResult)
 
+		// An explicit exit is terminal, even when this step fills the context.
+		if r.exitState != nil && r.exitState.Called() {
+			result.Status = RunExited
+			result.Messages = r.copyMessages()
+			result.NewMessages = r.copyNewMessages()
+			result.CompactionState = r.compactionState
+			return result, nil
+		}
+
 		// Check for context overflow and compact if needed
 		if r.session.IsOverflow() {
 			r.log("[%s] Context overflow detected, compacting...\n", r.agent.Name)
 
-			pruned := r.session.Prune()
+			pruned := r.prune()
 			if pruned > 0 {
 				r.log("[%s] Pruned %d old tool outputs\n", r.agent.Name, pruned)
 			}
@@ -459,30 +467,54 @@ func (r *Runner) Run(ctx context.Context, prompt string) (*RunResult, error) {
 			}
 		}
 
-		// Check if the agent invoked the exit tool. Done before the
-		// FinishReason check because the LLM commonly replies with a final
-		// "I'm done" text after the exit tool call — that text would set
-		// FinishReason to Stop and exit the loop the regular way, but we
-		// want RunExited specifically so callers can distinguish.
-		if r.exitState != nil && r.exitState.Called() {
-			result.Status = RunExited
-			result.Messages = r.copyMessages()
-			result.NewMessages = r.copyNewMessages()
-			result.CompactionState = r.compactionState
-			return result, nil
-		}
-
 		// Check if we should stop
 		if stepResult.FinishReason != stream.FinishReasonToolCalls {
+			result.Status = RunCompleted
 			break
 		}
 	}
 
-	result.Status = RunCompleted
 	result.Messages = r.copyMessages()
 	result.NewMessages = r.copyNewMessages()
 	result.CompactionState = r.compactionState
 	return result, nil
+}
+
+// initSession resolves one budget for every entry point, including child runs.
+func (r *Runner) initSession() error {
+	config := session.DefaultCompactionConfig()
+	if r.compactionConfig != nil {
+		config = *r.compactionConfig
+	}
+	limits := r.modelLimits
+	if limits != (session.ModelLimits{}) {
+		if err := limits.Validate(config.Auto); err != nil {
+			return fmt.Errorf("RunnerOptions.ModelLimits for %q: %w", r.agent.Model, err)
+		}
+	} else if info, ok := provider.GetModelInfo(r.providerID, r.modelID); ok && info.Limit != nil {
+		limits = session.ModelLimits{Context: info.Limit.Context, Input: info.Limit.Input, Output: info.Limit.Output}
+	}
+	if r.session != nil {
+		r.session.Cancel()
+	}
+	r.session = session.NewWithOptions(session.SessionOptions{
+		ID: r.sessionID, AgentName: r.agent.Name, ModelID: r.modelID,
+		Limits: limits, CompactionConfig: &config, Bus: r.bus,
+	})
+	r.newMessages = nil
+	r.compactionState = nil
+	r.streamErrorContinuations = 0
+	return nil
+}
+
+func (r *Runner) prune() int {
+	// Prune exactly the model-facing transcript, not unfiltered stored history.
+	r.session.Messages = session.FromGoAIMessages(r.messages[1:])
+	pruned := r.session.Prune()
+	if pruned > 0 {
+		r.messages = append(r.messages[:1:1], r.session.ToGoAIMessages()...)
+	}
+	return pruned
 }
 
 // CompactResult describes the outcome of a user-triggered compaction.
@@ -503,6 +535,7 @@ type CompactResult struct {
 func (r *Runner) Compact(ctx context.Context) (*CompactResult, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.canContinue = false
 
 	if r.store == nil {
 		return nil, errors.New("Compact requires a SessionStore")
@@ -511,21 +544,9 @@ func (r *Runner) Compact(ctx context.Context) (*CompactResult, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Build session + system prompt the same way Run does, so compaction
-	// sees the same model limits, bus, and history policy.
-	contextLimit := provider.GetContextLimit(r.providerID, r.modelID)
-	outputLimit := provider.GetOutputLimit(r.providerID, r.modelID)
-	if outputLimit == 0 {
-		outputLimit = session.OutputTokenMax
+	if err := r.initSession(); err != nil {
+		return nil, err
 	}
-	r.session = session.NewWithOptions(session.SessionOptions{
-		ID:               r.sessionID,
-		AgentName:        r.agent.Name,
-		ModelID:          r.modelID,
-		CompactionConfig: r.compactionConfig,
-		Limits:           session.ModelLimits{Context: contextLimit, Output: outputLimit},
-		Bus:              r.bus,
-	})
 
 	systemPrompt := r.buildSystemPrompt()
 
@@ -533,6 +554,7 @@ func (r *Runner) Compact(ctx context.Context) (*CompactResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store load: %w", err)
 	}
+	history = r.stripOldFilesFromHistory(history)
 	r.session.Messages = history
 
 	goaiHistory := session.MessagesToGoAI(history)
@@ -576,10 +598,17 @@ func (r *Runner) Compact(ctx context.Context) (*CompactResult, error) {
 // Compact() method so the two can't drift.
 func (r *Runner) compactNow(ctx context.Context, systemPrompt string) (int, error) {
 	preTokens := r.session.Tokens.Input + r.session.Tokens.Cache.Read + r.session.Tokens.Output
+	maxOutputTokens := session.OutputTokenMax
+	if r.session.ModelLimits.Output > 0 {
+		maxOutputTokens = min(maxOutputTokens, r.session.ModelLimits.Output)
+	}
 
 	compactOpts := &session.CompactOptions{
 		ProviderOptions: provider.ProviderOptions(r.providerID, r.modelID, r.sessionID),
-		MaxOutputTokens: provider.MaxOutputTokens(r.modelID),
+		MaxOutputTokens: maxOutputTokens,
+		TransformMessages: func(msgs []goai.Message) []goai.Message {
+			return coalesceConsecutiveUser(redactMessages(msgs, r.agent.Redactor))
+		},
 	}
 	if err := r.session.CompactAndContinue(ctx, r.model, r.messages, compactOpts); err != nil {
 		return 0, fmt.Errorf("compaction error: %w", err)
@@ -588,15 +617,13 @@ func (r *Runner) compactNow(ctx context.Context, systemPrompt string) (int, erro
 	compactedMsgs := r.session.ToGoAIMessages()
 	r.messages = append([]goai.Message{goai.NewSystemMessage(systemPrompt)}, compactedMsgs...)
 	r.compactionState = &CompactionState{Messages: compactedMsgs}
+	r.session.Tokens = session.Tokens{Input: session.EstimateMessagesTokens(session.FromGoAIMessages(r.messages))}
 
-	tokensFreed := 0
+	tokensFreed := max(0, preTokens-session.EstimateMessagesTokens(r.session.GetMessages()))
 	if r.store != nil {
 		postCheckpoint := r.session.GetMessages()
-		tokensFreed = preTokens - session.EstimateMessagesTokens(postCheckpoint)
-		if tokensFreed < 0 {
-			tokensFreed = 0
-		}
 		if err := r.store.Compact(ctx, postCheckpoint, tokensFreed); err != nil {
+			r.canContinue = false
 			return 0, fmt.Errorf("store compact: %w", err)
 		}
 	}
@@ -685,15 +712,30 @@ func (r *Runner) Continue(ctx context.Context, prompt string) (*RunResult, error
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.session == nil {
-		return nil, fmt.Errorf("Continue called before Run")
+	if !r.canContinue || len(r.messages) == 0 {
+		return nil, errors.New("Continue requires an initialized Run transcript; call Run to load the session")
 	}
 
-	// Add user message to existing thread
-	r.messages = append(r.messages, goai.NewUserMessage(prompt))
+	r.newMessages = nil
+	r.compactionState = nil
+	r.streamErrorContinuations = 0
+	r.doomDetector = session.NewDoomLoopDetector()
+	if prompt != "" {
+		userMsg := goai.NewUserMessage(prompt)
+		sm := session.FromGoAIMessage(userMsg)
+		if r.store != nil {
+			if err := r.store.Append(ctx, []session.Message{sm}); err != nil {
+				r.canContinue = false
+				return nil, fmt.Errorf("store append user message: %w", err)
+			}
+		}
+		r.messages = append(r.messages, userMsg)
+		r.session.AddMessage(sm)
+	}
 
 	result := &RunResult{
 		AgentName: r.agent.Name,
+		Status:    RunStepLimitReached,
 	}
 	defer func() { result.Usage = sumStepsUsage(result.Steps) }()
 
@@ -753,10 +795,18 @@ func (r *Runner) Continue(ctx context.Context, prompt string) (*RunResult, error
 		r.streamErrorContinuations = 0
 		r.recordStep(result, stepResult)
 
+		if r.exitState != nil && r.exitState.Called() {
+			result.Status = RunExited
+			result.Messages = r.copyMessages()
+			result.NewMessages = r.copyNewMessages()
+			result.CompactionState = r.compactionState
+			return result, nil
+		}
+
 		if r.session.IsOverflow() {
 			r.log("[%s] Context overflow detected, compacting...\n", r.agent.Name)
 
-			pruned := r.session.Prune()
+			pruned := r.prune()
 			if pruned > 0 {
 				r.log("[%s] Pruned %d old tool outputs\n", r.agent.Name, pruned)
 			}
@@ -775,20 +825,12 @@ func (r *Runner) Continue(ctx context.Context, prompt string) (*RunResult, error
 			}
 		}
 
-		if r.exitState != nil && r.exitState.Called() {
-			result.Status = RunExited
-			result.Messages = r.copyMessages()
-			result.NewMessages = r.copyNewMessages()
-			result.CompactionState = r.compactionState
-			return result, nil
-		}
-
 		if stepResult.FinishReason != stream.FinishReasonToolCalls {
+			result.Status = RunCompleted
 			break
 		}
 	}
 
-	result.Status = RunCompleted
 	result.Messages = r.copyMessages()
 	result.NewMessages = r.copyNewMessages()
 	result.CompactionState = r.compactionState
@@ -878,7 +920,8 @@ func (r *Runner) runStep(ctx context.Context) (*StepResult, error) {
 	var textBuilder strings.Builder
 	var toolCalls []stream.ToolCall
 	var toolResults []stream.ToolResultEvent
-	var reasoningParts []goai.ReasoningPart
+	var assistantParts []goai.Part
+	textIndex := -1
 	var reasoningID string
 	reasoningIndex := -1
 	var observedFinishReason stream.FinishReason
@@ -886,42 +929,72 @@ func (r *Runner) runStep(ctx context.Context) (*StepResult, error) {
 
 	for event := range streamResult.FullStream {
 		switch e := event.Data.(type) {
+		case stream.TextStartEvent:
+			assistantParts = append(assistantParts, goai.TextPart{ProviderOptions: maps.Clone(e.ProviderMetadata)})
+			textIndex = len(assistantParts) - 1
 		case stream.TextDeltaEvent:
 			r.bus.Publish(bus.StreamTextDelta, e)
 			r.logText(e.Text)
 			textBuilder.WriteString(e.Text)
+			if textIndex < 0 {
+				assistantParts = append(assistantParts, goai.TextPart{})
+				textIndex = len(assistantParts) - 1
+			}
+			tp := assistantParts[textIndex].(goai.TextPart)
+			if len(e.ProviderMetadata) > 0 {
+				if tp.ProviderOptions == nil {
+					tp.ProviderOptions = make(map[string]any)
+				}
+				maps.Copy(tp.ProviderOptions, e.ProviderMetadata)
+			}
+			tp.Text += e.Text
+			assistantParts[textIndex] = tp
+		case stream.TextEndEvent:
+			if textIndex >= 0 && len(e.ProviderMetadata) > 0 {
+				tp := assistantParts[textIndex].(goai.TextPart)
+				if tp.ProviderOptions == nil {
+					tp.ProviderOptions = make(map[string]any)
+				}
+				maps.Copy(tp.ProviderOptions, e.ProviderMetadata)
+				assistantParts[textIndex] = tp
+			}
+			textIndex = -1
 		case stream.ReasoningStartEvent:
-			reasoningParts = append(reasoningParts, goai.ReasoningPart{
+			textIndex = -1
+			assistantParts = append(assistantParts, goai.ReasoningPart{
 				ProviderOptions: reasoningProviderOptions(e.ProviderMetadata, e.ID),
 			})
-			reasoningIndex = len(reasoningParts) - 1
+			reasoningIndex = len(assistantParts) - 1
 			reasoningID = e.ID
 		case stream.ReasoningDeltaEvent:
+			textIndex = -1
 			if reasoningIndex < 0 || (reasoningID != "" && e.ID != "" && reasoningID != e.ID) {
-				reasoningParts = append(reasoningParts, goai.ReasoningPart{
+				assistantParts = append(assistantParts, goai.ReasoningPart{
 					ProviderOptions: reasoningProviderOptions(e.ProviderMetadata, e.ID),
 				})
-				reasoningIndex = len(reasoningParts) - 1
+				reasoningIndex = len(assistantParts) - 1
 				reasoningID = e.ID
 			} else {
-				mergeReasoningProviderOptions(reasoningParts[reasoningIndex].ProviderOptions, e.ProviderMetadata)
+				mergeReasoningProviderOptions(assistantParts[reasoningIndex].(goai.ReasoningPart).ProviderOptions, e.ProviderMetadata)
 				if reasoningID == "" && e.ID != "" {
 					reasoningID = e.ID
-					reasoningParts[reasoningIndex].ProviderOptions["itemId"] = e.ID
+					assistantParts[reasoningIndex].(goai.ReasoningPart).ProviderOptions["itemId"] = e.ID
 				}
 			}
-			reasoningParts[reasoningIndex].Text += e.Text
+			rp := assistantParts[reasoningIndex].(goai.ReasoningPart)
+			rp.Text += e.Text
+			assistantParts[reasoningIndex] = rp
 		case stream.ReasoningEndEvent:
 			if reasoningIndex < 0 || (reasoningID != "" && e.ID != "" && reasoningID != e.ID) {
-				reasoningParts = append(reasoningParts, goai.ReasoningPart{
+				assistantParts = append(assistantParts, goai.ReasoningPart{
 					ProviderOptions: reasoningProviderOptions(e.ProviderMetadata, e.ID),
 				})
-				reasoningIndex = len(reasoningParts) - 1
+				reasoningIndex = len(assistantParts) - 1
 			} else {
-				mergeReasoningProviderOptions(reasoningParts[reasoningIndex].ProviderOptions, e.ProviderMetadata)
+				mergeReasoningProviderOptions(assistantParts[reasoningIndex].(goai.ReasoningPart).ProviderOptions, e.ProviderMetadata)
 			}
 			if e.ID != "" {
-				reasoningParts[reasoningIndex].ProviderOptions["itemId"] = e.ID
+				assistantParts[reasoningIndex].(goai.ReasoningPart).ProviderOptions["itemId"] = e.ID
 			}
 			reasoningID = ""
 			reasoningIndex = -1
@@ -934,11 +1007,18 @@ func (r *Runner) runStep(ctx context.Context) (*StepResult, error) {
 			}
 			observedUsage = e.Usage
 		case stream.ToolCallEvent:
+			textIndex = -1
+			assistantParts = append(assistantParts, goai.ToolCallPart{
+				ID: e.ToolCallID, Name: e.ToolName, Input: e.Input,
+				ProviderExecuted: e.ProviderExecuted, ProviderOptions: e.ProviderMetadata,
+			})
 			r.bus.Publish(bus.StreamToolCall, e)
 			toolCalls = append(toolCalls, stream.ToolCall{
-				ID:    e.ToolCallID,
-				Name:  e.ToolName,
-				Input: e.Input,
+				ID:               e.ToolCallID,
+				Name:             e.ToolName,
+				Input:            e.Input,
+				ProviderExecuted: e.ProviderExecuted,
+				ProviderMetadata: e.ProviderMetadata,
 			})
 			inputSummary := string(e.Input)
 			if len(inputSummary) > 200 {
@@ -958,6 +1038,13 @@ func (r *Runner) runStep(ctx context.Context) (*StepResult, error) {
 		case stream.ToolResultEvent:
 			r.bus.Publish(bus.StreamToolResult, e)
 			toolResults = append(toolResults, e)
+			if e.ProviderExecuted {
+				textIndex = -1
+				assistantParts = append(assistantParts, message.ToolResultPart{
+					ToolCallID: e.ToolCallID, ToolName: e.ToolName, Output: e.Output,
+					ProviderExecuted: true, ProviderOptions: e.ProviderMetadata,
+				})
+			}
 			output := message.ToolOutputText(e.Output)
 			if len(output) > 500 {
 				output = output[:500] + "..."
@@ -966,9 +1053,16 @@ func (r *Runner) runStep(ctx context.Context) (*StepResult, error) {
 		case stream.ToolErrorEvent:
 			// An errored tool is still a tool result for pairing purposes —
 			// collect it with its discriminated error output.
-			tr := stream.ToolResultEvent{ToolCallID: e.ToolCallID, ToolName: e.ToolName, Input: e.Input, Output: e.Output}
+			tr := stream.ToolResultEvent{ToolCallID: e.ToolCallID, ToolName: e.ToolName, Input: e.Input, Output: e.Output, ProviderExecuted: e.ProviderExecuted, ProviderMetadata: e.ProviderMetadata}
 			r.bus.Publish(bus.StreamToolResult, tr)
 			toolResults = append(toolResults, tr)
+			if e.ProviderExecuted {
+				textIndex = -1
+				assistantParts = append(assistantParts, message.ToolResultPart{
+					ToolCallID: e.ToolCallID, ToolName: e.ToolName, Output: e.Output,
+					ProviderExecuted: true, ProviderOptions: e.ProviderMetadata,
+				})
+			}
 			r.log("[result] %s\n", message.ToolOutputText(e.Output))
 		case stream.ToolOutputDeniedEvent:
 			tr := stream.ToolResultEvent{ToolCallID: e.ToolCallID, ToolName: e.ToolName, Input: e.Input, Output: message.ExecutionDeniedOutput{Reason: e.Reason}}
@@ -987,7 +1081,7 @@ func (r *Runner) runStep(ctx context.Context) (*StepResult, error) {
 				// the resume path's tool-result append forms a valid
 				// assistant→tool pair. A delegated suspend that skipped this
 				// left an orphaned tool message → next LLM turn 400s.
-				if err := r.appendPartialStep(ctx, textBuilder.String(), reasoningParts, toolCalls, toolResults, observedUsage); err != nil {
+				if err := r.appendPartialStep(ctx, assistantParts, toolCalls, toolResults, observedUsage); err != nil {
 					return &StepResult{
 						Text:         textBuilder.String(),
 						ToolCalls:    toolCalls,
@@ -1031,7 +1125,7 @@ func (r *Runner) runStep(ctx context.Context) (*StepResult, error) {
 			// result, added in appendMessages) so the interrupted work
 			// survives into the next turn's context instead of vanishing.
 			if ctx.Err() != nil || errors.Is(e.Error, context.Canceled) {
-				appendErr := r.appendPartialStep(ctx, textBuilder.String(), reasoningParts, toolCalls, toolResults, observedUsage)
+				appendErr := r.appendPartialStep(ctx, assistantParts, toolCalls, toolResults, observedUsage)
 				if appendErr != nil {
 					return &StepResult{
 						Text:         textBuilder.String(),
@@ -1049,7 +1143,7 @@ func (r *Runner) runStep(ctx context.Context) (*StepResult, error) {
 					Usage:        observedUsage,
 				}, fmt.Errorf("stream error: %w", e.Error)
 			}
-			appendErr := r.appendMessages(ctx, true, textBuilder.String(), reasoningParts, toolCalls, toolResults, observedUsage)
+			appendErr := r.appendMessages(ctx, true, assistantParts, toolCalls, toolResults, observedUsage)
 			if appendErr != nil {
 				return &StepResult{
 					Text:         textBuilder.String(),
@@ -1087,7 +1181,7 @@ func (r *Runner) runStep(ctx context.Context) (*StepResult, error) {
 		Usage:        usage,
 	}
 
-	if err := r.appendMessages(ctx, true, text, reasoningParts, toolCalls, toolResults, usage); err != nil {
+	if err := r.appendMessages(ctx, true, assistantParts, toolCalls, toolResults, usage); err != nil {
 		return stepResult, err
 	}
 	r.bus.Publish(bus.StreamStepComplete, stepResult)
@@ -1104,12 +1198,12 @@ func (r *Runner) runStep(ctx context.Context) (*StepResult, error) {
 
 // appendPartialStep appends the assistant message and completed tool results to
 // r.messages for a resumable or cancelled step.
-func (r *Runner) appendPartialStep(ctx context.Context, text string, reasoningParts []goai.ReasoningPart, toolCalls []stream.ToolCall, toolResults []stream.ToolResultEvent, usage stream.Usage) error {
+func (r *Runner) appendPartialStep(ctx context.Context, parts []goai.Part, toolCalls []stream.ToolCall, toolResults []stream.ToolResultEvent, usage stream.Usage) error {
 	// completed=false: a suspended step (permission/question) deliberately
 	// leaves its pending tool-call unanswered for the resume path to fill, so
 	// orphan-synthesis must not run. The ctx-cancelled sub-case still gets a
 	// synthesized "Cancelled by user." result via appendMessages' own check.
-	return r.appendMessages(ctx, false, text, reasoningParts, toolCalls, toolResults, usage)
+	return r.appendMessages(ctx, false, parts, toolCalls, toolResults, usage)
 }
 
 type sessionStoreAppendError struct {
@@ -1141,13 +1235,14 @@ func mergeReasoningProviderOptions(destination, source map[string]any) {
 // to the assistant session message so billing / display totals can be computed per-message.
 //
 // completed reports whether the model stream finished normally for this step.
-// A completed step must never persist an assistant tool-call without a matching
-// result: a tool with no execute function (NoExecute) or a result the provider
+// A completed step must pair each locally executed tool call with a result:
+// a tool with no execute function (NoExecute) or a result the provider
 // stream dropped would otherwise leave an orphan that fails the next turn's LLM
 // call (OpenAI-compatible APIs reject an unanswered tool_call). Both that case
 // and a mid-step cancellation synthesize a placeholder result so the persisted
-// step is always a valid assistant→tool pair.
-func (r *Runner) appendMessages(ctx context.Context, completed bool, text string, reasoningParts []goai.ReasoningPart, toolCalls []stream.ToolCall, toolResults []stream.ToolResultEvent, usage stream.Usage) error {
+// step is always a valid assistant/tool pair. Provider-executed calls retain
+// their provider-side lifecycle and never receive synthetic local results.
+func (r *Runner) appendMessages(ctx context.Context, completed bool, parts []goai.Part, toolCalls []stream.ToolCall, toolResults []stream.ToolResultEvent, usage stream.Usage) error {
 	if len(toolCalls) > 0 && (completed || ctx.Err() != nil) {
 		reason := "No tool result was recorded for this call."
 		if ctx.Err() != nil {
@@ -1158,7 +1253,7 @@ func (r *Runner) appendMessages(ctx context.Context, completed bool, text string
 			resolved[tr.ToolCallID] = true
 		}
 		for _, tc := range toolCalls {
-			if !resolved[tc.ID] {
+			if !resolved[tc.ID] && !tc.ProviderExecuted {
 				toolResults = append(toolResults, stream.ToolResultEvent{
 					ToolCallID: tc.ID,
 					ToolName:   tc.Name,
@@ -1170,40 +1265,30 @@ func (r *Runner) appendMessages(ctx context.Context, completed bool, text string
 
 	var goaiMsgs []goai.Message
 
-	hasParts := len(toolCalls) > 0 || len(reasoningParts) > 0
-	if hasParts {
-		parts := make([]goai.Part, 0)
-		for _, rp := range reasoningParts {
-			parts = append(parts, rp)
-		}
-		if text != "" {
-			parts = append(parts, goai.TextPart{Text: text})
-		}
-		for _, tc := range toolCalls {
-			parts = append(parts, goai.ToolCallPart{
-				ID:    tc.ID,
-				Name:  tc.Name,
-				Input: tc.Input,
-			})
-		}
+	if len(parts) > 0 {
 		assistantMsg := goai.NewAssistantMessageWithParts(parts...)
+		if len(parts) == 1 {
+			if tp, ok := parts[0].(goai.TextPart); ok && len(tp.ProviderOptions) == 0 {
+				assistantMsg = goai.NewAssistantMessage(tp.Text)
+			}
+		}
 		r.messages = append(r.messages, assistantMsg)
 		r.newMessages = append(r.newMessages, assistantMsg)
 		goaiMsgs = append(goaiMsgs, assistantMsg)
 
 		for _, tr := range toolResults {
-			// The discriminated Output carries content/attachments inline;
-			// providers and session conversion expand it as needed.
+			if tr.ProviderExecuted {
+				continue
+			}
+			// Keep the discriminated output and replay metadata together.
 			toolMsg := goai.NewToolMessage(tr.ToolCallID, tr.ToolName, tr.Output)
+			toolMsg.Content.Parts[0] = message.ToolResultPart{
+				ToolCallID: tr.ToolCallID, ToolName: tr.ToolName, Output: tr.Output, ProviderOptions: tr.ProviderMetadata,
+			}
 			r.messages = append(r.messages, toolMsg)
 			r.newMessages = append(r.newMessages, toolMsg)
 			goaiMsgs = append(goaiMsgs, toolMsg)
 		}
-	} else if text != "" {
-		assistantMsg := goai.NewAssistantMessage(text)
-		r.messages = append(r.messages, assistantMsg)
-		r.newMessages = append(r.newMessages, assistantMsg)
-		goaiMsgs = append(goaiMsgs, assistantMsg)
 	}
 
 	// Track in session history (for compaction) and persist via store.
@@ -1223,10 +1308,7 @@ func (r *Runner) appendMessages(ctx context.Context, completed bool, text string
 			}
 		}
 
-		// Strip image/file parts and append detach info to tool output before
-		// persisting when ExcludeFiles is set. The detach message goes into the
-		// tool Output string (not a separate text part) so it works with ALL
-		// providers, including those that don't support multi-part tool results.
+		// Apply attachment retention to both message parts and content outputs.
 		if r.agent.HistoryPolicy.ExcludeFiles {
 			prunedMsg := r.session.CompactionConfig.PrunedMessage
 			if prunedMsg == nil {
@@ -1234,33 +1316,7 @@ func (r *Runner) appendMessages(ctx context.Context, completed bool, text string
 			}
 
 			for i := range sessionMsgs {
-				// Collect detach messages for stripped images/files.
-				var detachNotes []string
-				var filtered []session.Part
-				for _, p := range sessionMsgs[i].Parts {
-					if p.Type == "file" && p.File != nil {
-						detachNotes = append(detachNotes, prunedMsg(session.PrunedInfo{
-							Type:     prunedKind(p.File.MimeType),
-							MimeType: p.File.MimeType,
-							Filename: p.File.Filename,
-							Source:   p.File.Source,
-						}))
-						continue // drop the attachment part
-					}
-					filtered = append(filtered, p)
-				}
-				// Append detach notes to the tool output string.
-				if len(detachNotes) > 0 {
-					for j := range filtered {
-						if filtered[j].Type == "tool" && filtered[j].Tool != nil {
-							for _, note := range detachNotes {
-								filtered[j].Tool.Output += "\n" + note
-							}
-							break // attach to first tool part
-						}
-					}
-				}
-				sessionMsgs[i].Parts = filtered
+				sessionMsgs[i] = stripFilesFromMessage(sessionMsgs[i], prunedMsg)
 			}
 		}
 
@@ -1277,6 +1333,7 @@ func (r *Runner) appendMessages(ctx context.Context, completed bool, text string
 			storeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 			defer cancel()
 			if err := r.store.Append(storeCtx, sessionMsgs); err != nil {
+				r.canContinue = false
 				return &sessionStoreAppendError{err: err}
 			}
 		}
@@ -1287,8 +1344,8 @@ func (r *Runner) appendMessages(ctx context.Context, completed bool, text string
 // stripOldFilesFromHistory enforces HistoryPolicy.FilesRetainTurns by
 // keeping image/file parts only in the N most recent user turns (plus
 // their trailing assistant/tool responses). Older messages get their
-// image/file parts replaced with a detach note — appended to the nearest
-// tool output, or inserted as a text part if there is none.
+// image/file parts replaced with a detach note. Content-output attachments
+// are replaced in place inside their original tool result.
 //
 // A "turn" is bounded by a user message: each user msg starts a new turn
 // and owns every non-user msg that follows it until the next user msg.
@@ -1321,41 +1378,54 @@ func (r *Runner) stripOldFilesFromHistory(history []session.Message) []session.M
 		prunedMsg = session.DefaultPrunedMessage
 	}
 
+	history = append([]session.Message(nil), history...)
 	for i := 0; i < stripBefore; i++ {
-		var detachNotes []string
-		var filtered []session.Part
-		for _, p := range history[i].Parts {
-			if p.Type == "file" && p.File != nil {
-				detachNotes = append(detachNotes, prunedMsg(session.PrunedInfo{
-					Type:     prunedKind(p.File.MimeType),
-					MimeType: p.File.MimeType,
-					Filename: p.File.Filename,
-					Source:   p.File.Source,
-				}))
-				continue
-			}
-			filtered = append(filtered, p)
-		}
-		if len(detachNotes) > 0 {
-			attached := false
-			for j := range filtered {
-				if filtered[j].Type == "tool" && filtered[j].Tool != nil {
-					for _, note := range detachNotes {
-						filtered[j].Tool.Output += "\n" + note
-					}
-					attached = true
-					break
-				}
-			}
-			if !attached {
-				for _, note := range detachNotes {
-					filtered = append(filtered, session.Part{Type: "text", Text: note})
-				}
-			}
-		}
-		history[i].Parts = filtered
+		history[i] = stripFilesFromMessage(history[i], prunedMsg)
 	}
 	return history
+}
+
+func stripFilesFromMessage(msg session.Message, note func(session.PrunedInfo) string) session.Message {
+	parts := make([]session.Part, 0, len(msg.Parts))
+	for _, p := range msg.Parts {
+		if p.File != nil {
+			p = session.Part{Type: "text", Text: note(session.PrunedInfo{
+				Type: prunedKind(p.File.MimeType), MimeType: p.File.MimeType, Filename: p.File.Filename, Source: p.File.Source,
+			})}
+		} else if p.Tool != nil && p.Tool.OutputType == "content" && !p.Tool.Compacted {
+			var items []message.ToolContentItem
+			if err := json.Unmarshal([]byte(p.Tool.Output), &items); err != nil {
+				panic(err)
+			}
+			for i, item := range items {
+				if strings.HasPrefix(item.Type, "image-") || strings.HasPrefix(item.Type, "file-") {
+					kind := "file"
+					if strings.HasPrefix(item.Type, "image-") {
+						kind = "image"
+					}
+					var source string
+					if key, ok := strings.CutPrefix(item.Data, "s3ref:"); ok {
+						source = key
+					} else if key, ok := strings.CutPrefix(item.URL, "s3ref:"); ok {
+						source = key
+					}
+					items[i] = message.ToolContentItem{Type: "text", Text: note(session.PrunedInfo{
+						Type: kind, MimeType: item.MediaType, Filename: item.Filename, Source: source,
+					})}
+				}
+			}
+			output, err := json.Marshal(items)
+			if err != nil {
+				panic(err)
+			}
+			tp := *p.Tool
+			tp.Output = string(output)
+			p.Tool = &tp
+		}
+		parts = append(parts, p)
+	}
+	msg.Parts = parts
+	return msg
 }
 
 // filterMessageParts strips message parts based on the history policy.
@@ -1372,7 +1442,7 @@ func filterMessageParts(msg goai.Message, policy agent.HistoryPolicy) goai.Messa
 			if policy.ExcludeReasoning {
 				continue
 			}
-		case goai.ToolCallPart:
+		case goai.ToolCallPart, message.ToolResultPart:
 			if policy.ExcludeToolCalls {
 				continue
 			}
@@ -1385,17 +1455,25 @@ func filterMessageParts(msg goai.Message, policy agent.HistoryPolicy) goai.Messa
 	}
 
 	if len(filtered) == 0 {
-		return goai.Message{Role: msg.Role}
+		msg.Content = message.Content{}
+		return msg
+	}
+	if policy.ExcludeFiles {
+		msg.Content = message.Content{Parts: filtered}
+		msg = session.MessageToGoAI(stripFilesFromMessage(session.FromGoAIMessage(msg), session.DefaultPrunedMessage))[0]
+		filtered = msg.Content.Parts
 	}
 
 	// Simplify to text-only if only one TextPart remains.
 	if len(filtered) == 1 {
-		if tp, ok := filtered[0].(goai.TextPart); ok {
-			return goai.Message{Role: msg.Role, Content: message.Content{Text: tp.Text}}
+		if tp, ok := filtered[0].(goai.TextPart); ok && len(tp.ProviderOptions) == 0 {
+			msg.Content = message.Content{Text: tp.Text}
+			return msg
 		}
 	}
 
-	return goai.Message{Role: msg.Role, Content: message.Content{Parts: filtered}}
+	msg.Content = message.Content{Parts: filtered}
+	return msg
 }
 
 // handleSuspension checks if the error is a permission/question suspension
@@ -1425,6 +1503,7 @@ func (r *Runner) handleSuspension(err error, stepResult *StepResult, result *Run
 		r.session.UpdateTokens(stepResult.Usage)
 	}
 	result.Status = RunSuspended
+	r.canContinue = false
 	result.Messages = r.copyMessages()
 	result.NewMessages = r.copyNewMessages()
 	result.CompactionState = r.compactionState
@@ -1440,7 +1519,7 @@ func pendingToolCalls(allCalls []stream.ToolCall, completed []stream.ToolResultE
 	}
 	var pending []stream.ToolCall
 	for _, tc := range allCalls {
-		if !done[tc.ID] {
+		if !done[tc.ID] && !tc.ProviderExecuted {
 			pending = append(pending, tc)
 		}
 	}
@@ -1504,6 +1583,7 @@ func (r *Runner) SpawnSubagent(ctx context.Context, agentName string, prompt str
 
 	subagent := factory(r.modelID)
 	subagent.Model = r.agent.Model // inherit parent's model
+	subagent.Redactor = r.agent.Redactor
 
 	subRunner := NewRunner(RunnerOptions{
 		Agent:                       subagent,
@@ -1516,6 +1596,8 @@ func (r *Runner) SpawnSubagent(ctx context.Context, agentName string, prompt str
 		Bus:                         r.bus,
 		Quiet:                       true,
 		Model:                       r.model,
+		ModelLimits:                 r.modelLimits,
+		CompactionConfig:            r.compactionConfig,
 		Executor:                    r.executor,
 		ToolCallExecutionMode:       r.toolCallExecutionMode,
 		MaxStreamErrorContinuations: r.maxStreamErrorContinuations,
@@ -1540,6 +1622,9 @@ func (r *Runner) SpawnSubagent(ctx context.Context, agentName string, prompt str
 				CompactionState:   res.CompactionState,
 			},
 		}
+	}
+	if res != nil && res.Status == RunStepLimitReached {
+		return res, fmt.Errorf("subagent %q: step limit reached before completion", agentName)
 	}
 	return res, nil
 }
@@ -1617,6 +1702,9 @@ func (r *ExitedRunResult) ExitCode() int {
 		}
 		return 1
 	}
+	if r.RunResult == nil {
+		return 3
+	}
 	switch r.Status {
 	case RunCancelled:
 		return 4
@@ -1660,6 +1748,8 @@ func (r *Runner) RunUntilExit(ctx context.Context, prompt string, opts RunUntilE
 	// to the LLM-usage ledger), undercounting badly.
 	steps := append([]*StepResult(nil), result.Steps...)
 	totalText := result.TotalText
+	newMessages := append([]goai.Message(nil), result.NewMessages...)
+	compactionState := result.CompactionState
 	aggregate := func() {
 		if out.RunResult == nil {
 			return
@@ -1667,6 +1757,8 @@ func (r *Runner) RunUntilExit(ctx context.Context, prompt string, opts RunUntilE
 		out.RunResult.Steps = steps
 		out.RunResult.TotalText = totalText
 		out.RunResult.Usage = sumStepsUsage(steps)
+		out.RunResult.NewMessages = newMessages
+		out.RunResult.CompactionState = compactionState
 	}
 
 	// Re-drive only when the underlying run terminated normally without
@@ -1679,6 +1771,10 @@ func (r *Runner) RunUntilExit(ctx context.Context, prompt string, opts RunUntilE
 		if result != nil {
 			steps = append(steps, result.Steps...)
 			totalText += result.TotalText
+			newMessages = append(newMessages, result.NewMessages...)
+			if result.CompactionState != nil {
+				compactionState = result.CompactionState
+			}
 		}
 		if err != nil {
 			aggregate()
@@ -1698,6 +1794,9 @@ const (
 	RunSuspended RunStatus = "suspended"
 	RunFailed    RunStatus = "failed"
 	RunCancelled RunStatus = "cancelled"
+	// RunStepLimitReached means the step budget ended while work remained.
+	// It is not completion and does not trigger RunUntilExit nudges.
+	RunStepLimitReached RunStatus = "step_limit_reached"
 	// RunExited is set when the agent invoked the exit tool. The caller
 	// reads RunnerOptions.ExitState to learn the agent-reported status
 	// (success/error) and the accompanying message. Only emitted when the

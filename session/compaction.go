@@ -2,10 +2,12 @@ package session
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/airlockrun/goai"
+	"github.com/airlockrun/goai/message"
 	"github.com/airlockrun/goai/stream"
 	"github.com/airlockrun/sol/bus"
 )
@@ -118,14 +120,45 @@ func EstimateMessagesTokens(msgs []Message) int {
 	for _, m := range msgs {
 		total += EstimateTokens(m.Content)
 		for _, p := range m.Parts {
+			if p.Compacted {
+				continue
+			}
 			total += EstimateTokens(p.Text)
 			if p.Tool != nil {
 				total += EstimateTokens(p.Tool.Input)
-				total += EstimateTokens(p.Tool.Output)
+				total += estimateToolOutputTokens(p.Tool)
+			}
+			if p.File != nil {
+				total += estimateFileTokens(p.File.MimeType)
 			}
 		}
 	}
 	return total
+}
+
+func estimateFileTokens(mimeType string) int {
+	if strings.HasPrefix(mimeType, "image/") {
+		return ImageTokenEstimate
+	}
+	return FileTokenEstimate
+}
+
+func estimateToolOutputTokens(p *ToolPart) int {
+	output := toolOutputFromSession(p)
+	if content, ok := output.(message.ContentOutput); ok {
+		total := 0
+		for _, item := range content.Value {
+			if item.Type == "text" {
+				total += EstimateTokens(item.Text)
+			} else if strings.HasPrefix(item.Type, "image-") {
+				total += ImageTokenEstimate
+			} else {
+				total += FileTokenEstimate
+			}
+		}
+		return total
+	}
+	return EstimateTokens(message.ToolOutputWire(output))
 }
 
 // SimpleCompactionAgent is a simple implementation of CompactionAgent.
@@ -162,25 +195,19 @@ func (s *Session) IsOverflow() bool {
 		return false
 	}
 
-	if s.ModelLimits.Context == 0 {
-		return false // No limit set
+	// An unknown budget cannot trigger automatic compaction. Callers requiring
+	// a known budget can enforce it with ModelLimits.Validate before running.
+	if s.ModelLimits.Context == 0 && s.ModelLimits.Input == 0 {
+		return false
+	}
+	if err := s.ModelLimits.Validate(true); err != nil {
+		panic(err)
 	}
 
 	// Calculate total tokens used
 	totalUsed := s.Tokens.Input + s.Tokens.Cache.Read + s.Tokens.Output
 
-	// Calculate usable context (total - reserved output)
-	outputReserve := s.ModelLimits.Output
-	if outputReserve == 0 || outputReserve > OutputTokenMax {
-		outputReserve = OutputTokenMax
-	}
-
-	usable := s.ModelLimits.Input
-	if usable == 0 {
-		usable = s.ModelLimits.Context - outputReserve
-	}
-
-	return totalUsed > usable
+	return totalUsed > s.ModelLimits.inputBudget()
 }
 
 // Prune removes old tool outputs to reduce context size.
@@ -216,7 +243,7 @@ loop:
 		}
 
 		// Skip first 2 turns (keep recent context)
-		if turns < 2 {
+		if turns < 2 || (msg.Role == "user" && turns == 2) {
 			continue
 		}
 
@@ -241,7 +268,7 @@ loop:
 				if part.Tool.Compacted {
 					break loop
 				}
-				estimate := EstimateTokens(part.Tool.Output)
+				estimate := estimateToolOutputTokens(part.Tool)
 				total += estimate
 				if total > PruneProtect {
 					pruned += estimate
@@ -252,10 +279,7 @@ loop:
 				if part.Compacted || part.File == nil {
 					continue
 				}
-				estimate := FileTokenEstimate
-				if strings.HasPrefix(part.File.MimeType, "image/") {
-					estimate = ImageTokenEstimate
-				}
+				estimate := estimateFileTokens(part.File.MimeType)
 				total += estimate
 				if total > PruneProtect {
 					pruned += estimate
@@ -267,6 +291,7 @@ loop:
 
 	// Only prune if we have enough to make a difference
 	if pruned > PruneMinimum {
+		before := EstimateMessagesTokens(s.Messages)
 		prunedMsg := s.CompactionConfig.PrunedMessage
 		if prunedMsg == nil {
 			prunedMsg = DefaultPrunedMessage
@@ -275,6 +300,14 @@ loop:
 		for _, t := range toPrune {
 			if t.tool != nil {
 				t.tool.Compacted = true
+				t.tool.Output = prunedMsg(PrunedInfo{Type: "tool_output"})
+				t.tool.OutputType = "text"
+				if t.tool.Outcome == "error" {
+					t.tool.OutputType = "error-text"
+				}
+				if t.tool.Outcome == "denied" {
+					t.tool.OutputType = "execution-denied"
+				}
 			}
 			if t.part != nil {
 				// Replace image/file with text placeholder.
@@ -283,6 +316,9 @@ loop:
 					info.MimeType = t.part.File.MimeType
 					info.Filename = t.part.File.Filename
 					info.Source = t.part.File.Source
+					if strings.HasPrefix(info.MimeType, "image/") {
+						info.Type = "image"
+					}
 				}
 				*t.part = Part{
 					Type: "text",
@@ -290,6 +326,8 @@ loop:
 				}
 			}
 		}
+		freed := before - EstimateMessagesTokens(s.Messages)
+		s.Tokens = Tokens{Input: max(0, s.Tokens.Input+s.Tokens.Cache.Read+s.Tokens.Output-freed)}
 		return len(toPrune)
 	}
 
@@ -319,6 +357,10 @@ type CompactOptions struct {
 
 	// MaxOutputTokens limits the compaction response length.
 	MaxOutputTokens int
+
+	// TransformMessages runs on the complete request, including the compaction
+	// system prompt. Callers use it to enforce outbound redaction.
+	TransformMessages func([]goai.Message) []goai.Message
 }
 
 // Compact performs context compaction by asking the model to summarize.
@@ -362,6 +404,9 @@ func (s *Session) Compact(ctx context.Context, model stream.Model, conversationM
 
 	// Apply provider options if provided (matching opencode's LLM.stream behavior)
 	if opts != nil {
+		if opts.TransformMessages != nil {
+			input.Messages = opts.TransformMessages(input.Messages)
+		}
 		if opts.ProviderOptions != nil {
 			input.ProviderOptions = opts.ProviderOptions
 		}
@@ -380,6 +425,16 @@ func (s *Session) Compact(ctx context.Context, model stream.Model, conversationM
 	summary, err := result.Text()
 	if err != nil {
 		return "", fmt.Errorf("compaction stream error: %w", err)
+	}
+	finish, err := result.FinishReason()
+	if err != nil {
+		return "", fmt.Errorf("compaction finish: %w", err)
+	}
+	if finish != stream.FinishReasonStop {
+		return "", fmt.Errorf("compaction summary incomplete: finish reason %q", finish)
+	}
+	if strings.TrimSpace(summary) == "" {
+		return "", errors.New("compaction summary is empty")
 	}
 
 	// Mark this as a compaction summary
@@ -426,20 +481,7 @@ func (s *Session) CompactAndContinue(ctx context.Context, model stream.Model, co
 
 	// Add the original user message that triggered compaction
 	if lastUserMsg != nil {
-		content := lastUserMsg.Content.Text
-		if content == "" && len(lastUserMsg.Content.Parts) > 0 {
-			// Try to extract text from parts
-			for _, part := range lastUserMsg.Content.Parts {
-				if tp, ok := part.(goai.TextPart); ok {
-					content = tp.Text
-					break
-				}
-			}
-		}
-		s.Messages = append(s.Messages, Message{
-			Role:    "user",
-			Content: content,
-		})
+		s.Messages = append(s.Messages, FromGoAIMessage(*lastUserMsg))
 	}
 
 	// Add the compaction summary
@@ -454,6 +496,7 @@ func (s *Session) CompactAndContinue(ctx context.Context, model stream.Model, co
 		Role:    "user",
 		Content: CompactionContinuationPrompt,
 	})
+	s.Tokens = Tokens{Input: EstimateMessagesTokens(s.Messages)}
 	s.mu.Unlock()
 
 	return nil
