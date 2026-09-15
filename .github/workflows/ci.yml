@@ -1,0 +1,19 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  vulnerabilities:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Go vulnerabilities
+        env:
+          GOWORK: off
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 -format=text -scan=symbol -test ./...
