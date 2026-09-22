@@ -30,6 +30,10 @@ type Agent struct {
 	// MaxSteps limits how many steps this agent can take (0 = default 50).
 	MaxSteps int
 
+	// MaxInputTokens limits cumulative provider-reported input tokens across
+	// model steps. Zero disables the token limit.
+	MaxInputTokens int
+
 	// Temperature sets the model temperature for this agent (nil = provider default).
 	Temperature *float64
 

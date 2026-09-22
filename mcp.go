@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 
 	"github.com/airlockrun/goai/mcp"
 	"github.com/airlockrun/goai/tool"
@@ -29,10 +30,11 @@ func ConnectMCPServers(ctx context.Context, servers []MCPServer) (*mcp.Client, t
 	client := mcp.NewClient()
 	for _, s := range servers {
 		err := client.Connect(ctx, mcp.ServerConfig{
-			Name:      s.Name,
-			Transport: "http",
-			URL:       s.URL,
-			Headers:   s.Headers,
+			Name:       s.Name,
+			Transport:  "http",
+			URL:        s.URL,
+			Headers:    s.Headers,
+			HTTPClient: &http.Client{},
 		})
 		if err != nil {
 			client.DisconnectAll()
@@ -42,7 +44,11 @@ func ConnectMCPServers(ctx context.Context, servers []MCPServer) (*mcp.Client, t
 
 	// Normalize MCP tool schemas to match opencode.
 	// See opencode: packages/opencode/src/mcp/index.ts lines 125-129.
-	tools := client.GetTools()
+	tools, err := client.GetTools(ctx)
+	if err != nil {
+		client.DisconnectAll()
+		return nil, nil, err
+	}
 	for name, t := range tools {
 		t.InputSchema = normalizeMCPToolSchema(t.InputSchema)
 		tools[name] = t

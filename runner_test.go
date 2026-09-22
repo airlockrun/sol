@@ -271,6 +271,28 @@ func TestRunner_StepLimit(t *testing.T) {
 	}
 }
 
+func TestRunner_InputTokenLimit(t *testing.T) {
+	a := testAgent(tool.Set{"noop": tool.New("noop").Build()})
+	a.MaxSteps = 10
+	a.MaxInputTokens = 15
+	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponse: testutil.MockToolCallResponse("c", "noop", map[string]any{}, testutil.MockUsage(10, 2))})
+	r := NewRunner(RunnerOptions{Agent: a, Model: model, Quiet: true})
+
+	result, err := r.Run(context.Background(), "go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != RunInputTokenLimitReached || len(result.Steps) != 2 || result.Usage.InputTotal() != 20 {
+		t.Fatalf("result = %+v", result)
+	}
+	if result.Error == nil || result.Error.Error() != "input token limit reached: 20 of 15" {
+		t.Fatalf("error = %v", result.Error)
+	}
+	if len(model.DoStreamCalls) != 2 {
+		t.Fatalf("model calls = %d, want 2", len(model.DoStreamCalls))
+	}
+}
+
 func TestRunner_PrunesLiveTranscript(t *testing.T) {
 	for _, persisted := range []bool{false, true} {
 		t.Run(map[bool]string{false: "initial", true: "store"}[persisted], func(t *testing.T) {
