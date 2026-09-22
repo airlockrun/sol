@@ -73,6 +73,7 @@ type Runner struct {
 	newMessages      []goai.Message   // append-only: messages generated during this run
 	compactionState  *CompactionState // set if compaction happened
 	doomDetector     *session.DoomLoopDetector
+	inputTokensUsed  int
 
 	// exitState is the optional "must call exit" hook. When non-nil the
 	// step loops break with RunExited as soon as ExitState.Called() turns
@@ -384,6 +385,9 @@ func (r *Runner) Run(ctx context.Context, prompt string) (*RunResult, error) {
 
 	// Run the thinking loop
 	for step := range maxSteps {
+		if r.stopForInputTokenLimit(result) {
+			return result, nil
+		}
 		r.log("[%s] Step %d...\n", r.agent.Name, step+1)
 
 		stepResult, err := r.runStep(ctx)
@@ -394,6 +398,9 @@ func (r *Runner) Run(ctx context.Context, prompt string) (*RunResult, error) {
 			}
 			if r.canContinueStreamError(ctx, err) {
 				r.recordStep(result, stepResult)
+				if r.stopForInputTokenLimit(result) {
+					return result, nil
+				}
 				if waitErr := r.continueStreamError(ctx, err); waitErr != nil {
 					result.Status = RunCancelled
 					result.Messages = r.copyMessages()
@@ -441,6 +448,9 @@ func (r *Runner) Run(ctx context.Context, prompt string) (*RunResult, error) {
 			result.Messages = r.copyMessages()
 			result.NewMessages = r.copyNewMessages()
 			result.CompactionState = r.compactionState
+			return result, nil
+		}
+		if stepResult.FinishReason == stream.FinishReasonToolCalls && r.stopForInputTokenLimit(result) {
 			return result, nil
 		}
 
@@ -504,6 +514,7 @@ func (r *Runner) initSession() error {
 	r.newMessages = nil
 	r.compactionState = nil
 	r.streamErrorContinuations = 0
+	r.inputTokensUsed = 0
 	return nil
 }
 
@@ -668,7 +679,21 @@ func (r *Runner) recordStep(result *RunResult, step *StepResult) {
 	}
 	result.Steps = append(result.Steps, step)
 	result.TotalText += step.Text
+	r.inputTokensUsed += step.Usage.InputTotal()
 	r.session.UpdateTokens(step.Usage)
+}
+
+func (r *Runner) stopForInputTokenLimit(result *RunResult) bool {
+	limit := r.agent.MaxInputTokens
+	if limit <= 0 || r.inputTokensUsed < limit {
+		return false
+	}
+	result.Status = RunInputTokenLimitReached
+	result.Messages = r.copyMessages()
+	result.NewMessages = r.copyNewMessages()
+	result.CompactionState = r.compactionState
+	result.Error = fmt.Errorf("input token limit reached: %d of %d", r.inputTokensUsed, limit)
+	return true
 }
 
 func (r *Runner) canContinueStreamError(ctx context.Context, err error) bool {
@@ -747,6 +772,9 @@ func (r *Runner) Continue(ctx context.Context, prompt string) (*RunResult, error
 	systemPrompt := r.buildSystemPrompt()
 
 	for step := range maxSteps {
+		if r.stopForInputTokenLimit(result) {
+			return result, nil
+		}
 		r.log("[%s] Step %d...\n", r.agent.Name, step+1)
 
 		stepResult, err := r.runStep(ctx)
@@ -756,6 +784,9 @@ func (r *Runner) Continue(ctx context.Context, prompt string) (*RunResult, error
 			}
 			if r.canContinueStreamError(ctx, err) {
 				r.recordStep(result, stepResult)
+				if r.stopForInputTokenLimit(result) {
+					return result, nil
+				}
 				if waitErr := r.continueStreamError(ctx, err); waitErr != nil {
 					result.Status = RunCancelled
 					result.Messages = r.copyMessages()
@@ -800,6 +831,9 @@ func (r *Runner) Continue(ctx context.Context, prompt string) (*RunResult, error
 			result.Messages = r.copyMessages()
 			result.NewMessages = r.copyNewMessages()
 			result.CompactionState = r.compactionState
+			return result, nil
+		}
+		if stepResult.FinishReason == stream.FinishReasonToolCalls && r.stopForInputTokenLimit(result) {
 			return result, nil
 		}
 
@@ -1797,6 +1831,8 @@ const (
 	// RunStepLimitReached means the step budget ended while work remained.
 	// It is not completion and does not trigger RunUntilExit nudges.
 	RunStepLimitReached RunStatus = "step_limit_reached"
+	// RunInputTokenLimitReached means cumulative model input reached its budget.
+	RunInputTokenLimitReached RunStatus = "input_token_limit_reached"
 	// RunExited is set when the agent invoked the exit tool. The caller
 	// reads RunnerOptions.ExitState to learn the agent-reported status
 	// (success/error) and the accompanying message. Only emitted when the
