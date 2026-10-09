@@ -207,9 +207,17 @@ func (m *codexModel) Stream(ctx context.Context, opts *stream.CallOptions) (<-ch
 			}
 		}
 		if combined.Err() != nil {
+			terminal := stream.Event{Type: stream.EventError, Data: stream.ErrorEvent{Error: context.Cause(combined)}}
 			select {
-			case output <- stream.Event{Type: stream.EventError, Data: stream.ErrorEvent{Error: context.Cause(combined)}}:
+			case output <- terminal:
 			default:
+				// Preserve the terminal error by freeing one buffered event. The
+				// consumer may already have drained it; this is the only sender.
+				select {
+				case <-output:
+				default:
+				}
+				output <- terminal
 			}
 		}
 	}()
