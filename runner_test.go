@@ -75,6 +75,275 @@ func testAgent(ts tool.Set) *agent.Agent {
 	}
 }
 
+func TestRunnerSafeBoundaryAdmitsPersistedInputBeforeCompletion(t *testing.T) {
+	for _, entry := range []string{"Run", "Continue"} {
+		t.Run(entry, func(t *testing.T) {
+			runner, model, store := safeBoundaryTestRunner(t, entry, []testutil.MockResponse{
+				{Text: "first", Usage: testutil.MockUsage(1, 1)},
+				{Text: "second", Usage: testutil.MockUsage(1, 1)},
+			})
+			var boundaries []SafeBoundary
+			admitted := false
+			runner.boundaryHook = func(ctx context.Context, boundary SafeBoundary) ([]session.Message, error) {
+				boundaries = append(boundaries, boundary)
+				if boundary != BoundaryAfterStep || admitted {
+					return nil, nil
+				}
+				// The host commits input before returning it to the runner.
+				msgs := []session.Message{{Role: "user", Content: "queued"}}
+				if err := store.Append(ctx, msgs); err != nil {
+					return nil, err
+				}
+				admitted = true
+				return msgs, nil
+			}
+			invoke := runner.Run
+			if entry == "Continue" {
+				invoke = runner.Continue
+			}
+			result, err := invoke(t.Context(), "start")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Status != RunCompleted || len(model.Requests()) != 2 {
+				t.Fatalf("status = %s, model calls = %d", result.Status, len(model.Requests()))
+			}
+			if store.appendCalls != 4 {
+				t.Fatalf("store append calls = %d, want user, two assistant steps and one host input", store.appendCalls)
+			}
+			queued := 0
+			for _, msg := range store.messages {
+				if msg.Content == "queued" {
+					queued++
+				}
+			}
+			if queued != 1 {
+				t.Fatalf("persisted queued messages = %d, want 1", queued)
+			}
+			request := model.Requests()[1]
+			if got := request.Messages[len(request.Messages)-1].Content.Text; got != "queued" {
+				t.Fatalf("second model call last message = %q", got)
+			}
+			want := []SafeBoundary{BoundaryBeforeModel, BoundaryAfterStep, BoundaryBeforeModel, BoundaryAfterStep}
+			if fmt.Sprint(boundaries) != fmt.Sprint(want) {
+				t.Fatalf("boundaries = %v, want %v", boundaries, want)
+			}
+		})
+	}
+}
+
+func safeBoundaryTestRunner(t *testing.T, entry string, responses []testutil.MockResponse) (*Runner, *testutil.MockModel, *testStore) {
+	t.Helper()
+	if entry == "Continue" {
+		responses = append([]testutil.MockResponse{{Text: "warm", Usage: testutil.MockUsage(1, 1)}}, responses...)
+	}
+	model := newMockModel(t, testutil.MockConfig{ID: "boundary", Responses: responses})
+	store := &testStore{}
+	gate := tool.New("gate").Description("Requires permission").
+		Execute(func(ctx context.Context, _ json.RawMessage, call tool.CallOptions) (tool.Result, error) {
+			return tool.Result{}, bus.PermissionManagerFromContext(ctx).Ask(ctx, bus.PermissionRequest{
+				SessionID: "boundary", Permission: "gate", Patterns: []string{"*"}, ToolCallID: call.ToolCallID,
+			})
+		}).Build()
+	runner := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{"gate": gate}), Model: model, SessionStore: store, Quiet: true, ExitState: &tools.ExitState{}})
+	if entry == "Continue" {
+		if _, err := runner.Run(t.Context(), "warm"); err != nil {
+			t.Fatal(err)
+		}
+		model.ResetRequests()
+		store.appendCalls = 0
+	}
+	return runner, model, store
+}
+
+func TestRunnerSafeBoundaryBeforeModelAdmission(t *testing.T) {
+	for _, entry := range []string{"Run", "Continue"} {
+		t.Run(entry, func(t *testing.T) {
+			runner, model, store := safeBoundaryTestRunner(t, entry, []testutil.MockResponse{{Text: "done"}})
+			runner.boundaryHook = func(ctx context.Context, boundary SafeBoundary) ([]session.Message, error) {
+				if boundary != BoundaryBeforeModel {
+					return nil, nil
+				}
+				msgs := []session.Message{{Role: "user", Content: "before model"}}
+				return msgs, store.Append(ctx, msgs)
+			}
+			invoke := runner.Run
+			if entry == "Continue" {
+				invoke = runner.Continue
+			}
+			result, err := invoke(t.Context(), "start")
+			if err != nil || result.Status != RunCompleted || len(model.Requests()) != 1 {
+				t.Fatalf("result = %+v, error = %v, calls = %d", result, err, len(model.Requests()))
+			}
+			request := model.Requests()[0]
+			if !strings.HasSuffix(request.Messages[len(request.Messages)-1].Content.Text, "before model") || store.appendCalls != 3 {
+				t.Fatalf("last request message = %+v, store append calls = %d", request.Messages[len(request.Messages)-1], store.appendCalls)
+			}
+		})
+	}
+}
+
+func TestRunnerSafeBoundaryFailureAndCancellation(t *testing.T) {
+	for _, entry := range []string{"Run", "Continue"} {
+		for _, boundary := range []SafeBoundary{BoundaryBeforeModel, BoundaryAfterStep, BoundarySuspended} {
+			for _, mode := range []string{"failure", "cancel", "committed input then cancel"} {
+				t.Run(entry+"/"+string(boundary)+"/"+mode, func(t *testing.T) {
+					response := testutil.MockResponse{Text: "first", Usage: testutil.MockUsage(1, 1)}
+					if boundary == BoundarySuspended {
+						response = testutil.MockResponse{Events: testutil.MockToolCallResponse("gate-call", "gate", map[string]any{}, testutil.MockUsage(1, 1))}
+					}
+					runner, model, store := safeBoundaryTestRunner(t, entry, []testutil.MockResponse{response})
+					ctx, cancel := context.WithCancel(t.Context())
+					defer cancel()
+					sentinel := errors.New("host checkpoint failed")
+					runner.boundaryHook = func(ctx context.Context, got SafeBoundary) ([]session.Message, error) {
+						if got != boundary {
+							return nil, nil
+						}
+						if mode == "failure" {
+							return []session.Message{{Role: "user", Content: "uncommitted"}}, sentinel
+						}
+						if mode == "committed input then cancel" {
+							msgs := []session.Message{{Role: "user", Content: "committed"}}
+							if err := store.Append(ctx, msgs); err != nil {
+								return nil, err
+							}
+							cancel()
+							return msgs, nil
+						}
+						cancel()
+						return nil, ctx.Err()
+					}
+					invoke := runner.Run
+					if entry == "Continue" {
+						invoke = runner.Continue
+					}
+					result, err := invoke(ctx, "start")
+					wantStatus, wantErr := RunFailed, sentinel
+					if mode != "failure" {
+						wantStatus, wantErr = RunCancelled, context.Canceled
+					}
+					if !errors.Is(err, wantErr) || !errors.Is(result.Error, wantErr) || result.Status != wantStatus {
+						t.Fatalf("result = %+v, error = %v", result, err)
+					}
+					wantCalls := 1
+					if boundary == BoundaryBeforeModel {
+						wantCalls = 0
+					}
+					if len(model.Requests()) != wantCalls || len(result.Steps) != wantCalls {
+						t.Fatalf("calls = %d, steps = %d, want %d", len(model.Requests()), len(result.Steps), wantCalls)
+					}
+					encoded, _ := json.Marshal(result.Messages)
+					if !strings.Contains(string(encoded), "start") || strings.Contains(string(encoded), "uncommitted") {
+						t.Fatalf("invalid failure transcript: %s", encoded)
+					}
+					if boundary == BoundaryAfterStep && (result.TotalText != "first" || len(result.NewMessages) == 0) {
+						t.Fatal("hook failure lost the completed step")
+					}
+					if mode == "committed input then cancel" && result.Messages[len(result.Messages)-1].Content.Text != "committed" {
+						t.Fatal("cancellation lost host-persisted input")
+					}
+					if boundary == BoundarySuspended && result.SuspensionContext == nil {
+						t.Fatal("hook failure lost the pending permission checkpoint")
+					}
+					if _, err := runner.Continue(t.Context(), "retry"); err == nil {
+						t.Fatal("failed hook allowed continuation without reloading durable history")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestRunnerSafeBoundaryAdmissionHonorsTerminalLimits(t *testing.T) {
+	for _, entry := range []string{"Run", "Continue"} {
+		for _, exit := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/exit=%t", entry, exit), func(t *testing.T) {
+				response := testutil.MockResponse{Text: "first"}
+				wantStatus := RunStepLimitReached
+				if exit {
+					response = testutil.MockResponse{Events: testutil.MockToolCallResponse("exit-call", "exit", map[string]string{"status": "success", "message": "done"}, testutil.MockUsage(1, 1))}
+					wantStatus = RunExited
+				}
+				runner, model, store := safeBoundaryTestRunner(t, entry, []testutil.MockResponse{response})
+				runner.agent.MaxSteps = 1
+				runner.boundaryHook = func(ctx context.Context, boundary SafeBoundary) ([]session.Message, error) {
+					if boundary != BoundaryAfterStep {
+						return nil, nil
+					}
+					msgs := []session.Message{{Role: "user", Content: "queued"}}
+					return msgs, store.Append(ctx, msgs)
+				}
+				invoke := runner.Run
+				if entry == "Continue" {
+					invoke = runner.Continue
+				}
+				result, err := invoke(t.Context(), "start")
+				if err != nil || result.Status != wantStatus || len(model.Requests()) != 1 {
+					t.Fatalf("result = %+v, error = %v, calls = %d", result, err, len(model.Requests()))
+				}
+				if result.Messages[len(result.Messages)-1].Content.Text != "queued" {
+					t.Fatal("terminal limit lost admitted input")
+				}
+			})
+		}
+	}
+}
+
+func TestRunnerSafeBoundarySuspensionSnapshot(t *testing.T) {
+	for _, entry := range []string{"Run", "Continue"} {
+		t.Run(entry, func(t *testing.T) {
+			response := testutil.MockResponse{Events: testutil.MockToolCallResponse("gate-call", "gate", map[string]any{}, testutil.MockUsage(1, 1))}
+			runner, model, store := safeBoundaryTestRunner(t, entry, []testutil.MockResponse{response})
+			var boundaries []SafeBoundary
+			runner.boundaryHook = func(ctx context.Context, boundary SafeBoundary) ([]session.Message, error) {
+				boundaries = append(boundaries, boundary)
+				if boundary != BoundarySuspended {
+					return nil, nil
+				}
+				msgs := []session.Message{{Role: "user", Content: "host checkpoint notice"}}
+				return msgs, store.Append(ctx, msgs)
+			}
+			invoke := runner.Run
+			if entry == "Continue" {
+				invoke = runner.Continue
+			}
+			result, err := invoke(t.Context(), "start")
+			if err != nil || result.Status != RunSuspended || result.SuspensionContext == nil || len(model.Requests()) != 1 {
+				t.Fatalf("result = %+v, error = %v", result, err)
+			}
+			if result.Messages[len(result.Messages)-1].Content.Text != "host checkpoint notice" || result.NewMessages[len(result.NewMessages)-1].Content.Text != "host checkpoint notice" {
+				t.Fatal("suspension snapshot lost host-persisted input")
+			}
+			if fmt.Sprint(boundaries) != fmt.Sprint([]SafeBoundary{BoundaryBeforeModel, BoundarySuspended}) {
+				t.Fatalf("suspension boundaries = %v", boundaries)
+			}
+		})
+	}
+}
+
+func TestRunnerSafeBoundaryAlreadyCancelled(t *testing.T) {
+	for _, entry := range []string{"Run", "Continue"} {
+		t.Run(entry, func(t *testing.T) {
+			runner, model, _ := safeBoundaryTestRunner(t, entry, []testutil.MockResponse{{Text: "unexpected"}})
+			runner.boundaryHook = func(context.Context, SafeBoundary) ([]session.Message, error) {
+				t.Error("cancelled run invoked host hook")
+				return nil, nil
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			invoke := runner.Run
+			if entry == "Continue" {
+				invoke = runner.Continue
+			}
+			result, err := invoke(ctx, "start")
+			if !errors.Is(err, context.Canceled) || result.Status != RunCancelled || len(model.Requests()) != 0 {
+				t.Fatalf("result = %+v, error = %v, model calls = %d", result, err, len(model.Requests()))
+			}
+		})
+	}
+}
+
 func TestRunner_ModelLimits(t *testing.T) {
 	for _, tt := range []struct {
 		name    string
