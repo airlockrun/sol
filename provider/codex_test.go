@@ -416,6 +416,17 @@ func TestCodexAbortDuringStreamingAndBackpressure(t *testing.T) {
 				t.Fatal(err)
 			}
 			<-started
+			deadline := time.NewTimer(time.Second)
+			defer deadline.Stop()
+			tick := time.NewTicker(time.Millisecond)
+			defer tick.Stop()
+			for len(events) != cap(events) {
+				select {
+				case <-tick.C:
+				case <-deadline.C:
+					t.Fatal("stream did not fill adapter buffer")
+				}
+			}
 			if consume {
 				for event := range events {
 					if _, ok := event.Data.(stream.TextDeltaEvent); ok {
@@ -433,7 +444,7 @@ func TestCodexAbortDuringStreamingAndBackpressure(t *testing.T) {
 			go func() { done <- drainCodexError(events) }()
 			select {
 			case err := <-done:
-				if consume && !errors.Is(err, context.Canceled) {
+				if !errors.Is(err, context.Canceled) {
 					t.Fatal(err)
 				}
 			case <-time.After(time.Second):
