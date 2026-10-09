@@ -1,28 +1,41 @@
 package tools
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/airlockrun/goai/tool"
 	"github.com/airlockrun/sol/toolutil"
+	_ "golang.org/x/image/webp"
 )
 
 const (
-	defaultReadLimit = 2000
-	maxLineLength    = 2000
-	maxReadBytes     = 50 * 1024 // 50KB
+	defaultReadLimit  = 2000
+	maxLineLength     = 2000
+	maxReadBytes      = 50 * 1024       // 50KB
+	maxReadImageBytes = 5 * 1024 * 1024 // 5 MiB of image file bytes
 )
+
+var errReadNonRegular = errors.New("cannot read non-regular file")
 
 // ReadInput is the input schema for the read tool
 type ReadInput struct {
 	FilePath string `json:"filePath" description:"The path to the file to read"`
-	Offset   int    `json:"offset,omitempty" description:"The line number to start reading from (0-based)"`
-	Limit    int    `json:"limit,omitempty" description:"The number of lines to read (defaults to 2000)"`
+	Offset   int    `json:"offset,omitempty" description:"Text files only: the line number to start reading from (0-based); omit for images"`
+	Limit    int    `json:"limit,omitempty" description:"Text files only: the number of lines to read (defaults to 2000); omit for images"`
 }
 
 // Read creates the read tool
@@ -33,14 +46,20 @@ Assume this tool is able to read all files on the machine. If the User provides 
 
 Usage:
 - The filePath parameter must be an absolute path, not a relative path
+- Only regular files can be read. Symbolic links to regular files are supported; pipes and device files are rejected before reading.
 - By default, it reads up to 2000 lines starting from the beginning of the file
 - You can optionally specify a line offset and limit (especially handy for long files), but it's recommended to read the whole file by not providing these parameters
 - Any lines longer than 2000 characters will be truncated
 - Results are returned using cat -n format, with line numbers starting at 1
+- PNG, JPEG, GIF, and WebP image files are returned as native image attachments for visual inspection, not OCR text. Formats are identified from file content, not the extension.
+- Images are read whole, with a maximum file size of 5 MiB (5242880 bytes). Omit offset and limit for images; supplying either is an error. Resize an oversized image before reading it.
 - You have the capability to call multiple tools in a single response. It is always better to speculatively read multiple files as a batch that are potentially useful.
 `).
 		SchemaFromStruct(ReadInput{}).
 		Execute(func(ctx context.Context, input json.RawMessage, opts tool.CallOptions) (tool.Result, error) {
+			if err := ctx.Err(); err != nil {
+				return tool.Result{}, err
+			}
 			var args ReadInput
 			if err := json.Unmarshal(input, &args); err != nil {
 				return tool.Result{}, err
@@ -56,7 +75,53 @@ Usage:
 				filePath = filepath.Join(workDir, filePath)
 			}
 
-			// Check for binary file by extension
+			info, err := os.Stat(filePath)
+			if err != nil || info.IsDir() {
+				return tool.Result{Output: fmt.Sprintf("Error: File not found: %s", filePath), Title: filepath.Base(filePath)}, nil
+			}
+			if !info.Mode().IsRegular() {
+				return tool.Result{}, fmt.Errorf("%w: %s", errReadNonRegular, filePath)
+			}
+			file, err := openReadFile(filePath)
+			if err != nil {
+				if errors.Is(err, errReadNonRegular) {
+					return tool.Result{}, err
+				}
+				return tool.Result{Output: fmt.Sprintf("Error: File not found: %s", filePath), Title: filepath.Base(filePath)}, nil
+			}
+			defer file.Close()
+			if err := ctx.Err(); err != nil {
+				return tool.Result{}, err
+			}
+			// A bounded content sniff precedes binary rejection, including when an
+			// image has a misleading extension. Text retains its ordinary limits.
+			header := make([]byte, 512)
+			n, err := io.ReadFull(file, header)
+			if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+				return tool.Result{}, fmt.Errorf("read file header: %w", err)
+			}
+			header = header[:n]
+			contentReader := io.MultiReader(bytes.NewReader(header), file)
+			mimeType := http.DetectContentType(header)
+			switch mimeType {
+			case "image/png", "image/jpeg", "image/gif", "image/webp":
+				var fields map[string]json.RawMessage
+				if err := json.Unmarshal(input, &fields); err != nil {
+					return tool.Result{}, err
+				}
+				_, offsetSet := fields["offset"]
+				_, limitSet := fields["limit"]
+				if offsetSet || limitSet {
+					return tool.Result{}, errors.New("offset and limit apply only to text files; omit both when reading an image")
+				}
+				result, err := readImage(ctx, file, contentReader, filePath, mimeType)
+				if err == nil && sessionID != "" {
+					toolutil.FileTime.Read(sessionID, filePath)
+				}
+				return result, err
+			}
+
+			// Reject other known binary formats without loading the whole file.
 			if isBinaryByExtension(filePath) {
 				return tool.Result{
 					Output: fmt.Sprintf("Cannot read binary file: %s", filePath),
@@ -64,7 +129,7 @@ Usage:
 				}, nil
 			}
 
-			content, err := os.ReadFile(filePath)
+			content, err := io.ReadAll(contentReader)
 			if err != nil {
 				return tool.Result{
 					Output: fmt.Sprintf("Error: File not found: %s", filePath),
@@ -177,6 +242,65 @@ Usage:
 			}, nil
 		}).
 		Build()
+}
+
+// openReadFile verifies the descriptor independently of the path check. Unix
+// opens are nonblocking so a replacement FIFO cannot block before this check.
+func openReadFile(filePath string) (*os.File, error) {
+	file, err := openReadDescriptor(filePath)
+	if err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		file.Close()
+		return nil, fmt.Errorf("%w: %s", errReadNonRegular, filePath)
+	}
+	return file, nil
+}
+
+func readImage(ctx context.Context, file *os.File, reader io.Reader, filePath, mimeType string) (tool.Result, error) {
+	info, err := file.Stat()
+	if err != nil {
+		return tool.Result{}, fmt.Errorf("stat image: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return tool.Result{}, errors.New("image must be a regular file")
+	}
+	if info.Size() > maxReadImageBytes {
+		return tool.Result{}, fmt.Errorf("image exceeds the read limit of 5 MiB (%d bytes); resize it before reading", maxReadImageBytes)
+	}
+	// LimitReader also bounds a file that grows after Stat.
+	content, err := io.ReadAll(io.LimitReader(reader, maxReadImageBytes+1))
+	if err != nil {
+		return tool.Result{}, fmt.Errorf("read image: %w", err)
+	}
+	if len(content) > maxReadImageBytes {
+		return tool.Result{}, fmt.Errorf("image exceeds the read limit of 5 MiB (%d bytes); resize it before reading", maxReadImageBytes)
+	}
+	if err := ctx.Err(); err != nil {
+		return tool.Result{}, err
+	}
+	// DecodeConfig validates the format header and dimensions without allocating
+	// a decompressed pixel buffer. The original encoded bytes reach the model.
+	config, format, err := image.DecodeConfig(bytes.NewReader(content))
+	if err != nil {
+		return tool.Result{}, fmt.Errorf("invalid %s image: %w", mimeType, err)
+	}
+	formats := map[string]string{"png": "image/png", "jpeg": "image/jpeg", "gif": "image/gif", "webp": "image/webp"}
+	if formats[format] != mimeType || config.Width <= 0 || config.Height <= 0 {
+		return tool.Result{}, errors.New("invalid image format or dimensions")
+	}
+	return tool.Result{
+		Output:      fmt.Sprintf("Image attached: %s (%s, %dx%d, %d bytes).", filePath, mimeType, config.Width, config.Height, len(content)),
+		Title:       filepath.Base(filePath),
+		Attachments: []tool.Attachment{{Data: base64.StdEncoding.EncodeToString(content), MimeType: mimeType, Filename: filepath.Base(filePath)}},
+		Metadata:    map[string]any{"bytes": len(content), "mimeType": mimeType, "width": config.Width, "height": config.Height},
+	}, nil
 }
 
 // isBinaryByExtension checks if a file is binary based on its extension.

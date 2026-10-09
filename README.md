@@ -280,6 +280,26 @@ The `sol` package is what airlock embeds for in-process agent execution. Run the
 
 See `cmd/sol/main.go` and `cmd/toolserver/main.go` in this repo for full examples.
 
+### Native image reads
+
+The `read` tool opens PNG, JPEG, GIF, and WebP files as native image attachments.
+It identifies the format from the file bytes and validates the image header and
+dimensions. Each image file is limited to **5 MiB (5,242,880 bytes)** and is read
+whole; omit `offset` and `limit` when reading images. Either pagination parameter,
+including an explicit zero, is rejected for images. Resize larger images first.
+Text files retain their line pagination and 50 KiB output cap.
+Read accepts regular files and symbolic links to regular files. It checks the
+target before opening and the opened descriptor before reading any bytes. Pipes
+and device files are rejected. On Unix, nonblocking opens prevent a replacement
+pipe from hanging descriptor validation.
+
+The tool returns the original encoded image through `tool.Result.Attachments`
+with base64 data and its detected MIME type. A vision-capable model receives the
+image for visual inspection; OCR is not required. Provider/model capabilities
+and the configured transport must support image input. Session persistence keeps
+the structured image result; history retention and compaction can remove old
+images from model context according to the configured policy.
+
 ## Scope
 
 We accept contributions that improve sol's library API, scriptability, structured-output handling, and pipe-friendly UX. We don't accept changes that try to make sol re-converge with opencode's interactive TUI experience — that's not what sol is for. Use opencode if that's what you want. See [CONTRIBUTING.md](CONTRIBUTING.md) for details.

@@ -1,8 +1,16 @@
 package tools
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"image"
+	"image/color"
+	"image/gif"
+	"image/jpeg"
+	"image/png"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -168,6 +176,15 @@ func TestReadTool_FileNotFound(t *testing.T) {
 	}
 }
 
+func TestReadTool_DirectoryKeepsFileError(t *testing.T) {
+	path := t.TempDir()
+	input, _ := json.Marshal(ReadInput{FilePath: path})
+	result, err := Read().Execute(t.Context(), input, tool.CallOptions{})
+	if err != nil || result.Output != "Error: File not found: "+path || len(result.Attachments) != 0 {
+		t.Fatalf("directory result = %+v, error = %v", result, err)
+	}
+}
+
 func TestReadTool_BinaryFileByExtension(t *testing.T) {
 	tmpDir := t.TempDir()
 	binaryPath := filepath.Join(tmpDir, "file.exe")
@@ -309,15 +326,211 @@ func TestReadTool_LongLineTruncationIsValidUTF8(t *testing.T) {
 	}
 }
 
-// TestReadTool_DescriptionMatchesBehavior: the tool returns text only — it does
-// not render images or emit a system-reminder for empty files, so the
-// description must not promise either (regression guard against the inherited
-// Claude Code boilerplate).
 func TestReadTool_DescriptionMatchesBehavior(t *testing.T) {
 	desc := Read().Description
-	for _, banned := range []string{"image files", "system reminder"} {
-		if strings.Contains(desc, banned) {
-			t.Errorf("description claims %q but the tool doesn't implement it", banned)
+	for _, required := range []string{"native image attachments", "PNG, JPEG, GIF, and WebP", "5 MiB", "Omit offset and limit"} {
+		if !strings.Contains(desc, required) {
+			t.Errorf("description omits %q", required)
 		}
+	}
+	if strings.Contains(desc, "system reminder") {
+		t.Error("description promises an unimplemented empty-file reminder")
+	}
+}
+
+func readTestImage(t *testing.T, format string) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, 1, 1))
+	img.Set(0, 0, color.RGBA{R: 255, A: 255})
+	var encoded bytes.Buffer
+	var err error
+	switch format {
+	case "png":
+		err = png.Encode(&encoded, img)
+	case "jpeg":
+		err = jpeg.Encode(&encoded, img, nil)
+	case "gif":
+		err = gif.Encode(&encoded, img, nil)
+	case "webp":
+		data, decodeErr := base64.StdEncoding.DecodeString("UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoBAAEADsD+JaQAA3AAAAAA")
+		if decodeErr != nil {
+			t.Fatal(decodeErr)
+		}
+		if _, _, decodeErr := image.Decode(bytes.NewReader(data)); decodeErr != nil {
+			t.Fatalf("invalid WebP test fixture: %v", decodeErr)
+		}
+		return data
+	default:
+		t.Fatalf("unsupported test image format %q", format)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded.Bytes()
+}
+
+func TestReadTool_NativeImagesThroughExecutor(t *testing.T) {
+	for _, tc := range []struct {
+		name, format, filename, mimeType string
+	}{
+		{"png", "png", "image.png", "image/png"},
+		{"jpeg with misleading extension", "jpeg", "image.png", "image/jpeg"},
+		{"gif", "gif", "image.gif", "image/gif"},
+		{"webp", "webp", "image.webp", "image/webp"},
+		{"extensionless", "png", "image", "image/png"},
+		{"binary extension", "png", "image.bin", "image/png"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data := readTestImage(t, tc.format)
+			root := t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, tc.filename), data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			input, _ := json.Marshal(ReadInput{FilePath: tc.filename})
+			executor := tool.NewLocalExecutor(tool.Set{"read": Read()}, nil)
+			response, err := executor.Execute(t.Context(), tool.Request{ToolCallID: "image-read", ToolName: "read", WorkDir: root, Input: input})
+			if err != nil || response.IsError || len(response.Attachments) != 1 {
+				t.Fatalf("response = %+v, error = %v", response, err)
+			}
+			attachment := response.Attachments[0]
+			decoded, err := base64.StdEncoding.DecodeString(attachment.Data)
+			if err != nil || !bytes.Equal(decoded, data) || attachment.MimeType != tc.mimeType || attachment.Filename != tc.filename {
+				t.Fatal("executor lost original image bytes, MIME type or filename")
+			}
+			if !strings.Contains(response.Output, "Image attached:") || strings.Contains(response.Output, attachment.Data) {
+				t.Fatal("image was flattened into text output")
+			}
+			if response.Metadata["width"] != 1 || response.Metadata["height"] != 1 || response.Metadata["bytes"] != len(data) {
+				t.Fatalf("image metadata = %+v", response.Metadata)
+			}
+		})
+	}
+}
+
+func TestReadTool_ImageRejectsPaginationAndMalformedHeaders(t *testing.T) {
+	for _, tc := range []struct {
+		name, parameters, wantError string
+		data                        []byte
+	}{
+		{"offset", `,"offset":1`, "omit both", readTestImage(t, "png")},
+		{"explicit zero offset", `,"offset":0`, "omit both", readTestImage(t, "png")},
+		{"limit", `,"limit":1`, "omit both", readTestImage(t, "png")},
+		{"explicit zero limit", `,"limit":0`, "omit both", readTestImage(t, "png")},
+		{"explicit null", `,"offset":null`, "omit both", readTestImage(t, "png")},
+		{"negative offset", `,"offset":-1`, "omit both", readTestImage(t, "png")},
+		{"truncated PNG", "", "invalid image/png image", []byte("\x89PNG\r\n\x1a\n")},
+		{"truncated JPEG", "", "invalid image/jpeg image", []byte{0xff, 0xd8, 0xff}},
+		{"truncated GIF", "", "invalid image/gif image", []byte("GIF89a")},
+		{"truncated WebP", "", "invalid image/webp image", []byte("RIFF\x10\x00\x00\x00WEBPVP8 ")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "image.png")
+			if err := os.WriteFile(path, tc.data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			pathJSON, _ := json.Marshal(path)
+			input := json.RawMessage(`{"filePath":` + string(pathJSON) + tc.parameters + `}`)
+			executor := tool.NewLocalExecutor(tool.Set{"read": Read()}, nil)
+			response, err := executor.Execute(t.Context(), tool.Request{ToolName: "read", Input: input})
+			if err != nil || !response.IsError || !strings.Contains(response.Error, tc.wantError) || len(response.Attachments) != 0 {
+				t.Fatalf("response = %+v, error = %v", response, err)
+			}
+		})
+	}
+}
+
+func TestReadTool_ImageSizeLimitDoesNotLimitText(t *testing.T) {
+	for _, oversized := range []bool{false, true} {
+		t.Run(map[bool]string{false: "at limit", true: "above limit"}[oversized], func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "image.png")
+			data := readTestImage(t, "png")
+			if err := os.WriteFile(path, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			size := int64(maxReadImageBytes)
+			if oversized {
+				size++
+			}
+			if err := os.Truncate(path, size); err != nil {
+				t.Fatal(err)
+			}
+			input, _ := json.Marshal(ReadInput{FilePath: path})
+			response, err := tool.NewLocalExecutor(tool.Set{"read": Read()}, nil).Execute(t.Context(), tool.Request{ToolName: "read", Input: input})
+			if err != nil || response.IsError != oversized {
+				t.Fatalf("response error = %q, execute error = %v", response.Error, err)
+			}
+			if oversized {
+				if !strings.Contains(response.Error, "5 MiB (5242880 bytes)") || len(response.Attachments) != 0 {
+					t.Fatal("oversized image did not produce a bounded, clear error")
+				}
+			} else if len(response.Attachments) != 1 || response.Metadata["bytes"] != maxReadImageBytes {
+				t.Fatal("image at the documented limit was rejected")
+			}
+		})
+	}
+	path := filepath.Join(t.TempDir(), "large.png")
+	if err := os.WriteFile(path, []byte(strings.Repeat("x", maxReadImageBytes+1)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got := executeReadTool(t, ReadInput{FilePath: path}); !strings.Contains(got, "00001|") || strings.Contains(got, "image") {
+		t.Fatal("text with an image extension was subjected to the image size limit")
+	}
+}
+
+type readImageZeroReader struct{}
+
+func (readImageZeroReader) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
+}
+
+type readImageCountingReader struct {
+	io.Reader
+	bytes int
+}
+
+func (r *readImageCountingReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	r.bytes += n
+	return n, err
+}
+
+func TestReadImage_BoundsGrowingFile(t *testing.T) {
+	data := readTestImage(t, "png")
+	path := filepath.Join(t.TempDir(), "growing.png")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	reader := &readImageCountingReader{Reader: io.MultiReader(bytes.NewReader(data), readImageZeroReader{})}
+	result, err := readImage(t.Context(), file, reader, path, "image/png")
+	if err == nil || !strings.Contains(err.Error(), "read limit") || len(result.Attachments) != 0 || reader.bytes != maxReadImageBytes+1 {
+		t.Fatalf("error = %v, bytes read = %d, attachments = %d", err, reader.bytes, len(result.Attachments))
+	}
+}
+
+func TestReadTool_UnsupportedImagesRemainBinary(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		data []byte
+	}{
+		{"BMP", []byte("BM\x00\x00\x00\x00\x00\x00")},
+		{"TIFF", []byte("II\x2a\x00\x08\x00\x00\x00")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "unsupported.png")
+			if err := os.WriteFile(path, tc.data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			input, _ := json.Marshal(ReadInput{FilePath: path})
+			result, err := Read().Execute(t.Context(), input, tool.CallOptions{})
+			if err != nil || len(result.Attachments) != 0 || !strings.Contains(result.Output, "Cannot read binary file") {
+				t.Fatalf("unsupported image response = %+v, error = %v", result, err)
+			}
+		})
 	}
 }
