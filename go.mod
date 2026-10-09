@@ -1,8 +1,8 @@
 module github.com/airlockrun/sol
 
-go 1.26.6
+go 1.26.9
 
-require github.com/airlockrun/goai v0.2.0
+require github.com/airlockrun/goai v0.3.0
 
 require golang.org/x/net v0.58.0
 
