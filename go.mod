@@ -2,7 +2,7 @@ module github.com/airlockrun/sol
 
 go 1.26.9
 
-require github.com/airlockrun/goai v0.3.0
+require github.com/airlockrun/goai v0.3.1
 
 require golang.org/x/net v0.58.0
 
@@ -11,6 +11,8 @@ require github.com/coder/websocket v1.8.14
 require golang.org/x/sys v0.47.0
 
 require golang.org/x/term v0.45.0
+
+require golang.org/x/image v0.45.0
 
 require (
 	github.com/google/jsonschema-go v0.4.3 // indirect

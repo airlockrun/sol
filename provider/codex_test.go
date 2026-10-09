@@ -1,13 +1,19 @@
 package provider_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -25,6 +31,7 @@ import (
 	"github.com/airlockrun/sol/localconfig"
 	"github.com/airlockrun/sol/provider"
 	"github.com/airlockrun/sol/session"
+	"github.com/airlockrun/sol/tools"
 )
 
 type fixedCodexSource struct {
@@ -240,6 +247,187 @@ func TestCodexToolAndReasoningRoundTrip(t *testing.T) {
 	if result.Status != sol.RunCompleted || calls.Load() != 2 {
 		t.Fatalf("status=%s calls=%d", result.Status, calls.Load())
 	}
+}
+
+type codexReadImageStore struct {
+	data []byte
+}
+
+func (s *codexReadImageStore) Load(ctx context.Context) ([]session.Message, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var messages []session.Message
+	if len(s.data) != 0 {
+		if err := json.Unmarshal(s.data, &messages); err != nil {
+			return nil, err
+		}
+	}
+	return messages, nil
+}
+
+func (s *codexReadImageStore) Append(ctx context.Context, messages []session.Message) error {
+	history, err := s.Load(ctx)
+	if err != nil {
+		return err
+	}
+	s.data, err = json.Marshal(append(history, messages...))
+	return err
+}
+
+func (s *codexReadImageStore) Compact(ctx context.Context, messages []session.Message, _ int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	var err error
+	s.data, err = json.Marshal(messages)
+	return err
+}
+
+func TestCodexRunnerReadNativeImagePersistenceAndCompaction(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 2, 1))
+	img.Set(0, 0, color.RGBA{R: 255, A: 255})
+	img.Set(1, 0, color.RGBA{B: 255, A: 255})
+	var fixture bytes.Buffer
+	if err := png.Encode(&fixture, img); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "native.png")
+	if err := os.WriteFile(path, fixture.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+	encoded := base64.StdEncoding.EncodeToString(fixture.Bytes())
+	arguments, _ := json.Marshal(tools.ReadInput{FilePath: path})
+	requests := make(chan map[string]any, 5)
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer synthetic-image-test" || body["instructions"] == nil || body["store"] != false || body["max_output_tokens"] != nil {
+			t.Error("Codex policy did not preserve native image request normalization")
+		}
+		requests <- body
+		call := calls.Add(1)
+		if call == 1 {
+			w.Header().Set("Content-Type", "text/event-stream")
+			item := map[string]any{"type": "function_call", "id": "read-item", "call_id": "read-image", "name": "read"}
+			for _, frame := range []map[string]any{
+				{"type": "response.output_item.added", "output_index": 0, "item": item},
+				{"type": "response.function_call_arguments.delta", "output_index": 0, "delta": string(arguments)},
+				{"type": "response.output_item.done", "output_index": 0, "item": map[string]any{"type": "function_call", "id": "read-item", "call_id": "read-image", "name": "read", "arguments": string(arguments)}},
+				{"type": "response.completed", "response": map[string]any{"id": "read-response", "usage": map[string]int{"input_tokens": 10, "output_tokens": 5}}},
+			} {
+				data, _ := json.Marshal(frame)
+				fmt.Fprintf(w, "data: %s\n\n", data)
+			}
+			return
+		}
+		if call == 4 {
+			writeCodexText(w, "Image inspected in the summary.")
+		} else {
+			writeCodexText(w, "Local protocol fixture complete.")
+		}
+	}))
+	defer server.Close()
+	model := newCodexTestModel(t, server, fixedCodexSource{access: codex.Access{Token: "synthetic-image-test"}})
+	store := &codexReadImageStore{}
+	newRunner := func(retainTurns int) *sol.Runner {
+		ts := tool.Set{"read": tools.Read()}
+		return sol.NewRunner(sol.RunnerOptions{
+			Agent: &agent.Agent{Name: "image-test", Model: "openai/gpt-5.4", SystemPrompt: "Inspect images with the read tool.", MaxSteps: 3, Tools: ts, HistoryPolicy: agent.HistoryPolicy{FilesRetainTurns: retainTurns}},
+			Model: model, Executor: tool.NewLocalExecutor(ts, nil), SessionStore: store, Quiet: true,
+		})
+	}
+	runner := newRunner(0)
+	result, err := runner.Run(t.Context(), "Read the generated image.")
+	if err != nil || result.Status != sol.RunCompleted || calls.Load() != 2 {
+		t.Fatalf("result = %+v, error = %v, HTTP calls = %d", result, err, calls.Load())
+	}
+	<-requests // The first request asks the model to select a tool.
+	assertCodexReadImageInput(t, <-requests, encoded)
+	if !bytes.Contains(store.data, []byte(encoded)) || !bytes.Contains(store.data, []byte(`"outputType":"content"`)) {
+		t.Fatal("persisted read result lost structured image bytes")
+	}
+	persisted := bytes.Clone(store.data)
+	loaded, err := store.Load(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, msg := range session.MessagesToGoAI(loaded) {
+		for _, part := range msg.Content.Parts {
+			if output, ok := part.(message.ToolResultPart); ok && output.ToolCallID == "read-image" {
+				content, ok := output.Output.(message.ContentOutput)
+				if !ok || len(content.Value) != 2 || content.Value[1].Type != "image-data" || content.Value[1].Data != encoded || content.Value[1].MediaType != "image/png" {
+					t.Fatal("persisted tool image was flattened on session replay")
+				}
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatal("persisted read result missing")
+	}
+	// A fresh runner must send the saved image without rereading the file.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	replay := newRunner(0)
+	if _, err := replay.Run(t.Context(), ""); err != nil {
+		t.Fatal(err)
+	}
+	assertCodexReadImageInput(t, <-requests, encoded)
+	if _, err := replay.Compact(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	assertCodexReadImageInput(t, <-requests, encoded)
+	if bytes.Contains(store.data, []byte(encoded)) || !bytes.Contains(store.data, []byte("Image inspected in the summary.")) {
+		t.Fatal("compaction did not replace image context with its summary")
+	}
+	// Retention strips only model context; durable image data stays available.
+	store.data = persisted
+	if err := store.Append(t.Context(), []session.Message{{Role: "user", Content: "A later turn."}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newRunner(1).Run(t.Context(), ""); err != nil {
+		t.Fatal(err)
+	}
+	retained, _ := json.Marshal(<-requests)
+	if bytes.Contains(retained, []byte(encoded)) || !bytes.Contains(retained, []byte("Image removed from context")) || !bytes.Contains(store.data, []byte(encoded)) {
+		t.Fatal("image retention flattened bytes or mutated durable history")
+	}
+	if calls.Load() != 5 {
+		t.Fatalf("HTTP calls = %d, want 5", calls.Load())
+	}
+}
+
+func assertCodexReadImageInput(t *testing.T, body map[string]any, encoded string) {
+	t.Helper()
+	input, ok := body["input"].([]any)
+	if !ok {
+		t.Fatal("Responses input missing")
+	}
+	for _, raw := range input {
+		item, ok := raw.(map[string]any)
+		if !ok || item["type"] != "function_call_output" || item["call_id"] != "read-image" {
+			continue
+		}
+		parts, ok := item["output"].([]any)
+		if !ok || len(parts) != 2 {
+			t.Fatal("image tool result was flattened instead of native multipart output")
+		}
+		text, textOK := parts[0].(map[string]any)
+		img, imageOK := parts[1].(map[string]any)
+		if !textOK || !imageOK || text["type"] != "input_text" || !strings.Contains(fmt.Sprint(text["text"]), "Image attached:") || img["type"] != "input_image" || img["image_url"] != "data:image/png;base64,"+encoded {
+			t.Fatal("native image bytes, MIME type or tool result ordering changed")
+		}
+		return
+	}
+	t.Fatal("read-image function result missing from Codex request")
 }
 
 func TestCodexCompaction(t *testing.T) {
