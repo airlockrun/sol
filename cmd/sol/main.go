@@ -15,32 +15,71 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 
 	"github.com/airlockrun/goai"
 	"github.com/airlockrun/goai/stream"
 	"github.com/airlockrun/sol"
 	"github.com/airlockrun/sol/agent"
+	"github.com/airlockrun/sol/auth/codex"
 	"github.com/airlockrun/sol/bus"
+	"github.com/airlockrun/sol/localconfig"
 	"github.com/airlockrun/sol/provider"
 	"github.com/airlockrun/sol/tools"
 )
 
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	if len(os.Args) > 1 && (os.Args[1] == "auth" || os.Args[1] == "config") {
+		store, err := localStore()
+		if err == nil && os.Args[1] == "config" {
+			err = runConfig(ctx, os.Args[2:], os.Stdout, store)
+		} else if err == nil {
+			var client *codex.Client
+			client, err = localCodex(store)
+			if err == nil {
+				err = runAuth(ctx, os.Args[2:], os.Stdout, client, store, func(ctx context.Context, stdin bool) (string, error) {
+					return readAPIKey(ctx, os.Stdin, os.Stderr, stdin)
+				})
+			}
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "[sol]", err)
+			os.Exit(1)
+		}
+		return
+	}
 	// Flags
-	modelFlag := flag.String("model", "openai/gpt-4o", "Model to use (provider/model format, e.g., openai/gpt-4o-mini)")
+	authFlag := flag.String("auth", "", "Authentication: api-key or codex; explicit model overrides default auth to api-key")
+	modelFlag := flag.String("model", "", "Model to use (provider/model); uses saved default or openai/gpt-4o")
 	agentFlag := flag.String("agent", "build", "Agent type: build, plan, explore, general")
 	nameFlag := flag.String("name", "", "Agent name for prompts (default: agent type name)")
 	noTitleFlag := flag.Bool("notitle", false, "Disable title generation (for replay testing)")
-	titleModelFlag := flag.String("title-model", "gpt-5-nano", "Model for title generation")
+	titleModelFlag := flag.String("title-model", "", "Model for title generation (default: selected main model)")
 	mcpFlag := flag.String("mcp", "", "MCP servers (comma-separated name=url pairs, e.g., 'docs=http://localhost:8080/mcp')")
-	searchFlag := flag.Bool("search", false, "Enable web search tool (uses LLM provider key if capable, or BRAVE_API_KEY/PERPLEXITY_API_KEY)")
+	searchFlag := flag.Bool("search", false, "Enable web search (native provider key, or independent Brave/Perplexity key from env/store)")
 	interactiveFlag := flag.Bool("i", false, "Interactive mode - prompt for permissions (default: auto-approve)")
 	helpFlag := flag.Bool("h", false, "Show help")
 	flag.Parse()
+	explicitModel, explicitTitle, explicitAuth := false, false, false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "model" {
+			explicitModel = true
+		}
+		if f.Name == "title-model" {
+			explicitTitle = true
+		}
+		if f.Name == "auth" {
+			explicitAuth = true
+		}
+	})
 
 	// Determine prompts from CLI args
 	var prompts []string
@@ -53,15 +92,21 @@ func main() {
 
 Usage:
   sol [options] <prompt>
+  sol auth login|status|logout codex
+  sol auth set-key PROVIDER [--stdin]
+  sol auth status|remove-key PROVIDER
+  sol config model [--auth api-key|codex] [PROVIDER/MODEL]
+  sol config model --clear
 
 Options:
-  -model string     Model to use in provider/model format (default "openai/gpt-4o")
+  -auth string      Authentication: api-key or codex (uses saved model/auth pair)
+  -model string     Model override; uses api-key unless -auth is also supplied
   -agent string     Agent type: build, plan, explore, general (default "build")
   -name string      Agent name for prompts (default: agent type name)
   -mcp string       MCP servers (comma-separated name=url pairs)
   -search           Enable web search tool
   -notitle          Disable title generation (for replay testing)
-  -title-model      Model for title generation (default "gpt-5-nano")
+  -title-model      Title model override (default: selected main model)
   -i                Interactive mode - prompt for permissions (default: auto-approve)
   -h                Show help
 
@@ -83,26 +128,74 @@ Examples:
 		os.Exit(1)
 	}
 
-	// Load .env files first
-	loadEnvFile(".env")
-	loadEnvFile("../.env")
-
-	// Check for Airlock proxy mode (AIRLOCK_API_URL + AIRLOCK_BUILD_TOKEN).
-	// When set, Sol proxies all LLM calls through Airlock instead of using direct API keys.
+	// Hosted proxy requests do not discover local credentials or inherit local
+	// model/auth defaults. Configuration commands above remain explicitly local.
 	proxyURL := os.Getenv("AIRLOCK_API_URL")
 	proxyToken := os.Getenv("AIRLOCK_BUILD_TOKEN")
+	var store localconfig.Store
+	config := localconfig.Config{Providers: make(map[string]localconfig.ProviderAuth)}
+	var err error
+	if proxyURL == "" {
+		store, err = localStore()
+		if err == nil {
+			config, err = store.Load(ctx)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "[sol]", err)
+			os.Exit(1)
+		}
+	} else if explicitAuth && *authFlag == "codex" {
+		fmt.Fprintln(os.Stderr, "[sol] -auth codex requires direct local mode; unset AIRLOCK_API_URL")
+		os.Exit(1)
+	}
+	selection, err := selectModel(config, *modelFlag, *authFlag, explicitModel, explicitAuth)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "[sol]", err)
+		os.Exit(1)
+	}
+	*modelFlag = selection.Model
+	*authFlag = selection.Auth
 
 	// Parse model to determine provider
 	providerID, modelID := provider.ParseModel(*modelFlag)
+	baseURL := os.Getenv("OPENAI_BASE_URL")
+	if err := validateAuthMode(*authFlag, providerID, modelID, proxyURL, baseURL, explicitModel || config.DefaultModel != nil); err != nil {
+		fmt.Fprintln(os.Stderr, "[sol]", err)
+		os.Exit(1)
+	}
+	var directModel, titleModel stream.Model
+	if *authFlag == "codex" {
+		client, err := localCodex(store)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "[sol]", err)
+			os.Exit(1)
+		}
+		opts := provider.CodexOptions{Credentials: client, HTTPClient: &http.Client{}, URL: provider.CodexURL, UserAgent: "sol/" + sol.Version, SessionID: rand.Text()}
+		directModel, titleModel, err = codexModels(modelID, *titleModelFlag, explicitTitle, opts)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "[sol]", err)
+			os.Exit(1)
+		}
+	}
 
 	// Load API key based on provider (not needed in proxy mode)
 	var apiKey string
-	if proxyURL == "" {
-		envVarName := provider.GetEnvVarName(providerID)
-		apiKey = os.Getenv(envVarName)
-		if apiKey == "" {
-			fmt.Fprintf(os.Stderr, "[sol] Error: %s not set\n", envVarName)
+	if proxyURL == "" && *authFlag == "api-key" {
+		apiKey, err = provider.ResolveLocalAPIKey(config, providerID, os.LookupEnv)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "[sol]", err)
 			os.Exit(1)
+		}
+		directModel = provider.CreateModel(providerID, modelID, provider.Options{APIKey: apiKey, BaseURL: baseURL})
+		titleModel = directModel
+		if explicitTitle && !*noTitleFlag {
+			id, model := provider.ParseModel(*titleModelFlag)
+			key, err := provider.ResolveLocalAPIKey(config, id, os.LookupEnv)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "[sol] title:", err)
+				os.Exit(1)
+			}
+			titleModel = provider.CreateModel(id, model, provider.Options{APIKey: key, BaseURL: baseURL})
 		}
 	}
 
@@ -122,9 +215,9 @@ Examples:
 
 	// Enable web search if requested
 	if *searchFlag {
-		t, ok := tools.WebSearch(providerID, apiKey)
+		t, ok := resolveSearch(*authFlag, providerID, apiKey, config)
 		if !ok {
-			fmt.Fprintf(os.Stderr, "[sol] Error: -search requires a search-capable provider or BRAVE_API_KEY/PERPLEXITY_API_KEY\n")
+			fmt.Fprintf(os.Stderr, "[sol] Error: -search requires a search-capable provider or an independent Brave/Perplexity API key in env/store\n")
 			os.Exit(1)
 		}
 		selectedAgent.Tools.Add(t)
@@ -134,7 +227,7 @@ Examples:
 	// Connect to MCP servers if configured
 	if *mcpFlag != "" {
 		servers := parseMCPFlag(*mcpFlag)
-		mcpClient, mcpTools, err := sol.ConnectMCPServers(context.Background(), servers)
+		mcpClient, mcpTools, err := sol.ConnectMCPServers(ctx, servers)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[sol] MCP error: %v\n", err)
 			os.Exit(1)
@@ -145,15 +238,17 @@ Examples:
 	}
 
 	cwd, _ := os.Getwd()
-	baseURL := os.Getenv("OPENAI_BASE_URL")
 
 	// Build the proxy model if in proxy mode.
-	var proxyModel stream.Model
+	proxyModel := directModel
 	if proxyURL != "" {
 		proxyModel = provider.CreateProxyModel(*modelFlag, provider.ProxyOptions{
 			BaseURL: proxyURL,
 			Token:   proxyToken,
 		})
+	}
+	if titleModel == nil {
+		titleModel = proxyModel
 	}
 
 	fmt.Printf("[%s] Starting...\n", selectedAgent.Name)
@@ -162,7 +257,7 @@ Examples:
 	} else {
 		fmt.Printf("[%s] Test mode: %d prompts\n", selectedAgent.Name, len(prompts))
 	}
-	fmt.Printf("[%s] Model: %s (using %s prompt)\n", selectedAgent.Name, *modelFlag, sol.GetPromptForModel(modelID))
+	fmt.Printf("[%s] Model: %s (auth: %s; using %s prompt)\n", selectedAgent.Name, *modelFlag, *authFlag, sol.GetPromptForModel(modelID))
 
 	if proxyURL != "" {
 		fmt.Printf("[%s] Using Airlock proxy: %s\n", selectedAgent.Name, proxyURL)
@@ -180,8 +275,7 @@ Examples:
 	enableTitleGen := !*noTitleFlag
 	var titleChan <-chan sol.TitleResult
 	if enableTitleGen && len(prompts) == 1 {
-		ctx := context.Background()
-		titleChan = sol.GenerateTitleAsync(ctx, prompts[0], *titleModelFlag, apiKey, baseURL)
+		titleChan = sol.GenerateTitleWithModelAsync(ctx, prompts[0], titleModel)
 	}
 
 	var totalSteps int
@@ -213,10 +307,10 @@ Examples:
 			}
 
 			// Run the agent with context values for tool execution
-			ctx := context.WithValue(context.Background(), tools.RunnerKey, runner)
-			ctx = context.WithValue(ctx, tools.WorkDirKey, cwd)
+			runCtx := context.WithValue(ctx, tools.RunnerKey, runner)
+			runCtx = context.WithValue(runCtx, tools.WorkDirKey, cwd)
 
-			result, runErr := runner.Run(ctx, prompt)
+			result, runErr := runner.Run(runCtx, prompt)
 			if runErr != nil {
 				fmt.Fprintf(os.Stderr, "[%s] Error: %s\n", selectedAgent.Name, runErr)
 				os.Exit(1)
@@ -261,7 +355,7 @@ Examples:
 							runner.PermissionManager().AddRule(rule)
 						}
 
-						resolution, resolveErr := runner.ResolvePermissionSuspension(ctx, sc, approved)
+						resolution, resolveErr := runner.ResolvePermissionSuspension(runCtx, sc, approved)
 						if resolveErr != nil {
 							fmt.Fprintf(os.Stderr, "[%s] Failed to resolve permission: %s\n", selectedAgent.Name, resolveErr)
 							os.Exit(1)
@@ -341,31 +435,4 @@ func parseMCPFlag(value string) []sol.MCPServer {
 		})
 	}
 	return servers
-}
-
-// loadEnvFile loads environment variables from a file.
-func loadEnvFile(path string) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		key := strings.TrimSpace(parts[0])
-		value := strings.TrimSpace(parts[1])
-		if len(value) >= 2 && ((value[0] == '"' && value[len(value)-1] == '"') ||
-			(value[0] == '\'' && value[len(value)-1] == '\'')) {
-			value = value[1 : len(value)-1]
-		}
-		if os.Getenv(key) == "" {
-			os.Setenv(key, value)
-		}
-	}
 }

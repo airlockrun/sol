@@ -24,6 +24,15 @@ import (
 	"github.com/airlockrun/sol/tools"
 )
 
+func newMockModel(t testing.TB, config testutil.MockConfig) *testutil.MockModel {
+	t.Helper()
+	m, err := testutil.NewMockModel(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
 // testStore is a simple in-memory session store that records appended messages.
 type testStore struct {
 	messages    []session.Message
@@ -88,7 +97,8 @@ func TestRunner_ModelLimits(t *testing.T) {
 				t.Run(entry, func(t *testing.T) {
 					a := testAgent(tool.Set{})
 					a.Model = tt.model
-					model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponse: testutil.MockTextResponse("ok", testutil.MockUsage(1, 1))})
+					model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+						Default: &testutil.MockResponse{Events: testutil.MockTextResponse("ok", testutil.MockUsage(1, 1))}})
 					r := NewRunner(RunnerOptions{Agent: a, Model: model, ModelLimits: tt.limits, CompactionConfig: tt.config, SessionStore: &testStore{}, Quiet: true})
 					var err error
 					switch entry {
@@ -103,7 +113,7 @@ func TestRunner_ModelLimits(t *testing.T) {
 						t.Fatalf("error = %v", err)
 					}
 					if tt.wantErr {
-						if !strings.Contains(err.Error(), "ModelLimits") || len(model.DoStreamCalls) != 0 {
+						if !strings.Contains(err.Error(), "ModelLimits") || len(model.Requests()) != 0 {
 							t.Fatalf("validation was not before model call: %v", err)
 						}
 					} else if entry != "child" {
@@ -142,18 +152,19 @@ func TestRunner_CompactionOutputLimit(t *testing.T) {
 				t.Run(entry, func(t *testing.T) {
 					a := testAgent(tool.Set{})
 					a.Model = tt.model
-					responses := [][]stream.Event{testutil.MockTextResponse("summary", testutil.MockUsage(10, 2))}
+					responses := []testutil.MockResponse{{Events: testutil.MockTextResponse("summary", testutil.MockUsage(10, 2))}}
 					idx := 0
 					if entry != "Compact" {
-						responses = append([][]stream.Event{testutil.MockTextResponse("overflow", testutil.MockUsage(200_000, 1))}, responses...)
-						responses = append(responses, testutil.MockTextResponse("done", testutil.MockUsage(10, 2)))
+						responses = append([]testutil.MockResponse{{Events: testutil.MockTextResponse("overflow", testutil.MockUsage(200_000, 1))}}, responses...)
+						responses = append(responses, testutil.MockResponse{Events: testutil.MockTextResponse("done", testutil.MockUsage(10, 2))})
 						idx++
 					}
 					if entry == "Continue" {
-						responses = append([][]stream.Event{testutil.MockTextResponse("first", testutil.MockUsage(10, 2))}, responses...)
+						responses = append([]testutil.MockResponse{{Events: testutil.MockTextResponse("first", testutil.MockUsage(10, 2))}}, responses...)
 						idx++
 					}
-					model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponses: responses})
+					model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+						Responses: responses})
 					r := NewRunner(RunnerOptions{Agent: a, Model: model, ModelLimits: tt.limits, SessionStore: &testStore{}, Quiet: true})
 					var err error
 					switch entry {
@@ -172,10 +183,10 @@ func TestRunner_CompactionOutputLimit(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					if len(model.DoStreamCalls) <= idx {
-						t.Fatalf("model calls = %d, want compaction at %d", len(model.DoStreamCalls), idx)
+					if len(model.Requests()) <= idx {
+						t.Fatalf("model calls = %d, want compaction at %d", len(model.Requests()), idx)
 					}
-					got := model.DoStreamCalls[idx].MaxOutputTokens
+					got := model.Requests()[idx].MaxOutputTokens
 					if got == nil {
 						t.Fatal("missing compaction output limit")
 					}
@@ -202,19 +213,20 @@ func TestRunner_SmallContextCompactsOnce(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			a := testAgent(tool.Set{})
 			a.Model = tt.model
-			model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponses: [][]stream.Event{
-				testutil.MockTextResponse("first", testutil.MockUsage(3000, 1)),
-				testutil.MockTextResponse("overflow", testutil.MockUsage(5000, 1)),
-				testutil.MockTextResponse("summary", testutil.MockUsage(5000, 100)),
-				testutil.MockTextResponse("done", testutil.MockUsage(3000, 1)),
-			}})
+			model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+				Responses: []testutil.MockResponse{
+					{Events: testutil.MockTextResponse("first", testutil.MockUsage(3000, 1))},
+					{Events: testutil.MockTextResponse("overflow", testutil.MockUsage(5000, 1))},
+					{Events: testutil.MockTextResponse("summary", testutil.MockUsage(5000, 100))},
+					{Events: testutil.MockTextResponse("done", testutil.MockUsage(3000, 1))},
+				}})
 			r := NewRunner(RunnerOptions{Agent: a, Model: model, ModelLimits: tt.limits, Quiet: true})
 			result, err := r.Run(context.Background(), "go")
 			if err != nil {
 				t.Fatal(err)
 			}
-			if result.Status != RunCompleted || result.CompactionState != nil || len(model.DoStreamCalls) != 1 {
-				t.Fatalf("premature compaction: status %s, calls %d", result.Status, len(model.DoStreamCalls))
+			if result.Status != RunCompleted || result.CompactionState != nil || len(model.Requests()) != 1 {
+				t.Fatalf("premature compaction: status %s, calls %d", result.Status, len(model.Requests()))
 			}
 			want := tt.limits
 			if tt.name == "gpt-4 catalog" {
@@ -227,8 +239,8 @@ func TestRunner_SmallContextCompactsOnce(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if result.Status != RunCompleted || result.CompactionState == nil || len(model.DoStreamCalls) != 4 {
-				t.Fatalf("expected one compaction then completion: status %s, calls %d", result.Status, len(model.DoStreamCalls))
+			if result.Status != RunCompleted || result.CompactionState == nil || len(model.Requests()) != 4 {
+				t.Fatalf("expected one compaction then completion: status %s, calls %d", result.Status, len(model.Requests()))
 			}
 			if r.session.IsOverflow() || r.session.ModelLimits != want {
 				t.Fatalf("continuation budget = %+v, tokens = %+v", r.session.ModelLimits, r.session.Tokens)
@@ -242,7 +254,8 @@ func TestRunner_StepLimit(t *testing.T) {
 		t.Run(entry, func(t *testing.T) {
 			a := testAgent(tool.Set{"noop": tool.New("noop").Build()})
 			a.MaxSteps = 1
-			model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponse: testutil.MockToolCallResponse("c", "noop", map[string]any{}, testutil.MockUsage(10, 2))})
+			model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+				Default: &testutil.MockResponse{Events: testutil.MockToolCallResponse("c", "noop", map[string]any{}, testutil.MockUsage(10, 2))}})
 			r := NewRunner(RunnerOptions{Agent: a, Model: model, Quiet: true, ExitState: &tools.ExitState{}})
 			var result *RunResult
 			var err error
@@ -275,7 +288,8 @@ func TestRunner_InputTokenLimit(t *testing.T) {
 	a := testAgent(tool.Set{"noop": tool.New("noop").Build()})
 	a.MaxSteps = 10
 	a.MaxInputTokens = 15
-	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponse: testutil.MockToolCallResponse("c", "noop", map[string]any{}, testutil.MockUsage(10, 2))})
+	model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: testutil.MockToolCallResponse("c", "noop", map[string]any{}, testutil.MockUsage(10, 2))}})
 	r := NewRunner(RunnerOptions{Agent: a, Model: model, Quiet: true})
 
 	result, err := r.Run(context.Background(), "go")
@@ -288,8 +302,8 @@ func TestRunner_InputTokenLimit(t *testing.T) {
 	if result.Error == nil || result.Error.Error() != "input token limit reached: 20 of 15" {
 		t.Fatalf("error = %v", result.Error)
 	}
-	if len(model.DoStreamCalls) != 2 {
-		t.Fatalf("model calls = %d, want 2", len(model.DoStreamCalls))
+	if len(model.Requests()) != 2 {
+		t.Fatalf("model calls = %d, want 2", len(model.Requests()))
 	}
 }
 
@@ -302,10 +316,11 @@ func TestRunner_PrunesLiveTranscript(t *testing.T) {
 				goai.NewToolResultText("old", "noop", strings.Repeat("old-output", 40_000)),
 				goai.NewUserMessage("recent"), goai.NewAssistantMessage("recent answer"),
 			}
-			model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponses: [][]stream.Event{
-				testutil.MockToolCallResponse("new", "noop", map[string]any{}, testutil.MockUsage(100_000, 1)),
-				testutil.MockTextResponse("done", testutil.MockUsage(10, 2)),
-			}})
+			model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+				Responses: []testutil.MockResponse{
+					{Events: testutil.MockToolCallResponse("new", "noop", map[string]any{}, testutil.MockUsage(100_000, 1))},
+					{Events: testutil.MockTextResponse("done", testutil.MockUsage(10, 2))},
+				}})
 			opts := RunnerOptions{Agent: testAgent(tool.Set{"noop": tool.New("noop").Build()}), Model: model, InitialMessages: history, ModelLimits: session.ModelLimits{Input: 80_000}, Quiet: true}
 			if persisted {
 				opts.SessionStore = &testStore{messages: session.FromGoAIMessages(history)}
@@ -315,10 +330,10 @@ func TestRunner_PrunesLiveTranscript(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(model.DoStreamCalls) != 2 || result.CompactionState != nil {
+			if len(model.Requests()) != 2 || result.CompactionState != nil {
 				t.Fatal("prune should avoid summarization")
 			}
-			encoded, err := json.Marshal(model.DoStreamCalls[1])
+			encoded, err := json.Marshal(model.Requests()[1])
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -342,7 +357,8 @@ func TestRunner_PrunePreservesFileSource(t *testing.T) {
 		}
 		return session.DefaultPrunedMessage(info)
 	}
-	r := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Model: testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{}), CompactionConfig: &config, Quiet: true})
+	r := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Model: newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: []stream.Event{}}}), CompactionConfig: &config, Quiet: true})
 	if err := r.initSession(); err != nil {
 		t.Fatal(err)
 	}
@@ -405,14 +421,15 @@ func TestRunner_CompactionRedactsCompleteRequest(t *testing.T) {
 				goai.NewUserMessage("request secret"),
 				goai.NewToolMessage("c", "noop", message.JSONOutput{Value: map[string]any{"key": "secret"}}),
 			})}
-			responses := [][]stream.Event{testutil.MockTextResponse("summary", testutil.MockUsage(10, 2))}
+			responses := []testutil.MockResponse{{Events: testutil.MockTextResponse("summary", testutil.MockUsage(10, 2))}}
 			if automatic {
-				responses = [][]stream.Event{
-					testutil.MockToolCallResponse("new", "noop", map[string]any{}, testutil.MockUsage(2000, 1)),
-					responses[0], testutil.MockTextResponse("done", testutil.MockUsage(10, 2)),
+				responses = []testutil.MockResponse{
+					{Events: testutil.MockToolCallResponse("new", "noop", map[string]any{}, testutil.MockUsage(2000, 1))},
+					responses[0], {Events: testutil.MockTextResponse("done", testutil.MockUsage(10, 2))},
 				}
 			}
-			model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponses: responses})
+			model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+				Responses: responses})
 			r := NewRunner(RunnerOptions{Agent: a, Model: model, SessionStore: store, CompactionConfig: &config, ModelLimits: session.ModelLimits{Input: 1000}, Quiet: true})
 			var err error
 			if automatic {
@@ -427,7 +444,7 @@ func TestRunner_CompactionRedactsCompleteRequest(t *testing.T) {
 			if automatic {
 				idx = 1
 			}
-			encoded, err := json.Marshal(model.DoStreamCalls[idx])
+			encoded, err := json.Marshal(model.Requests()[idx])
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -439,10 +456,11 @@ func TestRunner_CompactionRedactsCompleteRequest(t *testing.T) {
 }
 
 func TestRunner_ContinuePersistsPromptAndScopesNewMessages(t *testing.T) {
-	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponses: [][]stream.Event{
-		testutil.MockTextResponse("first answer", testutil.MockUsage(10, 2)),
-		testutil.MockTextResponse("second answer", testutil.MockUsage(20, 3)),
-	}})
+	model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Responses: []testutil.MockResponse{
+			{Events: testutil.MockTextResponse("first answer", testutil.MockUsage(10, 2))},
+			{Events: testutil.MockTextResponse("second answer", testutil.MockUsage(20, 3))},
+		}})
 	store := &testStore{}
 	r := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Model: model, SessionStore: store, Quiet: true})
 	if _, err := r.Run(context.Background(), "first"); err != nil {
@@ -462,16 +480,17 @@ func TestRunner_ContinuePersistsPromptAndScopesNewMessages(t *testing.T) {
 
 func TestRunner_ProviderToolReplayOrder(t *testing.T) {
 	metadata := map[string]any{"itemId": "remote"}
-	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponse: []stream.Event{
-		{Type: stream.EventTextDelta, Data: stream.TextDeltaEvent{Text: "before", ProviderMetadata: metadata}},
-		{Type: stream.EventReasoningStart, Data: stream.ReasoningStartEvent{ID: "r", ProviderMetadata: metadata}},
-		{Type: stream.EventReasoningDelta, Data: stream.ReasoningDeltaEvent{ID: "r", Text: "thinking"}},
-		{Type: stream.EventReasoningEnd, Data: stream.ReasoningEndEvent{ID: "r"}},
-		{Type: stream.EventToolCall, Data: stream.ToolCallEvent{ToolCallID: "c", ToolName: "search", Input: json.RawMessage(`{}`), ProviderExecuted: true, ProviderMetadata: metadata}},
-		{Type: stream.EventToolResult, Data: stream.ToolResultEvent{ToolCallID: "c", ToolName: "search", Output: message.JSONOutput{Value: map[string]any{"ok": true}}, ProviderExecuted: true, ProviderMetadata: metadata}},
-		{Type: stream.EventTextDelta, Data: stream.TextDeltaEvent{Text: "after"}},
-		{Type: stream.EventFinish, Data: stream.FinishEvent{FinishReason: stream.FinishReasonStop, Usage: testutil.MockUsage(10, 2)}},
-	}})
+	model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: []stream.Event{
+			{Type: stream.EventTextDelta, Data: stream.TextDeltaEvent{Text: "before", ProviderMetadata: metadata}},
+			{Type: stream.EventReasoningStart, Data: stream.ReasoningStartEvent{ID: "r", ProviderMetadata: metadata}},
+			{Type: stream.EventReasoningDelta, Data: stream.ReasoningDeltaEvent{ID: "r", Text: "thinking"}},
+			{Type: stream.EventReasoningEnd, Data: stream.ReasoningEndEvent{ID: "r"}},
+			{Type: stream.EventToolCall, Data: stream.ToolCallEvent{ToolCallID: "c", ToolName: "search", Input: json.RawMessage(`{}`), ProviderExecuted: true, ProviderMetadata: metadata}},
+			{Type: stream.EventToolResult, Data: stream.ToolResultEvent{ToolCallID: "c", ToolName: "search", Output: message.JSONOutput{Value: map[string]any{"ok": true}}, ProviderExecuted: true, ProviderMetadata: metadata}},
+			{Type: stream.EventTextDelta, Data: stream.TextDeltaEvent{Text: "after"}},
+			{Type: stream.EventFinish, Data: stream.FinishEvent{FinishReason: stream.FinishReasonStop, Usage: testutil.MockUsage(10, 2)}},
+		}}})
 	store := &testStore{}
 	r := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Model: model, SessionStore: store, Quiet: true})
 	result, err := r.Run(context.Background(), "go")
@@ -503,22 +522,24 @@ func TestRunner_ProviderToolReplayOrder(t *testing.T) {
 func TestRunner_ExitIsTerminalAtContextAndStepLimits(t *testing.T) {
 	a := testAgent(tool.Set{})
 	a.MaxSteps = 1
-	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponse: testutil.MockToolCallResponse("exit", "exit", map[string]string{"status": "success", "message": "done"}, testutil.MockUsage(2000, 1))})
+	model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: testutil.MockToolCallResponse("exit", "exit", map[string]string{"status": "success", "message": "done"}, testutil.MockUsage(2000, 1))}})
 	r := NewRunner(RunnerOptions{Agent: a, Model: model, ModelLimits: session.ModelLimits{Input: 1000}, ExitState: &tools.ExitState{}, Quiet: true})
 	result, err := r.Run(context.Background(), "go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Status != RunExited || len(model.DoStreamCalls) != 1 {
-		t.Fatalf("result = %+v, calls = %d", result, len(model.DoStreamCalls))
+	if result.Status != RunExited || len(model.Requests()) != 1 {
+		t.Fatalf("result = %+v, calls = %d", result, len(model.Requests()))
 	}
 }
 
 func TestRunner_ProviderCallWithoutResultIsNotSynthesized(t *testing.T) {
-	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponse: []stream.Event{
-		{Type: stream.EventToolCall, Data: stream.ToolCallEvent{ToolCallID: "c", ToolName: "search", Input: json.RawMessage(`{}`), ProviderExecuted: true}},
-		{Type: stream.EventFinish, Data: stream.FinishEvent{FinishReason: stream.FinishReasonStop, Usage: testutil.MockUsage(1, 1)}},
-	}})
+	model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: []stream.Event{
+			{Type: stream.EventToolCall, Data: stream.ToolCallEvent{ToolCallID: "c", ToolName: "search", Input: json.RawMessage(`{}`), ProviderExecuted: true}},
+			{Type: stream.EventFinish, Data: stream.FinishEvent{FinishReason: stream.FinishReasonStop, Usage: testutil.MockUsage(1, 1)}},
+		}}})
 	r := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Model: model, Quiet: true})
 	result, err := r.Run(context.Background(), "go")
 	if err != nil {
@@ -548,7 +569,8 @@ func TestRunner_FilesRetainTurnsPreservesStoreAndStructuredResults(t *testing.T)
 	store := &testStore{messages: history}
 	a := testAgent(tool.Set{})
 	a.HistoryPolicy.FilesRetainTurns = 1
-	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponse: testutil.MockTextResponse("ok", testutil.MockUsage(1, 1))})
+	model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: testutil.MockTextResponse("ok", testutil.MockUsage(1, 1))}})
 	r := NewRunner(RunnerOptions{Agent: a, Model: model, SessionStore: store, Quiet: true})
 	if _, err := r.Run(context.Background(), ""); err != nil {
 		t.Fatal(err)
@@ -557,7 +579,7 @@ func TestRunner_FilesRetainTurnsPreservesStoreAndStructuredResults(t *testing.T)
 	if string(after) != string(before) {
 		t.Fatal("retention mutated loaded store history")
 	}
-	request, _ := json.Marshal(model.DoStreamCalls[0])
+	request, _ := json.Marshal(model.Requests()[0])
 	if strings.Contains(string(request), "old image payload") || strings.Contains(string(request), "old file payload") {
 		t.Fatalf("retained old attachment: %s", request)
 	}
@@ -589,7 +611,8 @@ func TestFilterMessageParts_ExcludesNestedContentFiles(t *testing.T) {
 
 func TestRunner_FailedAppendRequiresFreshRun(t *testing.T) {
 	store := &testStore{appendErrAt: 2}
-	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponse: testutil.MockTextResponse("answer", testutil.MockUsage(1, 1))})
+	model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: testutil.MockTextResponse("answer", testutil.MockUsage(1, 1))}})
 	r := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Model: model, SessionStore: store, Quiet: true})
 	if _, err := r.Run(context.Background(), "first"); err == nil {
 		t.Fatal("expected append error")
@@ -653,17 +676,16 @@ func TestRunner_AgentToolSets_GeneralAgent(t *testing.T) {
 
 func TestRunner_TaskUsesActiveRunner(t *testing.T) {
 	taskTool := tools.Task()
-	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		StreamResponses: [][]stream.Event{
-			testutil.MockToolCallResponse("task-1", "task", map[string]string{
+	model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Responses: []testutil.MockResponse{
+			{Events: testutil.MockToolCallResponse("task-1", "task", map[string]string{
 				"description":   "inspect code",
 				"prompt":        "Inspect the code and report back.",
 				"subagent_type": "general",
-			}, testutil.MockUsage(1, 1)),
-			testutil.MockTextResponse("child result", testutil.MockUsage(1, 1)),
-			testutil.MockTextResponse("parent final", testutil.MockUsage(1, 1)),
-		},
-	})
+			}, testutil.MockUsage(1, 1))},
+			{Events: testutil.MockTextResponse("child result", testutil.MockUsage(1, 1))},
+			{Events: testutil.MockTextResponse("parent final", testutil.MockUsage(1, 1))},
+		}})
 	runner := NewRunner(RunnerOptions{
 		Agent: testAgent(tool.Set{"task": taskTool}),
 		Model: model,
@@ -677,8 +699,8 @@ func TestRunner_TaskUsesActiveRunner(t *testing.T) {
 	if result.TotalText != "parent final" {
 		t.Fatalf("TotalText = %q, want parent final", result.TotalText)
 	}
-	if len(model.DoStreamCalls) != 3 {
-		t.Fatalf("model calls = %d, want parent, child, parent", len(model.DoStreamCalls))
+	if len(model.Requests()) != 3 {
+		t.Fatalf("model calls = %d, want parent, child, parent", len(model.Requests()))
 	}
 }
 
@@ -792,14 +814,13 @@ func (e *recordingExecutor) Execute(_ context.Context, req tool.Request) (tool.R
 func (*recordingExecutor) Tools() []tool.Info { return nil }
 
 func TestRunner_SubagentInheritsExecutor(t *testing.T) {
-	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		StreamResponses: [][]stream.Event{
-			testutil.MockToolCallResponse("read-1", "read", map[string]string{
+	model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Responses: []testutil.MockResponse{
+			{Events: testutil.MockToolCallResponse("read-1", "read", map[string]string{
 				"filePath": "/workspace/main.go",
-			}, testutil.MockUsage(1, 1)),
-			testutil.MockTextResponse("inspection complete", testutil.MockUsage(1, 1)),
-		},
-	})
+			}, testutil.MockUsage(1, 1))},
+			{Events: testutil.MockTextResponse("inspection complete", testutil.MockUsage(1, 1))},
+		}})
 	executor := &recordingExecutor{}
 	runner := NewRunner(RunnerOptions{
 		Agent:    testAgent(tool.Set{}),
@@ -823,16 +844,17 @@ func TestRunner_SubagentInheritsExecutor(t *testing.T) {
 
 func TestRunner_SubagentStepLimitPropagatesThroughTask(t *testing.T) {
 	maxSteps := agent.NewGeneralAgent("gpt-4o").MaxSteps
-	responses := make([][]stream.Event, maxSteps)
+	responses := make([]testutil.MockResponse, maxSteps)
 	for i := range responses {
-		responses[i] = testutil.MockToolCallResponse(fmt.Sprintf("read-%d", i), "read", map[string]string{
+		responses[i].Events = testutil.MockToolCallResponse(fmt.Sprintf("read-%d", i), "read", map[string]string{
 			"filePath": fmt.Sprintf("/workspace/file-%d.go", i),
 		}, testutil.MockUsage(1, 1))
 	}
 	executor := &recordingExecutor{}
 	runner := NewRunner(RunnerOptions{
-		Agent:    testAgent(tool.Set{}),
-		Model:    testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponses: responses}),
+		Agent: testAgent(tool.Set{}),
+		Model: newMockModel(t, testutil.MockConfig{ID: "fixture",
+			Responses: responses}),
 		Executor: executor,
 		Quiet:    true,
 	})
@@ -868,9 +890,8 @@ func TestRunner_AgentToolSets_PlanAgent(t *testing.T) {
 
 func TestNewRunner_Options(t *testing.T) {
 	a := testAgent(tools.CreateToolSetForModel(""))
-	mockModel := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		StreamResponse: testutil.MockTextResponse("hi", testutil.MockUsage(1, 1)),
-	})
+	mockModel := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: testutil.MockTextResponse("hi", testutil.MockUsage(1, 1))}})
 	supportsStructuredOutputs := true
 	includeUsage := true
 	httpClient := &http.Client{}
@@ -922,9 +943,8 @@ func TestNewRunner_InvalidToolCallExecutionModePanics(t *testing.T) {
 }
 
 func TestRunner_Run_CompletedStatus(t *testing.T) {
-	mockModel := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		StreamResponse: testutil.MockTextResponse("Hello!", testutil.MockUsage(10, 5)),
-	})
+	mockModel := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: testutil.MockTextResponse("Hello!", testutil.MockUsage(10, 5))}})
 
 	runner := NewRunner(RunnerOptions{
 		Agent: testAgent(tool.Set{}),
@@ -966,8 +986,8 @@ func TestRunner_Run_CompletedStatus(t *testing.T) {
 }
 
 func TestRunner_DoesNotForceMaxOutputTokens(t *testing.T) {
-	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		DoStreamFunc: func(ctx context.Context, options *stream.CallOptions) (<-chan stream.Event, error) {
+	model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Stream: func(ctx context.Context, options *stream.CallOptions) (<-chan stream.Event, error) {
 			if options.MaxOutputTokens != nil {
 				t.Errorf("MaxOutputTokens = %d, want provider default", *options.MaxOutputTokens)
 			}
@@ -977,8 +997,7 @@ func TestRunner_DoesNotForceMaxOutputTokens(t *testing.T) {
 			}
 			close(events)
 			return events, nil
-		},
-	})
+		}})
 	runner := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Model: model, Quiet: true})
 	if _, err := runner.Run(context.Background(), "hi"); err != nil {
 		t.Fatal(err)
@@ -986,15 +1005,14 @@ func TestRunner_DoesNotForceMaxOutputTokens(t *testing.T) {
 }
 
 func TestRunner_LengthFinishIsIncomplete(t *testing.T) {
-	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		StreamResponse: []stream.Event{
+	model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: []stream.Event{
 			{Type: stream.EventTextDelta, Data: stream.TextDeltaEvent{Text: "partial"}},
 			{
 				Type: stream.EventFinish,
 				Data: stream.FinishEvent{FinishReason: stream.FinishReasonLength, Usage: testutil.MockUsage(10, 16_385)},
 			},
-		},
-	})
+		}}})
 	runner := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Model: model, Quiet: true})
 	result, err := runner.Run(context.Background(), "hi")
 	if err == nil || !strings.Contains(err.Error(), "maximum output token limit") {
@@ -1012,15 +1030,14 @@ func TestRunner_LengthFinishIsIncomplete(t *testing.T) {
 }
 
 func TestRunner_ErrorFinishFailsWithPartialResult(t *testing.T) {
-	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		StreamResponse: []stream.Event{
+	model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: []stream.Event{
 			{Type: stream.EventTextDelta, Data: stream.TextDeltaEvent{Text: "partial"}},
 			{
 				Type: stream.EventFinish,
 				Data: stream.FinishEvent{FinishReason: stream.FinishReasonError, Usage: testutil.MockUsage(10, 4)},
 			},
-		},
-	})
+		}}})
 	runner := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Model: model, Quiet: true})
 	result, err := runner.Run(context.Background(), "hi")
 	if err == nil || !strings.Contains(err.Error(), "model response failed") {
@@ -1036,9 +1053,8 @@ func TestRunner_ErrorFinishFailsWithPartialResult(t *testing.T) {
 
 func TestRunner_AssistantStoreAppendFailureFailsRun(t *testing.T) {
 	store := &testStore{appendErrAt: 2}
-	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		StreamResponse: testutil.MockTextResponse("partial", testutil.MockUsage(2, 1)),
-	})
+	model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: testutil.MockTextResponse("partial", testutil.MockUsage(2, 1))}})
 	runner := NewRunner(RunnerOptions{
 		Agent:        testAgent(tool.Set{}),
 		Model:        model,
@@ -1064,9 +1080,8 @@ func TestRunner_ContinueStoreAppendFailureWinsOverCancellation(t *testing.T) {
 			cancelContinue = nil
 		}
 	})
-	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		StreamResponse: testutil.MockTextResponse("partial", testutil.MockUsage(2, 1)),
-	})
+	model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: testutil.MockTextResponse("partial", testutil.MockUsage(2, 1))}})
 	runner := NewRunner(RunnerOptions{
 		Agent:        testAgent(tool.Set{}),
 		Model:        model,
@@ -1090,12 +1105,11 @@ func TestRunner_ContinueStoreAppendFailureWinsOverCancellation(t *testing.T) {
 }
 
 func TestRunner_StreamErrorRetainsPartialText(t *testing.T) {
-	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		StreamResponse: []stream.Event{
+	model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: []stream.Event{
 			{Type: stream.EventTextDelta, Data: stream.TextDeltaEvent{Text: "partial"}},
 			{Type: stream.EventError, Data: stream.ErrorEvent{Error: errors.New("connection reset")}},
-		},
-	})
+		}}})
 	runner := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Model: model, Quiet: true})
 	result, err := runner.Run(context.Background(), "hi")
 	if err == nil || !strings.Contains(err.Error(), "connection reset") {
@@ -1111,8 +1125,8 @@ func TestRunner_StreamErrorRetainsPartialText(t *testing.T) {
 
 func TestRunner_ContinuesRetryableStreamErrorWithPartialContext(t *testing.T) {
 	attempts := 0
-	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		DoStreamFunc: func(ctx context.Context, options *stream.CallOptions) (<-chan stream.Event, error) {
+	model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Stream: func(ctx context.Context, options *stream.CallOptions) (<-chan stream.Event, error) {
 			attempts++
 			if attempts == 1 {
 				return testEventStream(ctx, []stream.Event{
@@ -1137,8 +1151,7 @@ func TestRunner_ContinuesRetryableStreamErrorWithPartialContext(t *testing.T) {
 				t.Errorf("continuation context missing partial=%v recovery=%v", sawPartial, sawRecovery)
 			}
 			return testEventStream(ctx, testutil.MockTextResponse("finished", testutil.MockUsage(1, 1))), nil
-		},
-	})
+		}})
 	runner := NewRunner(RunnerOptions{
 		Agent:                       testAgent(tool.Set{}),
 		Model:                       model,
@@ -1172,8 +1185,8 @@ func TestRunner_DoesNotExecuteToolCallFromInterruptedStream(t *testing.T) {
 			return tool.Result{Output: "changed"}, nil
 		}).
 		Build()
-	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		DoStreamFunc: func(ctx context.Context, options *stream.CallOptions) (<-chan stream.Event, error) {
+	model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Stream: func(ctx context.Context, options *stream.CallOptions) (<-chan stream.Event, error) {
 			attempts++
 			if attempts == 1 {
 				return testEventStream(ctx, []stream.Event{
@@ -1195,8 +1208,7 @@ func TestRunner_DoesNotExecuteToolCallFromInterruptedStream(t *testing.T) {
 				t.Error("continuation context has an unanswered interrupted tool call")
 			}
 			return testEventStream(ctx, testutil.MockTextResponse("recovered", testutil.MockUsage(1, 1))), nil
-		},
-	})
+		}})
 	runner := NewRunner(RunnerOptions{
 		Agent:                       testAgent(tool.Set{"change": testTool}),
 		Model:                       model,
@@ -1215,8 +1227,8 @@ func TestRunner_DoesNotExecuteToolCallFromInterruptedStream(t *testing.T) {
 
 func TestRunner_StopsAfterStreamErrorContinuationLimit(t *testing.T) {
 	attempts := 0
-	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		DoStreamFunc: func(ctx context.Context, _ *stream.CallOptions) (<-chan stream.Event, error) {
+	model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Stream: func(ctx context.Context, _ *stream.CallOptions) (<-chan stream.Event, error) {
 			attempts++
 			return testEventStream(ctx, []stream.Event{
 				{Type: stream.EventTextDelta, Data: stream.TextDeltaEvent{Text: "partial"}},
@@ -1224,8 +1236,7 @@ func TestRunner_StopsAfterStreamErrorContinuationLimit(t *testing.T) {
 					Message: "connection reset", IsRetryable: true, IsRetryableSet: true,
 				})}},
 			}), nil
-		},
-	})
+		}})
 	runner := NewRunner(RunnerOptions{
 		Agent:                       testAgent(tool.Set{}),
 		Model:                       model,
@@ -1254,8 +1265,8 @@ func TestRunner_SuccessResetsStreamErrorContinuationLimit(t *testing.T) {
 			return tool.Result{Output: "ok"}, nil
 		}).
 		Build()
-	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		DoStreamFunc: func(ctx context.Context, _ *stream.CallOptions) (<-chan stream.Event, error) {
+	model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Stream: func(ctx context.Context, _ *stream.CallOptions) (<-chan stream.Event, error) {
 			attempts++
 			switch attempts {
 			case 1, 3:
@@ -1272,8 +1283,7 @@ func TestRunner_SuccessResetsStreamErrorContinuationLimit(t *testing.T) {
 			default:
 				return testEventStream(ctx, testutil.MockTextResponse("finished", testutil.MockUsage(1, 1))), nil
 			}
-		},
-	})
+		}})
 	runner := NewRunner(RunnerOptions{
 		Agent:                       testAgent(tool.Set{"echo": echoTool}),
 		Model:                       model,
@@ -1311,15 +1321,14 @@ func TestNewRunner_StreamErrorContinuationsRejectSessionStore(t *testing.T) {
 }
 
 func TestRunner_PreservesReasoningContent(t *testing.T) {
-	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		StreamResponse: []stream.Event{
+	model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: []stream.Event{
 			{Type: stream.EventReasoningStart, Data: stream.ReasoningStartEvent{ID: "reasoning-0"}},
 			{Type: stream.EventReasoningDelta, Data: stream.ReasoningDeltaEvent{ID: "reasoning-0", Text: "considering"}},
 			{Type: stream.EventReasoningEnd, Data: stream.ReasoningEndEvent{ID: "reasoning-0"}},
 			{Type: stream.EventTextDelta, Data: stream.TextDeltaEvent{Text: "answer"}},
 			{Type: stream.EventFinish, Data: stream.FinishEvent{FinishReason: stream.FinishReasonStop, Usage: testutil.MockUsage(1, 2)}},
-		},
-	})
+		}}})
 	runner := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Model: model, Quiet: true})
 	result, err := runner.Run(context.Background(), "hi")
 	if err != nil {
@@ -1338,14 +1347,13 @@ func TestRunner_PreservesReasoningContent(t *testing.T) {
 }
 
 func TestRunner_PreservesReasoningWithEmptyID(t *testing.T) {
-	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		StreamResponse: []stream.Event{
+	model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: []stream.Event{
 			{Type: stream.EventReasoningDelta, Data: stream.ReasoningDeltaEvent{Text: "considering"}},
 			{Type: stream.EventReasoningEnd, Data: stream.ReasoningEndEvent{}},
 			{Type: stream.EventTextDelta, Data: stream.TextDeltaEvent{Text: "answer"}},
 			{Type: stream.EventFinish, Data: stream.FinishEvent{FinishReason: stream.FinishReasonStop, Usage: testutil.MockUsage(1, 2)}},
-		},
-	})
+		}}})
 	runner := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Model: model, Quiet: true})
 	result, err := runner.Run(context.Background(), "hi")
 	if err != nil {
@@ -1364,8 +1372,8 @@ func TestRunner_PreservesReasoningWithEmptyID(t *testing.T) {
 }
 
 func TestRunner_PreservesDistinctReasoningBlocksWithEmptyIDs(t *testing.T) {
-	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		StreamResponse: []stream.Event{
+	model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: []stream.Event{
 			{Type: stream.EventReasoningStart, Data: stream.ReasoningStartEvent{ProviderMetadata: map[string]any{"phase": "first"}}},
 			{Type: stream.EventReasoningDelta, Data: stream.ReasoningDeltaEvent{Text: "one"}},
 			{Type: stream.EventReasoningEnd, Data: stream.ReasoningEndEvent{}},
@@ -1374,8 +1382,7 @@ func TestRunner_PreservesDistinctReasoningBlocksWithEmptyIDs(t *testing.T) {
 			{Type: stream.EventReasoningEnd, Data: stream.ReasoningEndEvent{}},
 			{Type: stream.EventTextDelta, Data: stream.TextDeltaEvent{Text: "answer"}},
 			{Type: stream.EventFinish, Data: stream.FinishEvent{FinishReason: stream.FinishReasonStop, Usage: testutil.MockUsage(1, 2)}},
-		},
-	})
+		}}})
 	runner := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Model: model, Quiet: true})
 	result, err := runner.Run(context.Background(), "hi")
 	if err != nil {
@@ -1397,12 +1404,11 @@ func TestRunner_PreservesDistinctReasoningBlocksWithEmptyIDs(t *testing.T) {
 }
 
 func TestRunner_RunWithInitialMessages_ThenContinue(t *testing.T) {
-	mockModel := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		StreamResponses: [][]stream.Event{
-			testutil.MockTextResponse("response 1", testutil.MockUsage(10, 5)),
-			testutil.MockTextResponse("response 2", testutil.MockUsage(15, 8)),
-		},
-	})
+	mockModel := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Responses: []testutil.MockResponse{
+			{Events: testutil.MockTextResponse("response 1", testutil.MockUsage(10, 5))},
+			{Events: testutil.MockTextResponse("response 2", testutil.MockUsage(15, 8))},
+		}})
 
 	// initialMessages should not include system prompt — runner always prepends its own
 	initialMessages := []goai.Message{
@@ -1473,15 +1479,14 @@ func TestRunner_RunWithInitialMessages_ThenContinue(t *testing.T) {
 // (a fresh Continue), and the returned result must reflect the WHOLE
 // interaction's usage — not just the final nudge segment.
 func TestRunUntilExit_AccumulatesUsageAcrossNudges(t *testing.T) {
-	mockModel := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		StreamResponses: [][]stream.Event{
+	mockModel := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Responses: []testutil.MockResponse{
 			// First run: model produces text but doesn't call exit → nudge.
-			testutil.MockTextResponse("draft done", testutil.MockUsage(10, 5)),
+			{Events: testutil.MockTextResponse("draft done", testutil.MockUsage(10, 5))},
 			// Nudge: model calls exit.
-			testutil.MockToolCallResponse("call_exit", "exit",
-				map[string]string{"status": "success", "message": "done"}, testutil.MockUsage(7, 3)),
-		},
-	})
+			{Events: testutil.MockToolCallResponse("call_exit", "exit",
+				map[string]string{"status": "success", "message": "done"}, testutil.MockUsage(7, 3))},
+		}})
 
 	exitState := &tools.ExitState{}
 	runner := NewRunner(RunnerOptions{
@@ -1515,9 +1520,8 @@ func TestRunUntilExit_AccumulatesUsageAcrossNudges(t *testing.T) {
 }
 
 func TestRunner_RunWithInitialMessages_EmptyPrompt(t *testing.T) {
-	mockModel := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		StreamResponse: testutil.MockTextResponse("resumed!", testutil.MockUsage(10, 5)),
-	})
+	mockModel := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: testutil.MockTextResponse("resumed!", testutil.MockUsage(10, 5))}})
 
 	// initialMessages should not include system prompt — runner always prepends its own
 	initialMessages := []goai.Message{
@@ -1562,9 +1566,8 @@ func TestRunner_SuspensionOnPermissionNeeded(t *testing.T) {
 			return tool.Result{Output: "done"}, nil
 		}).Build()
 
-	mockModel := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		StreamResponse: testutil.MockToolCallResponse("call_1", "perm_tool", map[string]string{}, testutil.MockUsage(10, 5)),
-	})
+	mockModel := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: testutil.MockToolCallResponse("call_1", "perm_tool", map[string]string{}, testutil.MockUsage(10, 5))}})
 
 	runner := NewRunner(RunnerOptions{
 		Agent: testAgent(tool.Set{"perm_tool": permTool}),
@@ -1619,9 +1622,8 @@ func TestRunner_CancelMidTool_PersistsInterruptedStep(t *testing.T) {
 			return tool.Result{}, toolCtx.Err()
 		}).Build()
 
-	mockModel := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		StreamResponse: testutil.MockToolCallResponse("call_1", "slow", map[string]string{}, testutil.MockUsage(10, 5)),
-	})
+	mockModel := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: testutil.MockToolCallResponse("call_1", "slow", map[string]string{}, testutil.MockUsage(10, 5))}})
 
 	store := &testStore{}
 	runner := NewRunner(RunnerOptions{
@@ -1675,12 +1677,11 @@ func TestRunner_CompletedStep_PairsOrphanToolCall(t *testing.T) {
 		t.Fatal("test precondition: noexec tool must have a nil Execute")
 	}
 
-	mockModel := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		StreamResponses: [][]stream.Event{
-			testutil.MockToolCallResponse("call_1", "noexec", map[string]string{}, testutil.MockUsage(10, 5)),
-			testutil.MockTextResponse("all done", testutil.MockUsage(5, 3)),
-		},
-	})
+	mockModel := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Responses: []testutil.MockResponse{
+			{Events: testutil.MockToolCallResponse("call_1", "noexec", map[string]string{}, testutil.MockUsage(10, 5))},
+			{Events: testutil.MockTextResponse("all done", testutil.MockUsage(5, 3))},
+		}})
 
 	store := &testStore{}
 	runner := NewRunner(RunnerOptions{
@@ -1737,9 +1738,8 @@ func TestRunner_CheckpointResumeRoundTrip(t *testing.T) {
 			return tool.Result{Output: "done"}, nil
 		}).Build()
 
-	mockModel1 := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		StreamResponse: testutil.MockToolCallResponse("call_1", "perm_tool", map[string]string{}, testutil.MockUsage(10, 5)),
-	})
+	mockModel1 := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: testutil.MockToolCallResponse("call_1", "perm_tool", map[string]string{}, testutil.MockUsage(10, 5))}})
 
 	runner1 := NewRunner(RunnerOptions{
 		Agent: testAgent(tool.Set{"perm_tool": permTool}),
@@ -1778,9 +1778,8 @@ func TestRunner_CheckpointResumeRoundTrip(t *testing.T) {
 	}
 
 	// Resume with a new runner using the checkpointed messages
-	mockModel2 := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		StreamResponse: testutil.MockTextResponse("resumed and done!", testutil.MockUsage(15, 10)),
-	})
+	mockModel2 := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: testutil.MockTextResponse("resumed and done!", testutil.MockUsage(15, 10))}})
 
 	runner2 := NewRunner(RunnerOptions{
 		Agent:           testAgent(tool.Set{}),
@@ -1823,12 +1822,11 @@ func TestRunner_AllowAllRules_NoSuspension(t *testing.T) {
 			return tool.Result{Output: "done"}, nil
 		}).Build()
 
-	mockModel := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		StreamResponses: [][]stream.Event{
-			testutil.MockToolCallResponse("call_1", "perm_tool", map[string]string{}, testutil.MockUsage(10, 5)),
-			testutil.MockTextResponse("completed!", testutil.MockUsage(5, 3)),
-		},
-	})
+	mockModel := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Responses: []testutil.MockResponse{
+			{Events: testutil.MockToolCallResponse("call_1", "perm_tool", map[string]string{}, testutil.MockUsage(10, 5))},
+			{Events: testutil.MockTextResponse("completed!", testutil.MockUsage(5, 3))},
+		}})
 
 	runner := NewRunner(RunnerOptions{
 		Agent: testAgent(tool.Set{"perm_tool": permTool}),
@@ -1859,12 +1857,11 @@ func TestRunner_StreamEventsOnBus(t *testing.T) {
 			return tool.Result{Output: "echoed"}, nil
 		}).Build()
 
-	mockModel := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		StreamResponses: [][]stream.Event{
-			testutil.MockToolCallResponse("call_1", "echo", map[string]string{}, testutil.MockUsage(10, 5)),
-			testutil.MockTextResponse("done!", testutil.MockUsage(5, 3)),
-		},
-	})
+	mockModel := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Responses: []testutil.MockResponse{
+			{Events: testutil.MockToolCallResponse("call_1", "echo", map[string]string{}, testutil.MockUsage(10, 5))},
+			{Events: testutil.MockTextResponse("done!", testutil.MockUsage(5, 3))},
+		}})
 
 	runner := NewRunner(RunnerOptions{
 		Agent: testAgent(tool.Set{"echo": echoTool}),
@@ -1993,12 +1990,11 @@ func TestRunner_InterruptResumeEquivalence(t *testing.T) {
 		toolSet := tool.Set{"greet": greetTool}
 
 		// === Path A: auto-approve, uninterrupted ===
-		mockA := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-			StreamResponses: [][]stream.Event{
-				testutil.MockToolCallResponse("call_1", "greet", map[string]string{}, testutil.MockUsage(10, 5)),
-				testutil.MockTextResponse("Greeting done!", testutil.MockUsage(15, 8)),
-			},
-		})
+		mockA := newMockModel(t, testutil.MockConfig{ID: "fixture",
+			Responses: []testutil.MockResponse{
+				{Events: testutil.MockToolCallResponse("call_1", "greet", map[string]string{}, testutil.MockUsage(10, 5))},
+				{Events: testutil.MockTextResponse("Greeting done!", testutil.MockUsage(15, 8))},
+			}})
 		runnerA := NewRunner(RunnerOptions{Agent: testAgent(toolSet), Model: mockA, Quiet: true})
 		runnerA.PermissionManager().SetRules(allowAll)
 
@@ -2013,9 +2009,8 @@ func TestRunner_InterruptResumeEquivalence(t *testing.T) {
 		// === Path B: interrupt → serialize → resume ===
 
 		// Phase 1: Run with no rules → suspension
-		mock2a := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-			StreamResponse: testutil.MockToolCallResponse("call_1", "greet", map[string]string{}, testutil.MockUsage(10, 5)),
-		})
+		mock2a := newMockModel(t, testutil.MockConfig{ID: "fixture",
+			Default: &testutil.MockResponse{Events: testutil.MockToolCallResponse("call_1", "greet", map[string]string{}, testutil.MockUsage(10, 5))}})
 		runner2a := NewRunner(RunnerOptions{Agent: testAgent(toolSet), Model: mock2a, Quiet: true})
 
 		result2a, err := runner2a.Run(context.Background(), "greet the world")
@@ -2043,12 +2038,11 @@ func TestRunner_InterruptResumeEquivalence(t *testing.T) {
 		}
 
 		// Phase 3: Resume with allow-all rules
-		mock2b := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-			StreamResponses: [][]stream.Event{
-				testutil.MockToolCallResponse("call_1", "greet", map[string]string{}, testutil.MockUsage(10, 5)),
-				testutil.MockTextResponse("Greeting done!", testutil.MockUsage(15, 8)),
-			},
-		})
+		mock2b := newMockModel(t, testutil.MockConfig{ID: "fixture",
+			Responses: []testutil.MockResponse{
+				{Events: testutil.MockToolCallResponse("call_1", "greet", map[string]string{}, testutil.MockUsage(10, 5))},
+				{Events: testutil.MockTextResponse("Greeting done!", testutil.MockUsage(15, 8))},
+			}})
 		runner2b := NewRunner(RunnerOptions{
 			Agent:           testAgent(toolSet),
 			Model:           mock2b,
@@ -2128,12 +2122,11 @@ func TestRunner_InterruptResumeEquivalence(t *testing.T) {
 		toolSet := tool.Set{"ask_color": askTool}
 
 		// === Path A: pre-loaded answer, uninterrupted ===
-		mockA := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-			StreamResponses: [][]stream.Event{
-				testutil.MockToolCallResponse("call_1", "ask_color", map[string]string{}, testutil.MockUsage(10, 5)),
-				testutil.MockTextResponse("Your color is noted!", testutil.MockUsage(15, 8)),
-			},
-		})
+		mockA := newMockModel(t, testutil.MockConfig{ID: "fixture",
+			Responses: []testutil.MockResponse{
+				{Events: testutil.MockToolCallResponse("call_1", "ask_color", map[string]string{}, testutil.MockUsage(10, 5))},
+				{Events: testutil.MockTextResponse("Your color is noted!", testutil.MockUsage(15, 8))},
+			}})
 		runnerA := NewRunner(RunnerOptions{Agent: testAgent(toolSet), Model: mockA, Quiet: true})
 		runnerA.PermissionManager().SetRules(allowAll)
 		runnerA.QuestionManager().PushAnswers([][]string{{"Blue"}})
@@ -2148,9 +2141,8 @@ func TestRunner_InterruptResumeEquivalence(t *testing.T) {
 
 		// === Path B: no answer → suspension → resume with answer ===
 
-		mock2a := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-			StreamResponse: testutil.MockToolCallResponse("call_1", "ask_color", map[string]string{}, testutil.MockUsage(10, 5)),
-		})
+		mock2a := newMockModel(t, testutil.MockConfig{ID: "fixture",
+			Default: &testutil.MockResponse{Events: testutil.MockToolCallResponse("call_1", "ask_color", map[string]string{}, testutil.MockUsage(10, 5))}})
 		runner2a := NewRunner(RunnerOptions{Agent: testAgent(toolSet), Model: mock2a, Quiet: true})
 		runner2a.PermissionManager().SetRules(allowAll)
 
@@ -2177,12 +2169,11 @@ func TestRunner_InterruptResumeEquivalence(t *testing.T) {
 			t.Fatalf("Path B phase 2: unmarshal error: %v", err)
 		}
 
-		mock2b := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-			StreamResponses: [][]stream.Event{
-				testutil.MockToolCallResponse("call_1", "ask_color", map[string]string{}, testutil.MockUsage(10, 5)),
-				testutil.MockTextResponse("Your color is noted!", testutil.MockUsage(15, 8)),
-			},
-		})
+		mock2b := newMockModel(t, testutil.MockConfig{ID: "fixture",
+			Responses: []testutil.MockResponse{
+				{Events: testutil.MockToolCallResponse("call_1", "ask_color", map[string]string{}, testutil.MockUsage(10, 5))},
+				{Events: testutil.MockTextResponse("Your color is noted!", testutil.MockUsage(15, 8))},
+			}})
 		runner2b := NewRunner(RunnerOptions{
 			Agent:           testAgent(toolSet),
 			Model:           mock2b,
@@ -2272,12 +2263,11 @@ func TestRunner_InterruptResumeEquivalence(t *testing.T) {
 		}
 
 		// === Path A: auto-approve, both tools succeed ===
-		mockA := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-			StreamResponses: [][]stream.Event{
-				multiToolCall(),
-				testutil.MockTextResponse("Both done!", testutil.MockUsage(15, 8)),
-			},
-		})
+		mockA := newMockModel(t, testutil.MockConfig{ID: "fixture",
+			Responses: []testutil.MockResponse{
+				{Events: multiToolCall()},
+				{Events: testutil.MockTextResponse("Both done!", testutil.MockUsage(15, 8))},
+			}})
 		runnerA := NewRunner(RunnerOptions{Agent: testAgent(toolSet), Model: mockA, Quiet: true})
 		runnerA.PermissionManager().SetRules(allowAll)
 
@@ -2291,9 +2281,8 @@ func TestRunner_InterruptResumeEquivalence(t *testing.T) {
 
 		// === Path B: safe_echo succeeds, perm_greet suspends ===
 
-		mock2a := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-			StreamResponse: multiToolCall(),
-		})
+		mock2a := newMockModel(t, testutil.MockConfig{ID: "fixture",
+			Default: &testutil.MockResponse{Events: multiToolCall()}})
 		runner2a := NewRunner(RunnerOptions{Agent: testAgent(toolSet), Model: mock2a, Quiet: true})
 
 		result2a, err := runner2a.Run(context.Background(), "echo and greet")
@@ -2331,12 +2320,11 @@ func TestRunner_InterruptResumeEquivalence(t *testing.T) {
 			t.Fatalf("Path B phase 2: unmarshal error: %v", err)
 		}
 
-		mock2b := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-			StreamResponses: [][]stream.Event{
-				testutil.MockToolCallResponse("call_greet_2", "perm_greet", map[string]string{}, testutil.MockUsage(10, 5)),
-				testutil.MockTextResponse("Both done!", testutil.MockUsage(15, 8)),
-			},
-		})
+		mock2b := newMockModel(t, testutil.MockConfig{ID: "fixture",
+			Responses: []testutil.MockResponse{
+				{Events: testutil.MockToolCallResponse("call_greet_2", "perm_greet", map[string]string{}, testutil.MockUsage(10, 5))},
+				{Events: testutil.MockTextResponse("Both done!", testutil.MockUsage(15, 8))},
+			}})
 		runner2b := NewRunner(RunnerOptions{
 			Agent:           testAgent(toolSet),
 			Model:           mock2b,
@@ -2493,9 +2481,8 @@ func TestRunner_Compact(t *testing.T) {
 		},
 	}
 
-	mockModel := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		StreamResponse: testutil.MockTextResponse("Conversation summary: user asked about topic X.", testutil.MockUsage(800, 40)),
-	})
+	mockModel := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: testutil.MockTextResponse("Conversation summary: user asked about topic X.", testutil.MockUsage(800, 40))}})
 
 	eventBus := bus.New()
 	var automaticEvents []bus.Event
@@ -2559,9 +2546,8 @@ func TestRunner_AutomaticCompactionLifecycle(t *testing.T) {
 	}{
 		{
 			name: "success",
-			model: testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-				StreamResponse: testutil.MockTextResponse("short summary", testutil.MockUsage(100, 10)),
-			}),
+			model: newMockModel(t, testutil.MockConfig{ID: "fixture",
+				Default: &testutil.MockResponse{Events: testutil.MockTextResponse("short summary", testutil.MockUsage(100, 10))}}),
 			store: &testStore{messages: []session.Message{
 				{Role: "user", Content: "question " + strings.Repeat("a", 500)},
 				{Role: "assistant", Content: "answer " + strings.Repeat("b", 500)},
@@ -2569,9 +2555,8 @@ func TestRunner_AutomaticCompactionLifecycle(t *testing.T) {
 		},
 		{
 			name: "failure",
-			model: testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-				StreamResponse: testutil.MockErrorResponse(errors.New("summary failed")),
-			}),
+			model: newMockModel(t, testutil.MockConfig{ID: "fixture",
+				Default: &testutil.MockResponse{Events: testutil.MockErrorResponse(errors.New("summary failed"))}}),
 			store:       &testStore{messages: []session.Message{{Role: "user", Content: "question"}}},
 			wantErr:     true,
 			wantErrText: "summary failed",
@@ -2627,9 +2612,8 @@ func TestRunner_AutomaticCompactionLifecycle(t *testing.T) {
 // TestRunner_Compact_NoStore verifies Compact rejects when no SessionStore
 // is configured — there's nothing to persist to, so the call is incoherent.
 func TestRunner_Compact_NoStore(t *testing.T) {
-	mockModel := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		StreamResponse: testutil.MockTextResponse("unused", testutil.MockUsage(1, 1)),
-	})
+	mockModel := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: testutil.MockTextResponse("unused", testutil.MockUsage(1, 1))}})
 	runner := NewRunner(RunnerOptions{
 		Agent: testAgent(tool.Set{}),
 		Model: mockModel,
@@ -2646,9 +2630,8 @@ func TestRunner_Compact_StoreError(t *testing.T) {
 		messages:   []session.Message{{Role: "user", Content: "request"}},
 		compactErr: compactErr,
 	}
-	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		StreamResponse: testutil.MockTextResponse("summary", testutil.MockUsage(10, 3)),
-	})
+	model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: testutil.MockTextResponse("summary", testutil.MockUsage(10, 3))}})
 	runner := NewRunner(RunnerOptions{
 		Agent:        testAgent(tool.Set{}),
 		Model:        model,
@@ -2688,9 +2671,8 @@ func TestRunner_SuspensionWithStore(t *testing.T) {
 	store := &testStore{}
 
 	// Step 1: Run with store — should suspend.
-	mockModel1 := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		StreamResponse: testutil.MockToolCallResponse("call_1", "perm_tool", map[string]string{"arg": "val"}, testutil.MockUsage(10, 5)),
-	})
+	mockModel1 := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: testutil.MockToolCallResponse("call_1", "perm_tool", map[string]string{"arg": "val"}, testutil.MockUsage(10, 5))}})
 
 	runner1 := NewRunner(RunnerOptions{
 		Agent:        testAgent(tool.Set{"perm_tool": permTool}),
@@ -2746,9 +2728,8 @@ func TestRunner_SuspensionWithStore(t *testing.T) {
 	}})
 
 	// Step 3: Resume with a new runner using the same store.
-	mockModel2 := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		StreamResponse: testutil.MockTextResponse("all done!", testutil.MockUsage(15, 10)),
-	})
+	mockModel2 := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: testutil.MockTextResponse("all done!", testutil.MockUsage(15, 10))}})
 
 	runner2 := NewRunner(RunnerOptions{
 		Agent:        testAgent(tool.Set{"perm_tool": permTool}),
