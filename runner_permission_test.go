@@ -365,9 +365,8 @@ func TestSuspensionContextFromErrorPopulatesToolCallID(t *testing.T) {
 }
 
 func TestRunnerResolvePermissionSuspensionNoStoreRunHistory(t *testing.T) {
-	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		StreamResponse: testutil.MockTextResponse("continued", testutil.MockUsage(1, 1)),
-	})
+	model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: testutil.MockTextResponse("continued", testutil.MockUsage(1, 1))}})
 	call := stream.ToolCall{ID: "call-1", Name: "write", Input: json.RawMessage(`{}`)}
 	runner := NewRunner(RunnerOptions{
 		Agent: testAgent(tool.Set{}),
@@ -386,17 +385,17 @@ func TestRunnerResolvePermissionSuspensionNoStoreRunHistory(t *testing.T) {
 	if len(resolution.Messages) != 1 {
 		t.Fatalf("resolution messages = %d, want 1", len(resolution.Messages))
 	}
-	if len(model.DoStreamCalls) != 0 {
-		t.Fatalf("resolver invoked model %d times", len(model.DoStreamCalls))
+	if len(model.Requests()) != 0 {
+		t.Fatalf("resolver invoked model %d times", len(model.Requests()))
 	}
 	if _, err := runner.Run(context.Background(), ""); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-	if len(model.DoStreamCalls) != 1 {
-		t.Fatalf("model calls = %d, want 1", len(model.DoStreamCalls))
+	if len(model.Requests()) != 1 {
+		t.Fatalf("model calls = %d, want 1", len(model.Requests()))
 	}
 	var found bool
-	for _, msg := range model.DoStreamCalls[0].Messages {
+	for _, msg := range model.Requests()[0].Messages {
 		if msg.Role != "tool" || !msg.Content.IsMultiPart() {
 			continue
 		}

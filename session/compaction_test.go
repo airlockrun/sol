@@ -13,6 +13,15 @@ import (
 	"github.com/airlockrun/goai/testutil"
 )
 
+func newMockModel(t testing.TB, config testutil.MockConfig) *testutil.MockModel {
+	t.Helper()
+	m, err := testutil.NewMockModel(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
 func TestIsOverflow_UnknownBudget(t *testing.T) {
 	s := New("test", "agent", "model", ModelLimits{})
 	s.Tokens.Input = 100_000
@@ -93,9 +102,8 @@ func TestSessionCompact_StreamErrorDoesNotMutateMessages(t *testing.T) {
 			s := New("test", "agent", "model", ModelLimits{})
 			s.Messages = []Message{{Role: "user", Content: "keep this message"}}
 			before := s.GetMessages()
-			model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-				StreamResponse: tt.events,
-			})
+			model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+				Default: &testutil.MockResponse{Events: tt.events}})
 
 			summary, err := s.Compact(context.Background(), model, []goai.Message{
 				goai.NewUserMessage("summarize this"),
@@ -114,9 +122,8 @@ func TestSessionCompact_StreamErrorDoesNotMutateMessages(t *testing.T) {
 }
 
 func TestSessionCompactAndContinue_MessageOrder(t *testing.T) {
-	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{
-		StreamResponse: testutil.MockTextResponse("internal summary", testutil.MockUsage(10, 3)),
-	})
+	model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: testutil.MockTextResponse("internal summary", testutil.MockUsage(10, 3))}})
 	s := New("test", "agent", "model", ModelLimits{})
 	s.Messages = []Message{{Role: "assistant", Content: "state replaced by compaction"}}
 
@@ -278,7 +285,8 @@ func TestPrune_UpdatesEstimateAndReplacement(t *testing.T) {
 }
 
 func TestCompactAndContinue_PreservesMultipartUser(t *testing.T) {
-	model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponse: testutil.MockTextResponse("summary", testutil.MockUsage(10, 2))})
+	model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+		Default: &testutil.MockResponse{Events: testutil.MockTextResponse("summary", testutil.MockUsage(10, 2))}})
 	s := New("test", "agent", "model", ModelLimits{})
 	user := message.NewUserMessageWithParts(goai.TextPart{Text: "look"}, message.FilePart{Data: message.FileDataText{Text: "file text"}, MimeType: "text/plain"})
 	if err := s.CompactAndContinue(context.Background(), model, []goai.Message{user}, nil); err != nil {
@@ -295,10 +303,11 @@ func TestCompactAndContinue_PreservesMultipartUser(t *testing.T) {
 func TestCompact_RejectsIncompleteSummary(t *testing.T) {
 	for _, finish := range []stream.FinishReason{stream.FinishReasonLength, stream.FinishReasonError, stream.FinishReasonToolCalls} {
 		t.Run(string(finish), func(t *testing.T) {
-			model := testutil.NewMockLanguageModel(testutil.MockLanguageModelOptions{StreamResponse: []stream.Event{
-				{Type: stream.EventTextDelta, Data: stream.TextDeltaEvent{Text: "partial"}},
-				{Type: stream.EventFinish, Data: stream.FinishEvent{FinishReason: finish}},
-			}})
+			model := newMockModel(t, testutil.MockConfig{ID: "fixture",
+				Default: &testutil.MockResponse{Events: []stream.Event{
+					{Type: stream.EventTextDelta, Data: stream.TextDeltaEvent{Text: "partial"}},
+					{Type: stream.EventFinish, Data: stream.FinishEvent{FinishReason: finish}},
+				}}})
 			s := New("test", "agent", "model", ModelLimits{})
 			s.Messages = []Message{{Role: "user", Content: "keep"}}
 			if err := s.CompactAndContinue(context.Background(), model, s.ToGoAIMessages(), nil); err == nil {

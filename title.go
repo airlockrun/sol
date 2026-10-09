@@ -2,6 +2,7 @@ package sol
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -20,12 +21,18 @@ type TitleResult struct {
 // GenerateTitleAsync generates a title for the conversation asynchronously.
 // It returns a channel that will receive the result.
 func GenerateTitleAsync(ctx context.Context, userPrompt string, titleModel, apiKey, baseURL string) <-chan TitleResult {
+	p := openai.New(provider.Options{APIKey: apiKey, BaseURL: baseURL})
+	return GenerateTitleWithModelAsync(ctx, userPrompt, p.Model(titleModel))
+}
+
+// GenerateTitleWithModelAsync uses an explicitly supplied model and credentials.
+func GenerateTitleWithModelAsync(ctx context.Context, userPrompt string, model stream.Model) <-chan TitleResult {
 	resultChan := make(chan TitleResult, 1)
 
 	go func() {
 		defer close(resultChan)
 
-		title, err := generateTitle(ctx, userPrompt, titleModel, apiKey, baseURL)
+		title, err := generateTitle(ctx, userPrompt, model)
 		resultChan <- TitleResult{Title: title, Error: err}
 	}()
 
@@ -33,12 +40,10 @@ func GenerateTitleAsync(ctx context.Context, userPrompt string, titleModel, apiK
 }
 
 // generateTitle generates a title synchronously
-func generateTitle(ctx context.Context, userPrompt string, titleModel, apiKey, baseURL string) (string, error) {
-	p := openai.New(provider.Options{
-		APIKey:  apiKey,
-		BaseURL: baseURL,
-	})
-	model := p.Model(titleModel)
+func generateTitle(ctx context.Context, userPrompt string, model stream.Model) (string, error) {
+	if model == nil {
+		return "", errors.New("title model is required")
+	}
 
 	messages := []goai.Message{
 		goai.NewSystemMessage(TitlePrompt()),

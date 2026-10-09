@@ -1,12 +1,16 @@
 module github.com/airlockrun/sol
 
-go 1.26.6
+go 1.26.9
 
-require github.com/airlockrun/goai v0.2.0
+require github.com/airlockrun/goai v0.3.0
 
 require golang.org/x/net v0.58.0
 
 require github.com/coder/websocket v1.8.14
+
+require golang.org/x/sys v0.47.0
+
+require golang.org/x/term v0.45.0
 
 require (
 	github.com/google/jsonschema-go v0.4.3 // indirect
@@ -16,6 +20,5 @@ require (
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	golang.org/x/oauth2 v0.35.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 )
