@@ -79,8 +79,25 @@ type Runner struct {
 	// step loops break with RunExited as soon as ExitState.Called() turns
 	// true. NewRunner also injects the exit tool into r.toolSet when the
 	// caller hasn't pre-registered one.
-	exitState *tools.ExitState
+	exitState    *tools.ExitState
+	boundaryHook SafeBoundaryHook
 }
+
+// SafeBoundary identifies a point where all preceding transcript effects are
+// durably complete and the runner may accept host-persisted input.
+type SafeBoundary string
+
+const (
+	BoundaryBeforeModel SafeBoundary = "before_model"
+	BoundaryAfterStep   SafeBoundary = "after_step"
+	BoundarySuspended   SafeBoundary = "suspended"
+)
+
+// SafeBoundaryHook is called while the runner owns its transcript. Returned
+// messages must already be persisted by the host; Runner adds them only to its
+// in-memory transcript and session. Hooks must not reenter the Runner. Hook
+// failures stop the run and require a fresh Run to reload the durable transcript.
+type SafeBoundaryHook func(context.Context, SafeBoundary) ([]session.Message, error)
 
 // RunnerOptions configures a new runner.
 type RunnerOptions struct {
@@ -166,6 +183,11 @@ type RunnerOptions struct {
 	// Use RunUntilExit if you also want the runner to nudge the model when
 	// it stops without calling exit.
 	ExitState *tools.ExitState
+
+	// SafeBoundaryHook lets a persistent host checkpoint external state and
+	// admit already-persisted input between model/tool effects. Existing
+	// in-memory and ordinary SessionStore consumers leave it nil.
+	SafeBoundaryHook SafeBoundaryHook
 }
 
 // NewRunner creates a new agent runner.
@@ -253,6 +275,7 @@ func NewRunner(opts RunnerOptions) *Runner {
 		permissionMgr:    bus.NewPermissionManager(b),
 		questionMgr:      bus.NewQuestionManager(b),
 		exitState:        opts.ExitState,
+		boundaryHook:     opts.SafeBoundaryHook,
 	}
 
 	return r
@@ -390,10 +413,20 @@ func (r *Runner) Run(ctx context.Context, prompt string) (*RunResult, error) {
 		}
 		r.log("[%s] Step %d...\n", r.agent.Name, step+1)
 
+		if _, err := r.applySafeBoundary(ctx, BoundaryBeforeModel); err != nil {
+			r.stopForSafeBoundaryError(ctx, result, err)
+			return result, err
+		}
 		stepResult, err := r.runStep(ctx)
 		if err != nil {
 			// Check for suspension (permission/question needed)
 			if suspResult, ok := r.handleSuspension(err, stepResult, result); ok {
+				if _, boundaryErr := r.applySafeBoundary(ctx, BoundarySuspended); boundaryErr != nil {
+					r.stopForSafeBoundaryError(ctx, suspResult, boundaryErr)
+					return suspResult, boundaryErr
+				}
+				suspResult.Messages = r.copyMessages()
+				suspResult.NewMessages = r.copyNewMessages()
 				return suspResult, nil
 			}
 			if r.canContinueStreamError(ctx, err) {
@@ -441,6 +474,11 @@ func (r *Runner) Run(ctx context.Context, prompt string) (*RunResult, error) {
 
 		r.streamErrorContinuations = 0
 		r.recordStep(result, stepResult)
+		admitted, boundaryErr := r.applySafeBoundary(ctx, BoundaryAfterStep)
+		if boundaryErr != nil {
+			r.stopForSafeBoundaryError(ctx, result, boundaryErr)
+			return result, boundaryErr
+		}
 
 		// An explicit exit is terminal, even when this step fills the context.
 		if r.exitState != nil && r.exitState.Called() {
@@ -478,7 +516,7 @@ func (r *Runner) Run(ctx context.Context, prompt string) (*RunResult, error) {
 		}
 
 		// Check if we should stop
-		if stepResult.FinishReason != stream.FinishReasonToolCalls {
+		if stepResult.FinishReason != stream.FinishReasonToolCalls && admitted == 0 {
 			result.Status = RunCompleted
 			break
 		}
@@ -777,9 +815,19 @@ func (r *Runner) Continue(ctx context.Context, prompt string) (*RunResult, error
 		}
 		r.log("[%s] Step %d...\n", r.agent.Name, step+1)
 
+		if _, err := r.applySafeBoundary(ctx, BoundaryBeforeModel); err != nil {
+			r.stopForSafeBoundaryError(ctx, result, err)
+			return result, err
+		}
 		stepResult, err := r.runStep(ctx)
 		if err != nil {
 			if suspResult, ok := r.handleSuspension(err, stepResult, result); ok {
+				if _, boundaryErr := r.applySafeBoundary(ctx, BoundarySuspended); boundaryErr != nil {
+					r.stopForSafeBoundaryError(ctx, suspResult, boundaryErr)
+					return suspResult, boundaryErr
+				}
+				suspResult.Messages = r.copyMessages()
+				suspResult.NewMessages = r.copyNewMessages()
 				return suspResult, nil
 			}
 			if r.canContinueStreamError(ctx, err) {
@@ -825,6 +873,11 @@ func (r *Runner) Continue(ctx context.Context, prompt string) (*RunResult, error
 
 		r.streamErrorContinuations = 0
 		r.recordStep(result, stepResult)
+		admitted, boundaryErr := r.applySafeBoundary(ctx, BoundaryAfterStep)
+		if boundaryErr != nil {
+			r.stopForSafeBoundaryError(ctx, result, boundaryErr)
+			return result, boundaryErr
+		}
 
 		if r.exitState != nil && r.exitState.Called() {
 			result.Status = RunExited
@@ -859,7 +912,7 @@ func (r *Runner) Continue(ctx context.Context, prompt string) (*RunResult, error
 			}
 		}
 
-		if stepResult.FinishReason != stream.FinishReasonToolCalls {
+		if stepResult.FinishReason != stream.FinishReasonToolCalls && admitted == 0 {
 			result.Status = RunCompleted
 			break
 		}
@@ -869,6 +922,41 @@ func (r *Runner) Continue(ctx context.Context, prompt string) (*RunResult, error
 	result.NewMessages = r.copyNewMessages()
 	result.CompactionState = r.compactionState
 	return result, nil
+}
+
+func (r *Runner) applySafeBoundary(ctx context.Context, boundary SafeBoundary) (int, error) {
+	if r.boundaryHook == nil {
+		return 0, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, fmt.Errorf("safe boundary %s: %w", boundary, err)
+	}
+	msgs, err := r.boundaryHook(ctx, boundary)
+	if err != nil {
+		return 0, fmt.Errorf("safe boundary %s: %w", boundary, err)
+	}
+	goaiMsgs := session.MessagesToGoAI(msgs)
+	r.messages = append(r.messages, goaiMsgs...)
+	r.newMessages = append(r.newMessages, goaiMsgs...)
+	for _, msg := range msgs {
+		r.session.AddMessage(msg)
+	}
+	if err := ctx.Err(); err != nil {
+		return len(msgs), fmt.Errorf("safe boundary %s: %w", boundary, err)
+	}
+	return len(msgs), nil
+}
+
+func (r *Runner) stopForSafeBoundaryError(ctx context.Context, result *RunResult, err error) {
+	r.canContinue = false
+	result.Status = RunFailed
+	if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+		result.Status = RunCancelled
+	}
+	result.Messages = r.copyMessages()
+	result.NewMessages = r.copyNewMessages()
+	result.CompactionState = r.compactionState
+	result.Error = err
 }
 
 // runStep executes a single step of the thinking loop.
