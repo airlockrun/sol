@@ -17,7 +17,7 @@ import (
 
 func testStore(t *testing.T) *FileStore {
 	t.Helper()
-	s, err := NewFileStore(filepath.Join(t.TempDir(), "sol", "auth.json"))
+	s, err := NewFileStore(filepath.Join(t.TempDir(), "sol", "config.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -26,9 +26,9 @@ func testStore(t *testing.T) *FileStore {
 func seed(t *testing.T, s Store) {
 	t.Helper()
 	_, err := s.Update(t.Context(), func(c *Config) error {
-		c.Providers["openai"] = ProviderAuth{APIKey: &APIKeyCredential{Key: "openai-test"}, OAuth: map[string]OAuthCredential{"codex": {AccessToken: "access", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour), AccountID: "0"}}}
-		c.Providers["anthropic"] = ProviderAuth{APIKey: &APIKeyCredential{Key: "anthropic-test"}}
-		c.DefaultModel = &ModelSelection{Model: "openai/gpt-5.4", Auth: "codex"}
+		c.Providers["work/openai"] = ProviderConfig{Auth: "codex", Credentials: &OAuthCredential{AccessToken: "access", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour), AccountID: "0"}}
+		c.Providers["personal/anthropic"] = ProviderConfig{Auth: APIKeyMode, Key: "anthropic-test"}
+		c.DefaultModel = "work/openai/gpt-5.4"
 		return nil
 	})
 	if err != nil {
@@ -39,7 +39,7 @@ func seed(t *testing.T, s Store) {
 func TestFileStore(t *testing.T) {
 	s := testStore(t)
 	empty, err := s.Load(t.Context())
-	if err != nil || len(empty.Providers) != 0 || empty.DefaultModel != nil {
+	if err != nil || len(empty.Providers) != 0 || empty.DefaultModel != "" {
 		t.Fatal("invalid empty store", err)
 	}
 	seed(t, s)
@@ -55,8 +55,8 @@ func TestFileStore(t *testing.T) {
 	encodedBefore, _ := json.Marshal(before)
 	failure := errors.New("callback failed")
 	_, err = s.Update(t.Context(), func(c *Config) error {
-		c.Providers["openai"].APIKey.Key = "changed"
-		c.DefaultModel.Auth = "api-key"
+		c.Providers["work/openai"].Credentials.AccessToken = "changed"
+		c.DefaultModel = "personal/anthropic/claude"
 		return failure
 	})
 	if !errors.Is(err, failure) {
@@ -88,24 +88,29 @@ func TestFileStoreVersionOne(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(s.path, data, 0600); err != nil {
+	source := filepath.Join(filepath.Dir(s.path), "auth.json")
+	if err := os.WriteFile(source, data, 0600); err != nil {
 		t.Fatal(err)
 	}
 	c, err := s.Load(t.Context())
-	if err != nil || c.Providers["openai"].OAuth["codex"].RefreshToken != "existing-refresh" {
+	if err != nil || c.Providers["codex/openai"].Credentials.RefreshToken != "existing-refresh" {
 		t.Fatal("lost version 1 credential", err)
 	}
 	_, err = s.Update(t.Context(), func(c *Config) error {
-		c.Providers["anthropic"] = ProviderAuth{APIKey: &APIKeyCredential{Key: "new-key"}}
-		c.DefaultModel = &ModelSelection{Model: "anthropic/claude", Auth: APIKeyMode}
+		c.Providers["default/anthropic"] = ProviderConfig{Auth: APIKeyMode, Key: "new-key"}
+		c.DefaultModel = "default/anthropic/claude"
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	c, err = s.Load(t.Context())
-	if err != nil || c.Providers["openai"].OAuth["codex"].RefreshToken != "existing-refresh" || c.DefaultModel.Model != "anthropic/claude" {
+	if err != nil || c.Providers["codex/openai"].Credentials.RefreshToken != "existing-refresh" || c.DefaultModel != "default/anthropic/claude" {
 		t.Fatal("upgrade lost data", err)
+	}
+	preserved, err := os.ReadFile(source)
+	if err != nil || string(preserved) != string(data) {
+		t.Fatal("import changed source")
 	}
 	data, err = os.ReadFile(s.path)
 	if err != nil {
@@ -169,16 +174,16 @@ func TestFileStoreCrossProcess(t *testing.T) {
 		}
 		for range 10 {
 			_, err := s.Update(t.Context(), func(c *Config) error {
-				p := c.Providers["openai"]
-				token := p.OAuth["codex"]
+				p := c.Providers["work/openai"]
+				token := *p.Credentials
 				n, err := strconv.Atoi(token.AccountID)
 				if err != nil {
 					return err
 				}
 				time.Sleep(time.Millisecond)
 				token.AccountID = strconv.Itoa(n + 1)
-				p.OAuth["codex"] = token
-				c.Providers["openai"] = p
+				p.Credentials = &token
+				c.Providers["work/openai"] = p
 				return nil
 			})
 			if err != nil {
@@ -205,7 +210,7 @@ func TestFileStoreCrossProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Providers["openai"].OAuth["codex"].AccountID != "40" || c.Providers["anthropic"].APIKey.Key != "anthropic-test" || c.DefaultModel.Auth != "codex" {
+	if c.Providers["work/openai"].Credentials.AccountID != "40" || c.Providers["personal/anthropic"].Key != "anthropic-test" || c.DefaultModel != "work/openai/gpt-5.4" {
 		t.Fatal("lost cross-process update or unrelated data")
 	}
 }
@@ -218,7 +223,7 @@ func TestFileStoreConcurrentProviderUpdates(t *testing.T) {
 		wg.Go(func() {
 			other, _ := NewFileStore(s.path)
 			_, err := other.Update(t.Context(), func(c *Config) error {
-				c.Providers["provider-"+strconv.Itoa(n)] = ProviderAuth{APIKey: &APIKeyCredential{Key: "test-key"}}
+				c.Providers["account-"+strconv.Itoa(n)+"/openai"] = ProviderConfig{Auth: APIKeyMode, Key: "test-key"}
 				return nil
 			})
 			if err != nil {
@@ -228,7 +233,7 @@ func TestFileStoreConcurrentProviderUpdates(t *testing.T) {
 	}
 	wg.Wait()
 	c, err := s.Load(t.Context())
-	if err != nil || len(c.Providers) != 22 || c.DefaultModel.Auth != "codex" || c.Providers["openai"].OAuth["codex"].RefreshToken != "refresh" {
+	if err != nil || len(c.Providers) != 22 || c.DefaultModel != "work/openai/gpt-5.4" || c.Providers["work/openai"].Credentials.RefreshToken != "refresh" {
 		t.Fatal("lost concurrent providers or default", err)
 	}
 }
@@ -263,7 +268,7 @@ func TestFileStoreRejectsUnsafeFiles(t *testing.T) {
 }
 
 func TestConfigValidation(t *testing.T) {
-	for _, c := range []Config{{}, {Providers: map[string]ProviderAuth{"bad/id": {}}}, {Providers: map[string]ProviderAuth{"openai": {APIKey: &APIKeyCredential{Key: ""}}}}, {Providers: map[string]ProviderAuth{"openai": {OAuth: map[string]OAuthCredential{"codex": {}}}}}, {Providers: map[string]ProviderAuth{}, DefaultModel: &ModelSelection{Model: "gpt-4o", Auth: "api-key"}}} {
+	for _, c := range []Config{{}, {Providers: map[string]ProviderConfig{"bad/id": {}}}, {Providers: map[string]ProviderConfig{"work/openai": {Auth: APIKeyMode, Key: "key", KeyEnv: "KEY"}}}, {Providers: map[string]ProviderConfig{"work/openai": {Auth: "codex", Credentials: &OAuthCredential{}}}}, {Providers: map[string]ProviderConfig{}, DefaultModel: "gpt-4o"}} {
 		if err := c.Validate(); err == nil {
 			t.Fatal("invalid record accepted")
 		}
@@ -274,7 +279,7 @@ func TestFileStoreRejectsOversizedUpdate(t *testing.T) {
 	s := testStore(t)
 	seed(t, s)
 	_, err := s.Update(t.Context(), func(c *Config) error {
-		c.Providers["too-large"] = ProviderAuth{APIKey: &APIKeyCredential{Key: strings.Repeat("x", maxStoreBytes)}}
+		c.Providers["too-large/openai"] = ProviderConfig{Auth: APIKeyMode, Key: strings.Repeat("x", maxStoreBytes)}
 		return nil
 	})
 	if err == nil {
@@ -286,13 +291,27 @@ func TestFileStoreRejectsOversizedUpdate(t *testing.T) {
 	}
 }
 
+func TestFileStoreRejectsOversizedRead(t *testing.T) {
+	s := testStore(t)
+	if _, err := s.Load(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	data := `{"version":3,"providers":{}}` + strings.Repeat(" ", maxStoreBytes)
+	if err := os.WriteFile(s.path, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Load(t.Context()); err == nil {
+		t.Fatal("truncated oversized input accepted")
+	}
+}
+
 func TestFileStoreCanceledConfigurationUpdateIsNotCommitted(t *testing.T) {
 	s := testStore(t)
 	seed(t, s)
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	_, err := s.Update(ctx, func(config *Config) error {
-		config.DefaultModel = &ModelSelection{Model: "anthropic/claude", Auth: APIKeyMode}
+		config.DefaultModel = "personal/anthropic/claude"
 		cancel()
 		return nil
 	})
@@ -300,7 +319,7 @@ func TestFileStoreCanceledConfigurationUpdateIsNotCommitted(t *testing.T) {
 		t.Fatal(err)
 	}
 	config, err := s.Load(t.Context())
-	if err != nil || config.DefaultModel.Model != "openai/gpt-5.4" {
+	if err != nil || config.DefaultModel != "work/openai/gpt-5.4" {
 		t.Fatal("canceled ordinary configuration change was committed", err)
 	}
 }
@@ -311,7 +330,7 @@ func TestFileStoreCommitContextContract(t *testing.T) {
 			s := testStore(t)
 			seed(t, s)
 			_, err := s.UpdateWithCommit(t.Context(), func(config *Config) (context.Context, error) {
-				config.DefaultModel = nil
+				config.DefaultModel = ""
 				switch kind {
 				case "nil":
 					return nil, nil
@@ -327,7 +346,7 @@ func TestFileStoreCommitContextContract(t *testing.T) {
 				t.Fatal("accepted invalid commit context")
 			}
 			config, err := s.Load(t.Context())
-			if err != nil || config.DefaultModel == nil {
+			if err != nil || config.DefaultModel == "" {
 				t.Fatal("invalid commit changed store", err)
 			}
 		})

@@ -6,21 +6,19 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
+	"sort"
 	"time"
 
-	"github.com/airlockrun/goai/stream"
 	"github.com/airlockrun/goai/tool"
 	"github.com/airlockrun/sol"
 	"github.com/airlockrun/sol/auth/codex"
 	"github.com/airlockrun/sol/localconfig"
 	"github.com/airlockrun/sol/provider"
 	"github.com/airlockrun/sol/tools"
-	"github.com/airlockrun/sol/websearch"
 )
 
-func localCodex(store localconfig.Store) (*codex.Client, error) {
-	credentials, err := codex.NewStore(store)
+func localCodex(store localconfig.Store, entry string) (*codex.Client, error) {
+	credentials, err := codex.NewStore(store, entry)
 	if err != nil {
 		return nil, err
 	}
@@ -32,80 +30,80 @@ type deviceClient interface {
 	CompleteDeviceAuth(context.Context, codex.DeviceAuthorization) (codex.Credential, error)
 }
 
-// runAuth receives all dependencies explicitly; tests never resolve local auth.
 func runAuth(ctx context.Context, args []string, output io.Writer, client deviceClient, store localconfig.Store, secret func(context.Context, bool) (string, error)) error {
-	const usage = "usage: sol auth login|status|logout codex; sol auth set-key PROVIDER [--stdin]; sol auth status|remove-key PROVIDER"
-	if len(args) < 2 || !localconfig.ValidID(args[1]) {
+	const usage = "usage: sol auth login ENTRY [--method codex]; sol auth set-key ENTRY [--stdin]; sol auth status [ENTRY]; sol auth logout|remove-key ENTRY"
+	if len(args) == 0 {
 		return errors.New(usage)
 	}
-	if args[0] == "set-key" {
-		if args[1] == "codex" {
-			return errors.New("Codex uses device login; configure OpenAI API keys under openai")
-		}
-		stdin := len(args) == 3 && args[2] == "--stdin"
-		if len(args) != 2 && !stdin {
-			return errors.New(usage)
-		}
-		if secret == nil {
-			return errors.New("API key input is required")
-		}
-		key, err := secret(ctx, stdin)
-		if err != nil {
-			return err
-		}
-		_, err = store.Update(ctx, func(config *localconfig.Config) error {
-			provider := config.Providers[args[1]]
-			provider.APIKey = &localconfig.APIKeyCredential{Key: key}
-			config.Providers[args[1]] = provider
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-		_, err = fmt.Fprintf(output, "API key configured for %s.\n", args[1])
-		return err
-	}
-	if len(args) != 2 {
-		return errors.New(usage)
-	}
-	if args[0] == "remove-key" {
-		if args[1] == "codex" {
-			return errors.New("use sol auth logout codex for device credentials")
-		}
-		_, err := store.Update(ctx, func(config *localconfig.Config) error {
-			provider := config.Providers[args[1]]
-			provider.APIKey = nil
-			if len(provider.OAuth) == 0 {
-				delete(config.Providers, args[1])
-			} else {
-				config.Providers[args[1]] = provider
-			}
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-		_, err = fmt.Fprintf(output, "Local API key removed for %s.\n", args[1])
-		return err
-	}
-	if args[0] == "status" && args[1] != "codex" {
+	if args[0] == "status" && len(args) <= 2 {
 		config, err := store.Load(ctx)
 		if err != nil {
 			return err
 		}
-		present := config.Providers[args[1]].APIKey != nil
-		_, err = fmt.Fprintf(output, "%s: stored API key configured = %t.\n", args[1], present)
-		return err
+		var entries []string
+		if len(args) == 2 {
+			if err := provider.ValidateLocalEntry(args[1]); err != nil {
+				return err
+			}
+			if _, ok := config.Providers[args[1]]; !ok {
+				return errors.New("unknown provider entry")
+			}
+			entries = []string{args[1]}
+		} else {
+			for entry := range config.Providers {
+				entries = append(entries, entry)
+			}
+			sort.Strings(entries)
+		}
+		for _, entry := range entries {
+			p := config.Providers[entry]
+			connected := p.Key != "" || p.KeyEnv != "" || p.Credentials != nil
+			if _, err := fmt.Fprintf(output, "%s: auth=%s configured=%t", entry, p.Auth, connected); err != nil {
+				return err
+			}
+			if p.Credentials != nil {
+				if _, err := fmt.Fprintf(output, " expires=%s", p.Credentials.ExpiresAt.Format(time.RFC3339)); err != nil {
+					return err
+				}
+			}
+			if _, err := fmt.Fprintln(output); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
-	if args[1] != "codex" {
+	if len(args) < 2 {
 		return errors.New(usage)
 	}
-	credentials, err := codex.NewStore(store)
-	if err != nil {
+	entry := args[1]
+	if err := provider.ValidateLocalEntry(entry); err != nil {
 		return err
 	}
 	switch args[0] {
 	case "login":
+		method := ""
+		if len(args) == 4 && args[2] == "--method" && args[3] == "codex" {
+			method = "codex"
+		} else if len(args) != 2 {
+			return errors.New(usage)
+		}
+		config, err := store.Load(ctx)
+		if err != nil {
+			return err
+		}
+		if method == "" {
+			method = config.Providers[entry].Auth
+		}
+		_, id, _ := localconfig.ParseEntry(entry)
+		if method != "codex" || id != "openai" {
+			return errors.New("login requires an openai entry with --method codex or configured codex auth")
+		}
+		if client == nil {
+			client, err = localCodex(store, entry)
+			if err != nil {
+				return err
+			}
+		}
 		ctx, cancel := context.WithTimeout(ctx, codex.LoginTimeout)
 		defer cancel()
 		device, err := client.StartDeviceAuth(ctx)
@@ -119,76 +117,71 @@ func runAuth(ctx context.Context, args []string, output io.Writer, client device
 		if err != nil {
 			return err
 		}
-		if _, err := credentials.Update(ctx, func(*codex.Credential) (*codex.Credential, error) { return &credential, nil }); err != nil {
-			return err
-		}
-		_, err = fmt.Fprintln(output, "Logged in to Codex.")
-		return err
-	case "status":
-		credential, err := credentials.Load(ctx)
+		credentials, err := codex.NewStore(store, entry)
 		if err != nil {
 			return err
 		}
-		_, err = fmt.Fprintf(output, "Codex credential present; access expires %s.\n", credential.ExpiresAt.Format(time.RFC3339))
-		return err
-	case "logout":
-		if _, err := credentials.Update(ctx, func(*codex.Credential) (*codex.Credential, error) { return nil, nil }); err != nil {
+		if _, err := credentials.Update(ctx, func(*codex.Credential) (*codex.Credential, error) { return &credential, nil }); err != nil {
 			return err
 		}
-		_, err := fmt.Fprintln(output, "Local Codex credentials removed.")
+		_, err = fmt.Fprintf(output, "Connected %s using codex. Use %s/MODEL.\n", entry, entry)
+		return err
+	case "set-key", "remove-key", "logout":
+		stdin := len(args) == 3 && args[2] == "--stdin" && args[0] == "set-key"
+		if len(args) != 2 && !stdin {
+			return errors.New(usage)
+		}
+		var key string
+		if args[0] == "set-key" {
+			if secret == nil {
+				return errors.New("API key input is required")
+			}
+			var err error
+			key, err = secret(ctx, stdin)
+			if err != nil {
+				return err
+			}
+			if key == "" {
+				return errors.New("API key must not be empty")
+			}
+		}
+		locker, ok := store.(localconfig.EntryLocker)
+		if !ok {
+			return errors.New("account-locking store is required")
+		}
+		unlock, err := locker.LockEntry(ctx, entry)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+		_, err = store.Update(ctx, func(config *localconfig.Config) error {
+			if args[0] == "set-key" {
+				config.Providers[entry] = localconfig.ProviderConfig{Auth: localconfig.APIKeyMode, Key: key, BaseURL: config.Providers[entry].BaseURL}
+				return nil
+			}
+			p, exists := config.Providers[entry]
+			if !exists {
+				return errors.New("unknown provider entry")
+			}
+			if args[0] == "remove-key" && p.Auth != localconfig.APIKeyMode {
+				return errors.New("remove-key requires an api-key entry")
+			}
+			p.Key, p.KeyEnv, p.Credentials = "", "", nil
+			config.Providers[entry] = p
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(output, "Local credentials updated for %s.\n", entry)
 		return err
 	default:
 		return errors.New(usage)
 	}
 }
-
-func validateAuthMode(auth, providerID, modelID, proxyURL, baseURL string, selectedModel bool) error {
-	switch auth {
-	case "api-key":
-		return nil
-	case "codex":
-		if providerID != "openai" || modelID == "" || !selectedModel {
-			return errors.New("Codex requires an explicit or configured openai/<Codex-supported model>")
-		}
-		if proxyURL != "" {
-			return errors.New("-auth codex requires direct local mode; unset AIRLOCK_API_URL")
-		}
-		if baseURL != "" {
-			return errors.New("-auth codex uses its dedicated backend; unset OPENAI_BASE_URL")
-		}
-		return nil
-	default:
-		return errors.New("-auth must be api-key or codex")
-	}
-}
-
-func codexModels(modelID, titleID string, explicitTitle bool, opts provider.CodexOptions) (stream.Model, stream.Model, error) {
-	model, err := provider.NewCodexModel(modelID, opts)
-	if err != nil {
-		return nil, nil, err
-	}
-	if !explicitTitle {
-		return model, model, nil
-	}
-	providerID, titleID := provider.ParseModel(titleID)
-	if providerID != "openai" {
-		return nil, nil, errors.New("Codex title model must use openai")
-	}
-	title, err := provider.NewCodexModel(titleID, opts)
-	return model, title, err
-}
-
-func resolveSearch(auth, providerID, apiKey string, config localconfig.Config) (tool.Tool, bool) {
+func resolveSearch(auth, providerID, apiKey string) (tool.Tool, bool) {
 	if auth != "codex" && apiKey != "" && provider.SearchBackend(providerID) != "" {
 		return tools.WebSearch(providerID, apiKey)
-	}
-	// Codex device tokens never reach API-key search backends. Independent search
-	// providers honor the same explicit environment-over-store precedence.
-	for _, id := range []string{"brave", "perplexity"} {
-		key, err := provider.ResolveLocalAPIKey(config, id, os.LookupEnv)
-		if err == nil {
-			return websearch.NewTool(websearch.NewClient(websearch.Options{Provider: id, APIKey: key})), true
-		}
 	}
 	return tool.Tool{}, false
 }

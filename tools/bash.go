@@ -443,6 +443,7 @@ Important:
 			defer cancel()
 
 			cmd := exec.CommandContext(execCtx, "bash", "-c", args.Command)
+			cmd.Env = processEnvironment(ctx)
 			cmd.Dir = effectiveWorkDir
 			// Run the command in its own process group and SIGKILL the
 			// whole group when execCtx fires, so descendants (a hung

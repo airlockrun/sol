@@ -27,34 +27,73 @@ Requires Go 1.26+.
 
 ```bash
 sol "summarize the contents of README.md"
-sol -model gpt-4o -agent plan "outline a migration to postgres 17"
-echo '{"task": "...", "context": "..."}' | sol < stdin > result.json
+sol -model personal/openai/gpt-4o -agent plan "outline a migration to postgres 17"
+sol "Summarize README.md" > summary.txt
 ```
 
 Flags:
 
-- `-model` — explicit model override; otherwise the saved default or `openai/gpt-4o`
-- `-auth` — `api-key` or `codex`; a saved default keeps its model/auth pair together
-- `-agent` — agent type: `build`, `plan`, `explore`, `general` (default `build`)
-- `-session` — session ID for prompt caching (default: auto-generated)
+- `-model` — explicit `slug/provider/model` reference; otherwise the saved default
+- `-agent` — override the session/configured agent: `build`, `plan`, `explore`, `general`
+- `-session` — existing durable session ID; overrides `SOL_SESSION`
+- `-verbose` — tool progress on stderr
 
-Output is structured for downstream tools (jq, etc.).
+Requests are noninteractive batch executions: assistant text goes to stdout,
+errors and newly created session IDs to stderr. Permissions are auto-approved and
+questions use the runner's automatic answers. No title-generation request runs.
+
+### Default agent and local sessions
+
+```bash
+sol config agent plan
+sol config agent                         # read the default
+export SOL_SESSION="$(sol session new)"  # create/select this terminal's session
+sol 'Inspect the project'
+sol 'Continue with the implementation'   # resume the same history
+sol session compact "$SOL_SESSION"       # summarize model context without running tools
+sol session show "$SOL_SESSION"          # JSON record including full history
+sol session list
+sol -session OTHER_ID 'Continue that session'
+export SOL_SESSION=OTHER_ID              # switch this shell's selection
+sol config agent --clear                 # default to build
+```
+
+Each shell selects its own ID explicitly. No global current-session file, terminal
+guessing, or interactive picker is involved. With no selector, each request creates
+a new session. Unknown IDs and empty `SOL_SESSION` fail. New sessions use the saved
+`defaultAgent` (otherwise `build`); existing sessions retain their agent/model unless
+overridden with flags. Execute from the session's original working directory.
+
+Private session records live under `$XDG_STATE_HOME/sol/sessions`, or
+`~/.local/state/sol/sessions`. Atomic snapshots retain the full transcript separately
+from the compacted model context. One cross-process lease protects an entire turn;
+a concurrent writer to the same session fails busy while unrelated sessions run
+independently. Interrupted turns retain an explicit unknown-effect marker for the
+next requested turn; commands are not automatically replayed.
+
+`SOL_DEPTH` guards nested model executions. An outer Sol passes `SOL_DEPTH=1` to
+launched programs, allowing one child Sol. That child passes `SOL_DEPTH=2`, which
+blocks further Sol inference before configuration or model access. Help, version
+and session inspection require no inference. Inherited `SOL_SESSION` is removed
+from launched programs so a child starts independently; a shell command can select
+a different child session explicitly. This is an operational recursion guard,
+not a sandbox against programs deliberately replacing environment variables.
 
 ### Local configuration and provider API keys
 
-Sol stores typed provider API keys, named OAuth credentials, and the default
-model/auth pair in one shared user configuration file:
-`filepath.Join(os.UserConfigDir(), "sol", "auth.json")`. On Linux this is
-`$XDG_CONFIG_HOME/sol/auth.json`, or `~/.config/sol/auth.json` when
+Sol stores named provider accounts, inline credentials, and the default model
+reference in one private user configuration file:
+`filepath.Join(os.UserConfigDir(), "sol", "config.json")`. On Linux this is
+`$XDG_CONFIG_HOME/sol/config.json`, or `~/.config/sol/config.json` when
 `XDG_CONFIG_HOME` is unset. The CLI does not discover credentials in project
 `.sol` directories or load project `.env` files.
 
 ```bash
-sol auth set-key openai                         # hidden terminal prompt
-secret-manager-command | sol auth set-key anthropic --stdin
-sol auth status openai                          # presence only, never the key
-sol auth remove-key openai
-sol config model openai/gpt-4o-mini              # save API-key model/auth pair
+sol auth set-key personal/openai                # hidden terminal prompt
+secret-manager-command | sol auth set-key work/anthropic --stdin
+sol auth status personal/openai                 # presence only, never the key
+sol auth remove-key personal/openai
+sol config model personal/openai/gpt-4o-mini     # save explicit account/model
 sol config model                               # read the selected default
 sol "Summarize README.md"                       # use that default
 sol config model --clear
@@ -67,54 +106,84 @@ entry. Ctrl-C cancels the hidden prompt and restores terminal state. Secret
 command-line arguments are rejected. Status and configuration commands do not
 print credentials.
 
-For API-key requests, an explicitly present process environment variable (for
-example `OPENAI_API_KEY`) overrides the stored key. An explicitly empty variable
-disables the stored key for that invocation and produces an error. An unset
-variable allows the stored provider key. The environment key does not change the
-selected auth mode; a Codex selection still uses device credentials.
+The private schema is:
 
-Model/auth selection is explicit:
+```json
+{
+  "version": 3,
+  "providers": {
+    "personal/openai": {"auth": "api-key", "key": "YOUR_API_KEY"},
+    "work/openai": {
+      "auth": "codex",
+      "credentials": {
+        "access_token": "ACCESS_TOKEN",
+        "refresh_token": "REFRESH_TOKEN",
+        "expires_at": "2026-10-10T12:00:00Z",
+        "account_id": "ACCOUNT_ID"
+      }
+    }
+  },
+  "defaultModel": "personal/openai/gpt-5.4",
+  "defaultAgent": "plan"
+}
+```
 
-- With neither `-model` nor `-auth`, the CLI uses the complete saved default pair.
-  Without a saved default it uses `openai/gpt-4o` with API-key auth.
-- `-model` selects API-key auth unless `-auth` is supplied as well, even when the
-  saved default uses Codex.
-- `-auth` overrides the auth method for the saved model. Selecting Codex requires
-  either an explicit model or a deliberately configured default model.
-- Login, refresh, key changes, and logout do not change the default selection.
-  A logged-out Codex default reports a missing credential instead of switching
-  silently to API-key auth.
+Entry names are case-sensitive `slug/provider` pairs. Slugs match
+`[A-Za-z0-9][A-Za-z0-9._-]*`; provider IDs must be canonical Sol catalog IDs,
+not aliases. Model references split at the first two slashes and retain the full
+model suffix, for example `work/huggingface/org/model`. Each entry has one method:
+`api-key`, or `codex` for OpenAI. Multiple entries can use the same provider and
+method with independent credentials.
 
-The shared file has a versioned typed schema with independent API-key and named
-OAuth records for each provider. All updates use locked read-modify-write and
-preserve other providers and defaults. Sol uses a private directory and file
-(`0700`/`0600` on Unix, current-user protected ACLs on Windows), atomic replacement,
-and a separate stable `auth.json.lock` file. Keep that lock file in place while Sol
-uses the store. Use local storage with working advisory locks and atomic
-replacement. Version 1 Codex-only records are readable; a changed update writes
-the complete version 2 shared record without losing the credential. Unsupported
-versions or fields fail rather than being silently discarded.
+API-key entries contain exactly one of `key` or explicit `keyEnv` when connected.
+For example `{"auth":"api-key","keyEnv":"WORK_OPENAI_KEY"}` reads only that
+variable; missing/empty values fail. Global provider environment variables never
+override inline keys or create accounts. Optional account `baseURL` selects an
+API-key endpoint. Disconnected entries retain their method with no credentials.
 
-The provider-neutral `github.com/airlockrun/sol/localconfig` package exposes
-`DefaultPath`, `NewFileStore`, `Store.Load`, and `Store.Update`. `Config.Providers`
-contains `ProviderAuth` records (`APIKey` and a map of named `OAuth` credentials),
-and `Config.DefaultModel` contains a `ModelSelection` (`Model`, `Auth`). Update
-callbacks receive a fresh configuration while holding the cross-process lock;
-they must not reenter the store. Callers pass an explicit absolute path in a
-Sol-owned directory; the containing directory is made private. Constructors do
-not read configuration or credentials.
+`-model` overrides the saved reference, including its account. Without an explicit
+reference or `defaultModel`, startup fails with configuration instructions. Missing
+accounts and disconnected accounts fail without choosing another account, method,
+or environment key. Login, refresh and logout preserve the default reference.
+`sol config model --clear` clears it. `-auth` is not a model-selection flag.
+
+Sol uses private files/directories (`0600`/`0700` on Unix and protected current-user
+ACLs on Windows), fsync and atomic replacement. `config.json.lock` serializes short
+read-modify-write transactions. Hashed per-entry lock files serialize credential
+operations across processes while unrelated accounts can refresh concurrently.
+Keep lock files in place while processes use the store. Unsupported fields,
+versions and corrupt records fail without overwriting data. CLI status/default
+output contains no keys or tokens.
+
+`localconfig` exposes `ProviderConfig`, `ModelRef`, `ParseModelRef`, `DefaultPath`,
+`NewFileStore`, `Load`, `Update`, and `LockEntry`. Store callbacks must not reenter
+the store. Acquire entry locks before configuration updates. Constructors perform
+no credential discovery. Hosted Airlock model bindings use their own records and
+do not read this private configuration.
+
+### Configuration import
+
+When `config.json` is absent, recognized version-1/version-2 `auth.json` records
+are automatically imported. Provider API keys become `default/PROVIDER` entries;
+OpenAI Codex tokens become `codex/openai`. A saved model/auth pair maps to that
+entry's full reference. No saved default means no default is invented. Unsupported
+methods, corrupt records, and dangling defaults abort the import. The source file
+is preserved as an inactive backup; `config.json` is the sole active configuration.
+When `config.json` exists, `auth.json` is not read or reimported, including after
+logout. Remove the inactive backup manually when it is no longer needed.
 
 ### Local Codex device authentication
 
 Use a ChatGPT account with access to the selected Codex model:
 
 ```bash
-sol auth login codex
-sol auth status codex
-sol -auth codex -model openai/gpt-5.4 -agent plan "Summarize README.md"
-sol config model --auth codex openai/gpt-5.4      # deliberately save Codex default
-sol -agent plan "Summarize README.md"            # use saved Codex model/auth pair
-sol auth logout codex
+sol auth login work/openai --method codex
+sol auth login personal/openai --method codex    # independent account session
+sol auth status work/openai
+sol -model work/openai/gpt-5.4 -agent plan "Summarize README.md"
+sol config model work/openai/gpt-5.4
+sol -agent plan "Summarize README.md"
+sol auth logout work/openai
 ```
 
 Login prints `https://auth.openai.com/codex/device` and a code to enter there.
@@ -124,28 +193,25 @@ bounded to thirty seconds. Status displays the access-token expiration without
 printing tokens; it does not refresh or verify the remote account. Logout removes
 the local credential only.
 
-Codex occupies the named `openai/codex` OAuth record in the shared local store.
-An OpenAI API key can coexist with it. The shared lock serializes refresh-token
-rotation across processes, including title requests and subagents.
+Codex is a method attached to each named OpenAI entry. Each login persists only
+that entry's tokens after success. Configured Codex entries support
+`sol auth login ENTRY` without repeating the method. Per-entry locks serialize
+refresh-token rotation across processes, including concurrent runs and subagents.
 Refresh starts when access expires within one minute; successful refresh is
 persisted before a model request is sent. Auth failures are reported to the caller;
 run login again if the account requires reauthorization. Keep the lock file in
 place while Sol processes use this store.
 
-Codex is selected by `-auth codex` or a deliberately saved Codex default; a login
-alone does not change API-key requests. It uses an `openai/<model>`, does not require
+Codex is selected by referencing a configured Codex entry; a login
+alone does not change another entry's requests. It does not require
 `OPENAI_API_KEY`, and uses the dedicated ChatGPT Codex Responses backend.
 `AIRLOCK_API_URL` and `OPENAI_BASE_URL` must be unset for this mode. Model
 availability depends on the account's Codex entitlements; an ordinary OpenAI
 catalog entry does not establish subscription access.
 
-Titles use the selected main model by default. `-title-model openai/gpt-5.4-mini`
-selects another account-supported model; `-notitle` disables titles. With Codex,
-`-search` requires a separate Brave or Perplexity API key, configured through
-`sol auth set-key brave|perplexity` or `BRAVE_API_KEY`/`PERPLEXITY_API_KEY` with the
-same environment precedence. Device credentials are never passed to an ordinary
-OpenAI search client. API-key title overrides resolve the title provider's own
-key instead of reusing a different provider's credential.
+With Codex, `-search -search-provider personal/brave` selects an independent API-key entry,
+configured with `sol auth set-key personal/brave`. Device credentials never reach
+API-key search backends. Session titles are deterministic excerpts of the first request.
 
 ### Explicit Codex models for library and local SDK tests
 
@@ -154,8 +220,7 @@ resolver without constructing a provider or credential source:
 
 ```go
 model, limits, err := provider.ResolveLocalModel(ctx, provider.LocalModelOptions{
-    Model: "openai/gpt-5.4",
-    Auth: provider.CodexMode, // Or localconfig.APIKeyMode.
+    Model: "work/openai/gpt-5.4",
     HTTPClient: http.DefaultClient,
     UserAgent: "my-local-test/1",
     SessionID: "explicit-test-session",
@@ -167,8 +232,8 @@ if err != nil {
 ```
 
 `ResolveLocalModel` returns `(stream.Model, session.ModelLimits, error)`.
-`Model` must be an explicit canonical `provider/model` and `Auth` must be explicit
-`api-key` or `codex`. The resolver does not select application model slots or the
+`Model` must be an explicit canonical `slug/provider/model` reference to a
+configured account. The resolver does not select application model slots or the
 saved default. Mock models are injected separately; ordinary deterministic tests
 do not call this resolver. Invalid selections fail before credential discovery.
 No CLI local-run command is involved.
@@ -176,9 +241,8 @@ No CLI local-run command is involved.
 The resolver loads the OS user store only when explicitly called. Supply `Store`
 or an absolute `ConfigPath` to select a test store instead; providing both is an
 error. `LookupEnv` defaults to process environment lookup during resolution and
-can be replaced for deterministic tests. API-key precedence matches the CLI,
-including explicitly empty environment variables disabling stored keys. Codex
-ignores API-key environment variables and requires an existing device login; the
+can be replaced for deterministic tests. Only explicit account `keyEnv` values
+use that lookup. Codex requires that entry's existing device login; the
 resolver never starts browser/device login. Expired Codex access is refreshed
 with durable serialization when the resolved model sends its first request.
 
@@ -203,7 +267,7 @@ shared, err := localconfig.NewFileStore(absoluteConfigPath)
 if err != nil {
     return err
 }
-store, err := codex.NewStore(shared)
+store, err := codex.NewStore(shared, "work/openai")
 if err != nil {
     return err
 }

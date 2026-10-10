@@ -27,13 +27,13 @@ func (c *authTestClient) CompleteDeviceAuth(context.Context, codex.DeviceAuthori
 }
 
 func TestRunAuth(t *testing.T) {
-	store, err := localconfig.NewFileStore(filepath.Join(t.TempDir(), "sol", "auth.json"))
+	store, err := localconfig.NewFileStore(filepath.Join(t.TempDir(), "sol", "config.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	client := &authTestClient{}
 	var output bytes.Buffer
-	if err := runAuth(t.Context(), []string{"login", "codex"}, &output, client, store, nil); err != nil {
+	if err := runAuth(t.Context(), []string{"login", "work/openai", "--method", "codex"}, &output, client, store, nil); err != nil {
 		t.Fatal(err)
 	}
 	if !client.deadline || !strings.Contains(output.String(), "CODE") {
@@ -43,26 +43,26 @@ func TestRunAuth(t *testing.T) {
 		t.Fatal("tokens displayed")
 	}
 	output.Reset()
-	if err := runAuth(t.Context(), []string{"status", "codex"}, &output, client, store, nil); err != nil {
+	if err := runAuth(t.Context(), []string{"status", "work/openai"}, &output, client, store, nil); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(output.String(), "secret") {
 		t.Fatal("status leaked tokens")
 	}
 	output.Reset()
-	if err := runAuth(t.Context(), []string{"logout", "codex"}, &output, client, store, nil); err != nil {
+	if err := runAuth(t.Context(), []string{"logout", "work/openai"}, &output, client, store, nil); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(output.String(), "Local") {
 		t.Fatal("logout claims wrong scope")
 	}
-	if err := runAuth(t.Context(), []string{"status", "codex"}, &output, client, store, nil); !errors.Is(err, codex.ErrNotLoggedIn) {
+	if err := runAuth(t.Context(), []string{"status", "work/openai"}, &output, client, store, nil); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestRunAuthFailures(t *testing.T) {
-	store, err := localconfig.NewFileStore(filepath.Join(t.TempDir(), "sol", "auth.json"))
+	store, err := localconfig.NewFileStore(filepath.Join(t.TempDir(), "sol", "config.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,28 +72,29 @@ func TestRunAuthFailures(t *testing.T) {
 		}
 	}
 	failure := errors.New("login failed")
-	if err := runAuth(t.Context(), []string{"login", "codex"}, &bytes.Buffer{}, &authTestClient{fail: failure}, store, nil); !errors.Is(err, failure) {
+	if err := runAuth(t.Context(), []string{"login", "work/openai", "--method", "codex"}, &bytes.Buffer{}, &authTestClient{fail: failure}, store, nil); !errors.Is(err, failure) {
 		t.Fatal(err)
 	}
-	credentials, _ := codex.NewStore(store)
+	credentials, _ := codex.NewStore(store, "work/openai")
 	if _, err := credentials.Load(t.Context()); !errors.Is(err, codex.ErrNotLoggedIn) {
 		t.Fatal("failed login persisted", err)
 	}
 }
 
 func TestProviderAPIKeyCommands(t *testing.T) {
-	store, err := localconfig.NewFileStore(filepath.Join(t.TempDir(), "sol", "auth.json"))
+	store, err := localconfig.NewFileStore(filepath.Join(t.TempDir(), "sol", "config.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, err = store.Update(t.Context(), func(config *localconfig.Config) error {
-		config.DefaultModel = &localconfig.ModelSelection{Model: "openai/gpt-5.4", Auth: "codex"}
+		config.Providers["work/openai"] = localconfig.ProviderConfig{Auth: "codex"}
+		config.DefaultModel = "work/openai/gpt-5.4"
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	credentials, _ := codex.NewStore(store)
+	credentials, _ := codex.NewStore(store, "work/openai")
 	_, err = credentials.Update(t.Context(), func(*codex.Credential) (*codex.Credential, error) {
 		return &codex.Credential{AccessToken: "oauth-secret", RefreshToken: "refresh-secret", ExpiresAt: time.Now().Add(time.Hour)}, nil
 	})
@@ -101,7 +102,7 @@ func TestProviderAPIKeyCommands(t *testing.T) {
 		t.Fatal(err)
 	}
 	var output bytes.Buffer
-	for _, id := range []string{"openai", "anthropic"} {
+	for _, id := range []string{"personal/openai", "personal/anthropic"} {
 		secret := func(context.Context, bool) (string, error) { return "key-secret", nil }
 		if err := runAuth(t.Context(), []string{"set-key", id, "--stdin"}, &output, nil, store, secret); err != nil {
 			t.Fatal(err)
@@ -110,24 +111,24 @@ func TestProviderAPIKeyCommands(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := runAuth(t.Context(), []string{"remove-key", "openai"}, &output, nil, store, nil); err != nil {
+	if err := runAuth(t.Context(), []string{"remove-key", "personal/openai"}, &output, nil, store, nil); err != nil {
 		t.Fatal(err)
 	}
 	config, err := store.Load(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if config.Providers["openai"].APIKey != nil || config.Providers["anthropic"].APIKey == nil || config.Providers["openai"].OAuth["codex"].AccessToken != "oauth-secret" || config.DefaultModel.Auth != "codex" {
+	if config.Providers["personal/openai"].Key != "" || config.Providers["personal/anthropic"].Key == "" || config.Providers["work/openai"].Credentials.AccessToken != "oauth-secret" || config.DefaultModel != "work/openai/gpt-5.4" {
 		t.Fatal("key commands changed unrelated settings")
 	}
-	if err := runAuth(t.Context(), []string{"logout", "codex"}, &output, nil, store, nil); err != nil {
+	if err := runAuth(t.Context(), []string{"logout", "work/openai"}, &output, nil, store, nil); err != nil {
 		t.Fatal(err)
 	}
 	config, err = store.Load(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if config.Providers["anthropic"].APIKey == nil || config.DefaultModel.Auth != "codex" {
+	if config.Providers["personal/anthropic"].Key == "" || config.DefaultModel != "work/openai/gpt-5.4" {
 		t.Fatal("logout lost other configuration")
 	}
 	if strings.Contains(output.String(), "secret") {
@@ -136,11 +137,11 @@ func TestProviderAPIKeyCommands(t *testing.T) {
 }
 
 func TestAPIKeyArgumentsDoNotAcceptSecrets(t *testing.T) {
-	store, err := localconfig.NewFileStore(filepath.Join(t.TempDir(), "sol", "auth.json"))
+	store, err := localconfig.NewFileStore(filepath.Join(t.TempDir(), "sol", "config.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, args := range [][]string{{"set-key", "openai", "argument-secret"}, {"set-key", "openai", "--stdin", "argument-secret"}, {"set-key", "codex"}, {"remove-key", "codex"}} {
+	for _, args := range [][]string{{"set-key", "work/openai", "argument-secret"}, {"set-key", "work/openai", "--stdin", "argument-secret"}, {"set-key", "codex"}, {"remove-key", "codex"}} {
 		var output bytes.Buffer
 		err := runAuth(t.Context(), args, &output, nil, store, func(context.Context, bool) (string, error) { t.Fatal("invalid command read a secret"); return "", nil })
 		if err == nil || strings.Contains(err.Error()+output.String(), "argument-secret") {

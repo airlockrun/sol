@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -28,11 +30,11 @@ func testClient(t *testing.T, server *httptest.Server, store Store) *Client {
 }
 func testStore(t *testing.T) *CredentialStore {
 	t.Helper()
-	shared, err := localconfig.NewFileStore(filepath.Join(t.TempDir(), "sol", "auth.json"))
+	shared, err := localconfig.NewFileStore(filepath.Join(t.TempDir(), "sol", "config.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := NewStore(shared)
+	s, err := NewStore(shared, "work/openai")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +192,7 @@ func TestClientRefreshSerializesStores(t *testing.T) {
 	var wg sync.WaitGroup
 	for range 12 {
 		wg.Go(func() {
-			independent, _ := NewStore(store.store)
+			independent, _ := NewStore(store.store, "work/openai")
 			access, err := testClient(t, server, independent).Access(t.Context())
 			if err != nil {
 				t.Error(err)
@@ -359,13 +361,14 @@ func (s *cancelBeforeCommitStore) UpdateWithCommit(ctx context.Context, change f
 }
 
 func TestClientCommitsAcceptedRefreshAfterCancellation(t *testing.T) {
-	shared, err := localconfig.NewFileStore(filepath.Join(t.TempDir(), "sol", "auth.json"))
+	shared, err := localconfig.NewFileStore(filepath.Join(t.TempDir(), "sol", "config.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, err = shared.Update(t.Context(), func(config *localconfig.Config) error {
-		config.Providers["openai"] = localconfig.ProviderAuth{APIKey: &localconfig.APIKeyCredential{Key: "independent-key"}, OAuth: map[string]localconfig.OAuthCredential{"codex": {AccessToken: "old", RefreshToken: "old-refresh", ExpiresAt: time.Now().Add(-time.Hour)}}}
-		config.DefaultModel = &localconfig.ModelSelection{Model: "openai/gpt-5.4", Auth: "codex"}
+		config.Providers["work/openai"] = localconfig.ProviderConfig{Auth: "codex", Credentials: &Credential{AccessToken: "old", RefreshToken: "old-refresh", ExpiresAt: time.Now().Add(-time.Hour)}}
+		config.Providers["personal/openai"] = localconfig.ProviderConfig{Auth: "api-key", Key: "independent-key"}
+		config.DefaultModel = "work/openai/gpt-5.4"
 		return nil
 	})
 	if err != nil {
@@ -382,7 +385,7 @@ func TestClientCommitsAcceptedRefreshAfterCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	hooked := &cancelBeforeCommitStore{FileStore: shared, cancel: cancel}
-	credentials, err := NewStore(hooked)
+	credentials, err := NewStore(hooked, "work/openai")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -397,8 +400,8 @@ func TestClientCommitsAcceptedRefreshAfterCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	credential := config.Providers["openai"].OAuth["codex"]
-	if credential.RefreshToken != "rotated-refresh" || credential.AccessToken != "accepted-access" || config.Providers["openai"].APIKey.Key != "independent-key" || config.DefaultModel.Auth != "codex" {
+	credential := config.Providers["work/openai"].Credentials
+	if credential.RefreshToken != "rotated-refresh" || credential.AccessToken != "accepted-access" || config.Providers["personal/openai"].Key != "independent-key" || config.DefaultModel != "work/openai/gpt-5.4" {
 		t.Fatal("accepted rotation or unrelated configuration lost")
 	}
 }
@@ -416,5 +419,127 @@ func TestClientCanceledBeforeRefreshDoesNotExchange(t *testing.T) {
 	c, err := store.Load(t.Context())
 	if err != nil || c.AccessToken != "old" {
 		t.Fatal("canceled request changed credentials", err)
+	}
+}
+
+func TestClientIndependentAccountsRefreshConcurrently(t *testing.T) {
+	shared, err := localconfig.NewFileStore(filepath.Join(t.TempDir(), "sol", "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stores []*CredentialStore
+	for _, entry := range []string{"work/openai", "personal/openai"} {
+		s, err := NewStore(shared, entry)
+		if err != nil {
+			t.Fatal(err)
+		}
+		save(t, s, Credential{AccessToken: "expired", RefreshToken: entry, ExpiresAt: time.Now().Add(-time.Hour), AccountID: entry})
+		stores = append(stores, s)
+	}
+	arrived := make(chan string, 2)
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.ParseForm()
+		account := r.Form.Get("refresh_token")
+		arrived <- account
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"access_token": account + "-access", "refresh_token": account + "-rotated", "expires_in": 3600})
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	var wg sync.WaitGroup
+	for _, store := range stores {
+		wg.Go(func() {
+			access, err := testClient(t, server, store).Access(ctx)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			if access.Token != store.entry+"-access" || access.AccountID != store.entry {
+				t.Error("cross-account token routing")
+			}
+		})
+	}
+	for range 2 {
+		select {
+		case <-arrived:
+		case <-ctx.Done():
+			close(release)
+			wg.Wait()
+			t.Fatal("unrelated refresh held global configuration lock")
+		}
+	}
+	// A normal configuration update must also complete while both exchanges wait.
+	if _, err := shared.Update(ctx, func(c *localconfig.Config) error {
+		c.Providers["third/openai"] = localconfig.ProviderConfig{Auth: "api-key", Key: "third-key"}
+		return nil
+	}); err != nil {
+		close(release)
+		wg.Wait()
+		t.Fatal(err)
+	}
+	close(release)
+	wg.Wait()
+	for _, store := range stores {
+		credential, err := store.Load(t.Context())
+		if err != nil || credential.RefreshToken != store.entry+"-rotated" {
+			t.Fatal("rotation crossed accounts", err)
+		}
+	}
+}
+
+func TestClientRefreshCrossProcess(t *testing.T) {
+	if path := os.Getenv("SOL_ACCOUNT_TEST_PATH"); path != "" {
+		shared, err := localconfig.NewFileStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		store, err := NewStore(shared, "work/openai")
+		if err != nil {
+			t.Fatal(err)
+		}
+		client, err := NewClient(ClientOptions{Store: store, HTTPClient: &http.Client{Timeout: 5 * time.Second}, Issuer: os.Getenv("SOL_ACCOUNT_TEST_ISSUER"), ClientID: "test", UserAgent: "test"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		access, err := client.Access(t.Context())
+		if err != nil || access.Token != "process-access" {
+			t.Fatal("cross-process access failed", err)
+		}
+		return
+	}
+	path := filepath.Join(t.TempDir(), "sol", "config.json")
+	shared, _ := localconfig.NewFileStore(path)
+	store, _ := NewStore(shared, "work/openai")
+	save(t, store, Credential{AccessToken: "expired", RefreshToken: "process-refresh", ExpiresAt: time.Now().Add(-time.Hour)})
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		r.ParseForm()
+		if r.Form.Get("refresh_token") != "process-refresh" {
+			t.Error("replayed rotated token")
+		}
+		time.Sleep(50 * time.Millisecond)
+		fmt.Fprint(w, `{"access_token":"process-access","refresh_token":"process-rotated","expires_in":3600}`)
+	}))
+	defer server.Close()
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Go(func() {
+			cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestClientRefreshCrossProcess$")
+			cmd.Env = append(os.Environ(), "SOL_ACCOUNT_TEST_PATH="+path, "SOL_ACCOUNT_TEST_ISSUER="+server.URL)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Errorf("subprocess failed: %v\n%s", err, output)
+			}
+		})
+	}
+	wg.Wait()
+	if calls.Load() != 1 {
+		t.Fatalf("refresh exchanges = %d, want 1", calls.Load())
 	}
 }

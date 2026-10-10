@@ -105,6 +105,7 @@ func grepWithRipgrep(ctx context.Context, searchPath, pattern, include string) s
 	args = append(args, searchPath)
 
 	cmd := exec.CommandContext(ctx, "rg", args...)
+	cmd.Env = processEnvironment(ctx)
 	output, err := cmd.Output()
 
 	// Exit codes: 0 = matches found, 1 = no matches, 2 = errors
@@ -190,6 +191,7 @@ func grepWithGrep(ctx context.Context, searchPath, pattern, include string) stri
 	}
 
 	cmd := exec.CommandContext(ctx, "grep", cmdArgs...)
+	cmd.Env = processEnvironment(ctx)
 	output, _ := cmd.Output()
 
 	result := strings.TrimSpace(string(output))

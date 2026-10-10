@@ -110,8 +110,6 @@ assistant: "I'm going to use the Task tool to launch the with the greeting-respo
 				return tool.Result{}, fmt.Errorf("unknown subagent type %q", agentType)
 			}
 
-			fmt.Printf("[%s] Spawning subagent '%s' for: %s\n", spawner.AgentName(), agentType, args.Description)
-
 			result, err := spawner.SpawnSubagent(ctx, agentType, args.Prompt)
 			if err != nil {
 				// Preserve fatal suspensions and structured tool failures rather
