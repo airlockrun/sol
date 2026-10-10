@@ -4,25 +4,20 @@ package localconfig
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 )
 
 // Version is the current on-disk configuration schema version.
-const Version = 2
+const Version = 3
 const APIKeyMode = "api-key"
 const maxStoreBytes = 1 << 20
-
-// APIKeyCredential holds one explicitly configured provider key.
-type APIKeyCredential struct {
-	Key string `json:"key"`
-}
 
 // OAuthCredential holds refreshable tokens and optional account-routing metadata.
 type OAuthCredential struct {
@@ -32,24 +27,12 @@ type OAuthCredential struct {
 	AccountID    string    `json:"account_id,omitempty"`
 }
 
-// ProviderAuth keeps API-key and named OAuth methods independently configurable.
-type ProviderAuth struct {
-	APIKey *APIKeyCredential          `json:"api_key,omitempty"`
-	OAuth  map[string]OAuthCredential `json:"oauth,omitempty"`
-}
-
-// ModelSelection persists the model and deliberate authentication method together.
-// Auth is api-key or a named OAuth method belonging to the selected provider.
-type ModelSelection struct {
-	Model string `json:"model"`
-	Auth  string `json:"auth"`
-}
-
 // Config is the complete local configuration snapshot. Providers is initialized
 // even when the file is absent. Credentials are not safe for display.
 type Config struct {
-	Providers    map[string]ProviderAuth `json:"providers"`
-	DefaultModel *ModelSelection         `json:"default_model,omitempty"`
+	Providers    map[string]ProviderConfig `json:"providers"`
+	DefaultModel string                    `json:"defaultModel,omitempty"`
+	DefaultAgent string                    `json:"defaultAgent,omitempty"`
 }
 
 // Store serializes read-modify-write across its users, including token refresh.
@@ -74,7 +57,7 @@ func DefaultPath() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "sol", "auth.json"), nil
+	return filepath.Join(dir, "sol", "config.json"), nil
 }
 
 // FileStore persists the complete record using private atomic writes and a stable
@@ -96,7 +79,7 @@ func (s *FileStore) Load(ctx context.Context) (Config, error) {
 		return Config{}, err
 	}
 	defer unlock()
-	return s.load()
+	return s.load(ctx)
 }
 
 func (s *FileStore) Update(ctx context.Context, change func(*Config) error) (Config, error) {
@@ -133,7 +116,7 @@ func (s *FileStore) update(ctx context.Context, change func(*Config) (context.Co
 		return Config{}, err
 	}
 	defer unlock()
-	config, err := s.load()
+	config, err := s.load(ctx)
 	if err != nil {
 		return Config{}, err
 	}
@@ -164,9 +147,16 @@ func (s *FileStore) update(ctx context.Context, change func(*Config) (context.Co
 	if err := commit.Err(); err != nil {
 		return Config{}, err
 	}
-	f, err := os.CreateTemp(filepath.Dir(s.path), ".auth-*")
-	if err != nil {
+	if err := s.write(commit, data); err != nil {
 		return Config{}, err
+	}
+	return config, nil
+}
+
+func (s *FileStore) write(commit context.Context, data []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(s.path), ".config-*")
+	if err != nil {
+		return err
 	}
 	defer os.Remove(f.Name())
 	if err = privatePath(f.Name(), 0600); err == nil {
@@ -177,18 +167,18 @@ func (s *FileStore) update(ctx context.Context, change func(*Config) (context.Co
 	}
 	err = errors.Join(err, f.Close())
 	if err != nil {
-		return Config{}, err
+		return err
 	}
 	if err := commit.Err(); err != nil {
-		return Config{}, err
+		return err
 	}
 	if err := replaceFile(f.Name(), s.path); err != nil {
-		return Config{}, err
+		return err
 	}
 	if err := syncDirectory(filepath.Dir(s.path)); err != nil {
-		return Config{}, err
+		return err
 	}
-	return config, nil
+	return nil
 }
 
 func encode(config Config) ([]byte, error) {
@@ -198,10 +188,13 @@ func encode(config Config) ([]byte, error) {
 	}{Version, config})
 }
 
-func (s *FileStore) load() (Config, error) {
-	empty := Config{Providers: make(map[string]ProviderAuth)}
+func (s *FileStore) load(ctx context.Context) (Config, error) {
+	empty := Config{Providers: make(map[string]ProviderConfig)}
 	info, err := os.Lstat(s.path)
 	if errors.Is(err, os.ErrNotExist) {
+		if filepath.Base(s.path) == "config.json" {
+			return s.importAuth(ctx, empty)
+		}
 		return empty, nil
 	}
 	if err != nil {
@@ -209,6 +202,9 @@ func (s *FileStore) load() (Config, error) {
 	}
 	if !info.Mode().IsRegular() {
 		return Config{}, errors.New("sol config: file must be regular, not a symlink")
+	}
+	if info.Size() > maxStoreBytes {
+		return Config{}, errors.New("sol config: configuration is too large")
 	}
 	if err := checkPrivateFile(s.path, info); err != nil {
 		return Config{}, err
@@ -221,7 +217,6 @@ func (s *FileStore) load() (Config, error) {
 	var record struct {
 		Version int `json:"version"`
 		Config
-		Codex *OAuthCredential `json:"codex,omitempty"`
 	}
 	d := json.NewDecoder(io.LimitReader(f, maxStoreBytes))
 	d.DisallowUnknownFields()
@@ -232,19 +227,7 @@ func (s *FileStore) load() (Config, error) {
 	if err := d.Decode(&extra); err != io.EOF {
 		return Config{}, errors.New("sol config: trailing configuration data")
 	}
-	switch record.Version {
-	case 1:
-		if record.Codex == nil || record.Providers != nil || record.DefaultModel != nil {
-			return Config{}, errors.New("sol config: invalid version 1 record")
-		}
-		// Version 1 stores one Codex credential. Reading it into the shared record
-		// preserves tokens; the next changed update writes the complete version 2.
-		record.Config = Config{Providers: map[string]ProviderAuth{"openai": {OAuth: map[string]OAuthCredential{"codex": *record.Codex}}}}
-	case Version:
-		if record.Codex != nil {
-			return Config{}, errors.New("sol config: invalid version 2 record")
-		}
-	default:
+	if record.Version != Version {
 		return Config{}, fmt.Errorf("sol config: unsupported version %d", record.Version)
 	}
 	if err := record.Config.Validate(); err != nil {
@@ -253,52 +236,17 @@ func (s *FileStore) load() (Config, error) {
 	return record.Config, nil
 }
 
-// Validate checks typed records without exposing credential contents in errors.
-func (c Config) Validate() error {
-	if c.Providers == nil {
-		return errors.New("sol config: providers map is required")
+// LockEntry serializes credential operations independently of other accounts.
+// Acquire this lock before Update; never acquire it inside an Update callback.
+func (s *FileStore) LockEntry(ctx context.Context, entry string) (func(), error) {
+	if s == nil || !filepath.IsAbs(s.path) {
+		return nil, errors.New("sol config: use NewFileStore with an absolute path")
 	}
-	for id, provider := range c.Providers {
-		if !ValidID(id) {
-			return errors.New("sol config: invalid provider ID")
-		}
-		if provider.APIKey != nil && (strings.TrimSpace(provider.APIKey.Key) == "" || strings.ContainsAny(provider.APIKey.Key, "\r\n")) {
-			return errors.New("sol config: invalid API key")
-		}
-		for method, credential := range provider.OAuth {
-			if !ValidID(method) || method == APIKeyMode {
-				return errors.New("sol config: invalid OAuth method")
-			}
-			if credential.AccessToken == "" || credential.RefreshToken == "" || credential.ExpiresAt.IsZero() {
-				return errors.New("sol config: incomplete OAuth credential")
-			}
-		}
+	if _, _, err := ParseEntry(entry); err != nil {
+		return nil, err
 	}
-	if c.DefaultModel != nil {
-		return c.DefaultModel.Validate()
-	}
-	return nil
-}
-
-func (m ModelSelection) Validate() error {
-	provider, model, ok := strings.Cut(m.Model, "/")
-	if !ok || !ValidID(provider) || strings.TrimSpace(model) == "" || strings.ContainsAny(model, " \t\r\n") || !ValidID(m.Auth) {
-		return errors.New("sol config: model requires provider/model and an auth method")
-	}
-	return nil
-}
-
-// ValidID checks provider and authentication-method identifiers.
-func ValidID(id string) bool {
-	if id == "" {
-		return false
-	}
-	for _, c := range id {
-		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_' || c == '.') {
-			return false
-		}
-	}
-	return true
+	lock := &FileStore{path: fmt.Sprintf("%s.entry-%x", s.path, sha256.Sum256([]byte(entry)))}
+	return lock.lock(ctx)
 }
 
 func (s *FileStore) lock(ctx context.Context) (func(), error) {

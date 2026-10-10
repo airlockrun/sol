@@ -3,10 +3,10 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 
+	"github.com/airlockrun/sol/agent"
 	"github.com/airlockrun/sol/localconfig"
 	"github.com/airlockrun/sol/provider"
 )
@@ -18,86 +18,98 @@ func localStore() (*localconfig.FileStore, error) {
 	}
 	return localconfig.NewFileStore(path)
 }
-
 func runConfig(ctx context.Context, args []string, output io.Writer, store localconfig.Store) error {
-	if len(args) == 0 || args[0] != "model" {
-		return errors.New("usage: sol config model [--auth api-key|codex] [PROVIDER/MODEL]; sol config model --clear")
+	if len(args) > 0 && args[0] == "agent" {
+		return runAgentConfig(ctx, args[1:], output, store)
 	}
-	flags := flag.NewFlagSet("config model", flag.ContinueOnError)
-	// Do not include untrusted arguments in diagnostics; configuration has no secret output.
-	flags.SetOutput(io.Discard)
-	auth := flags.String("auth", localconfig.APIKeyMode, "authentication method")
-	clear := flags.Bool("clear", false, "clear default")
-	if err := flags.Parse(args[1:]); err != nil {
-		return errors.New("invalid config model arguments")
+	if len(args) < 1 || args[0] != "model" || len(args) > 2 {
+		return errors.New("usage: sol config model [slug/provider/model | --clear]")
 	}
-	authSet := false
-	flags.Visit(func(f *flag.Flag) {
-		if f.Name == "auth" {
-			authSet = true
-		}
-	})
-	if flags.NArg() > 1 || *clear && (flags.NArg() != 0 || authSet) {
-		return errors.New("invalid config model arguments")
-	}
-	if *clear {
-		if _, err := store.Update(ctx, func(config *localconfig.Config) error { config.DefaultModel = nil; return nil }); err != nil {
-			return err
-		}
-		_, err := fmt.Fprintln(output, "Default model cleared.")
-		return err
-	}
-	if flags.NArg() == 0 {
-		if authSet {
-			return errors.New("setting authentication requires a model")
-		}
+	if len(args) == 1 {
 		config, err := store.Load(ctx)
 		if err != nil {
 			return err
 		}
-		if config.DefaultModel == nil {
+		if config.DefaultModel == "" {
 			_, err = fmt.Fprintln(output, "No default model configured.")
+		} else {
+			_, err = fmt.Fprintln(output, "Default model:", config.DefaultModel)
+		}
+		return err
+	}
+	value := args[1]
+	if value == "--clear" {
+		value = ""
+	} else {
+		ref, err := localconfig.ParseModelRef(value)
+		if err != nil {
 			return err
 		}
-		_, err = fmt.Fprintf(output, "Default model: %s (auth: %s)\n", config.DefaultModel.Model, config.DefaultModel.Auth)
+		if err := provider.ValidateLocalEntry(ref.Entry); err != nil {
+			return err
+		}
+		if _, ok := provider.GetModelInfo(ref.Provider, ref.Model); !ok {
+			return errors.New("default model is not in the provider catalog")
+		}
+	}
+	_, err := store.Update(ctx, func(config *localconfig.Config) error {
+		if value != "" {
+			if _, _, err := config.Resolve(value); err != nil {
+				return err
+			}
+		}
+		config.DefaultModel = value
+		return nil
+	})
+	if err != nil {
 		return err
 	}
-	model := flags.Arg(0)
-	selection := localconfig.ModelSelection{Model: model, Auth: *auth}
-	if err := selection.Validate(); err != nil {
-		return err
+	if value == "" {
+		_, err = fmt.Fprintln(output, "Default model cleared.")
+	} else {
+		_, err = fmt.Fprintln(output, "Default model:", value)
 	}
-	id, modelID := provider.ParseModel(model)
-	if err := validateAuthMode(*auth, id, modelID, "", "", true); err != nil {
-		return err
-	}
-	if _, err := store.Update(ctx, func(config *localconfig.Config) error { config.DefaultModel = &selection; return nil }); err != nil {
-		return err
-	}
-	_, err := fmt.Fprintf(output, "Default model: %s (auth: %s)\n", selection.Model, selection.Auth)
 	return err
 }
 
-// An explicit model starts in API-key mode. Only an explicit auth flag or the
-// complete stored default selection may choose Codex.
-func selectModel(config localconfig.Config, model, auth string, explicitModel, explicitAuth bool) (localconfig.ModelSelection, error) {
-	selection := localconfig.ModelSelection{Model: "openai/gpt-4o", Auth: localconfig.APIKeyMode}
-	if !explicitModel && config.DefaultModel != nil {
-		selection = *config.DefaultModel
+func runAgentConfig(ctx context.Context, args []string, output io.Writer, store localconfig.Store) error {
+	if len(args) > 1 {
+		return errors.New("usage: sol config agent [name | --clear]")
 	}
-	if explicitModel {
-		id, modelID := provider.ParseModel(model)
-		selection = localconfig.ModelSelection{Model: id + "/" + modelID, Auth: localconfig.APIKeyMode}
+	if len(args) == 0 {
+		c, err := store.Load(ctx)
+		if err != nil {
+			return err
+		}
+		name := c.DefaultAgent
+		if name == "" {
+			name = "build"
+		}
+		_, err = fmt.Fprintln(output, "Default agent:", name)
+		return err
 	}
-	if explicitAuth {
-		selection.Auth = auth
+	name := args[0]
+	if name == "--clear" {
+		name = ""
+	} else if _, ok := agent.Get(name, ""); !ok {
+		return fmt.Errorf("unknown agent %q; available: %v", name, agent.List())
 	}
-	if err := selection.Validate(); err != nil {
-		return localconfig.ModelSelection{}, err
+	_, err := store.Update(ctx, func(c *localconfig.Config) error { c.DefaultAgent = name; return nil })
+	if err != nil {
+		return err
 	}
-	id, modelID := provider.ParseModel(selection.Model)
-	if err := validateAuthMode(selection.Auth, id, modelID, "", "", explicitModel || config.DefaultModel != nil); err != nil {
-		return localconfig.ModelSelection{}, err
+	if name == "" {
+		name = "build"
 	}
-	return selection, nil
+	_, err = fmt.Fprintln(output, "Default agent:", name)
+	return err
+}
+func selectModel(config localconfig.Config, model string) (localconfig.ModelRef, localconfig.ProviderConfig, error) {
+	if model == "" {
+		model = config.DefaultModel
+	}
+	if model == "" {
+		return localconfig.ModelRef{}, localconfig.ProviderConfig{}, errors.New("no model selected; use -model slug/provider/model or sol config model slug/provider/model")
+	}
+	return config.Resolve(model)
 }

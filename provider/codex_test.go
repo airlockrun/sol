@@ -530,11 +530,11 @@ func TestCodexAbortDuringRefresh(t *testing.T) {
 		close(stopped)
 	}))
 	defer server.Close()
-	shared, err := localconfig.NewFileStore(filepath.Join(t.TempDir(), "sol", "auth.json"))
+	shared, err := localconfig.NewFileStore(filepath.Join(t.TempDir(), "sol", "config.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := codex.NewStore(shared)
+	store, err := codex.NewStore(shared, "work/openai")
 	if err != nil {
 		t.Fatal(err)
 	}

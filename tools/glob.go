@@ -93,6 +93,7 @@ func globWithRipgrep(ctx context.Context, searchPath, pattern string) ([]string,
 	// Use ripgrep's --files with glob pattern
 	// Run from searchPath directory (matching opencode behavior)
 	cmd := exec.CommandContext(ctx, "rg", "--files", "--follow", "--hidden", "--glob=!.git/*", "--glob", pattern)
+	cmd.Env = processEnvironment(ctx)
 	cmd.Dir = searchPath
 	output, err := cmd.Output()
 	if err != nil {
@@ -158,6 +159,7 @@ func globWithFind(ctx context.Context, searchPath, pattern string) ([]string, bo
 	}
 
 	cmd := exec.CommandContext(ctx, "find", searchPath, "-name", namePattern, "-type", "f", "-not", "-path", "*/.git/*")
+	cmd.Env = processEnvironment(ctx)
 	output, _ := cmd.Output()
 
 	lines := strings.Split(strings.TrimSpace(string(output)), "\n")

@@ -39,7 +39,6 @@ const CodexMode = "codex"
 // boundary. Supplying Store or ConfigPath avoids OS path discovery.
 type LocalModelOptions struct {
 	Model string
-	Auth  string
 	// HTTPClient is copied with redirects disabled for credentialed requests.
 	HTTPClient *http.Client
 	UserAgent  string
@@ -66,28 +65,19 @@ func ResolveLocalModel(ctx context.Context, opts LocalModelOptions) (stream.Mode
 	if err := ctx.Err(); err != nil {
 		return nil, session.ModelLimits{}, err
 	}
-	selection := localconfig.ModelSelection{Model: opts.Model, Auth: opts.Auth}
-	if err := selection.Validate(); err != nil {
+	ref, err := localconfig.ParseModelRef(opts.Model)
+	if err != nil {
 		return nil, session.ModelLimits{}, err
 	}
-	id, modelID := ParseModel(opts.Model)
+	id, modelID := ref.Provider, ref.Model
 	if id == "mock" {
 		return nil, session.ModelLimits{}, errors.New("local model resolution requires an explicit real provider; inject mock models separately")
-	}
-	if opts.Auth != localconfig.APIKeyMode && opts.Auth != CodexMode {
-		return nil, session.ModelLimits{}, errors.New("local model auth must be api-key or codex")
 	}
 	if opts.HTTPClient == nil || opts.UserAgent == "" || opts.SessionID == "" {
 		return nil, session.ModelLimits{}, errors.New("local model requires HTTPClient, UserAgent and SessionID")
 	}
 	if opts.Store != nil && opts.ConfigPath != "" {
 		return nil, session.ModelLimits{}, errors.New("local model accepts Store or ConfigPath, not both")
-	}
-	if opts.Auth == CodexMode && (id != "openai" || opts.BaseURL != "") {
-		return nil, session.ModelLimits{}, errors.New("Codex requires openai and its dedicated Responses endpoint")
-	}
-	if opts.Auth == localconfig.APIKeyMode && (opts.CodexURL != "" || opts.Issuer != "") {
-		return nil, session.ModelLimits{}, errors.New("Codex endpoints require codex authentication")
 	}
 	if opts.BaseURL != "" {
 		if err := validateLocalURL(opts.BaseURL); err != nil {
@@ -104,10 +94,10 @@ func ResolveLocalModel(ctx context.Context, opts LocalModelOptions) (stream.Mode
 			return nil, session.ModelLimits{}, err
 		}
 	}
-	if info, ok := GetProviderInfo(id); ok && info.ID != id {
-		return nil, session.ModelLimits{}, fmt.Errorf("local model requires canonical provider ID %s", info.ID)
+	if err := ValidateLocalEntry(ref.Entry); err != nil {
+		return nil, session.ModelLimits{}, err
 	}
-	if opts.Auth == localconfig.APIKeyMode && nativeLocalProvider(id) {
+	if nativeLocalProvider(id) {
 		if _, ok := localProviderFactories[id]; !ok {
 			return nil, session.ModelLimits{}, fmt.Errorf("provider %s has no local language-model transport with explicit HTTP client support", id)
 		}
@@ -140,8 +130,23 @@ func ResolveLocalModel(ctx context.Context, opts LocalModelOptions) (stream.Mode
 	if err := config.Validate(); err != nil {
 		return nil, session.ModelLimits{}, err
 	}
-	if opts.Auth == CodexMode {
-		credentials, err := codex.NewStore(store)
+	_, binding, err := config.Resolve(opts.Model)
+	if err != nil {
+		return nil, session.ModelLimits{}, err
+	}
+	if opts.BaseURL == "" {
+		opts.BaseURL = binding.BaseURL
+	}
+	if opts.BaseURL != "" {
+		if err := validateLocalURL(opts.BaseURL); err != nil {
+			return nil, session.ModelLimits{}, err
+		}
+	}
+	if binding.Auth == CodexMode {
+		if opts.BaseURL != "" {
+			return nil, session.ModelLimits{}, errors.New("Codex uses its dedicated Responses endpoint")
+		}
+		credentials, err := codex.NewStore(store, ref.Entry)
 		if err != nil {
 			return nil, session.ModelLimits{}, err
 		}
@@ -163,11 +168,17 @@ func ResolveLocalModel(ctx context.Context, opts LocalModelOptions) (stream.Mode
 		model, err := NewCodexModel(modelID, CodexOptions{Credentials: client, HTTPClient: opts.HTTPClient, URL: endpoint, UserAgent: opts.UserAgent, SessionID: opts.SessionID})
 		return model, limits, err
 	}
+	if id == "baseten" && opts.BaseURL != "" {
+		return nil, session.ModelLimits{}, errors.New("local Baseten language models use deployment URLs and do not support BaseURL")
+	}
+	if opts.CodexURL != "" || opts.Issuer != "" {
+		return nil, session.ModelLimits{}, errors.New("Codex endpoints require codex authentication")
+	}
 	lookup := opts.LookupEnv
 	if lookup == nil {
 		lookup = os.LookupEnv
 	}
-	key, err := ResolveLocalAPIKey(config, id, lookup)
+	key, err := ResolveLocalAPIKey(config, ref.Entry, lookup)
 	if err != nil {
 		return nil, session.ModelLimits{}, err
 	}
@@ -178,29 +189,57 @@ func ResolveLocalModel(ctx context.Context, opts LocalModelOptions) (stream.Mode
 	return model, limits, nil
 }
 
-// ResolveLocalAPIKey shares the CLI's environment-over-store policy without any
-// file discovery. An explicitly present empty environment value disables a key.
-func ResolveLocalAPIKey(config localconfig.Config, id string, lookup func(string) (string, bool)) (string, error) {
-	if !localconfig.ValidID(id) || lookup == nil {
-		return "", errors.New("local API key requires a provider ID and environment lookup")
+// ValidateLocalEntry requires a canonical provider namespace from Sol's catalog.
+func ValidateLocalEntry(entry string) error {
+	_, id, err := localconfig.ParseEntry(entry)
+	if err != nil {
+		return err
 	}
-	env := GetEnvVarName(id)
-	if key, present := lookup(env); present {
+	info, ok := GetProviderInfo(id)
+	if !ok || info.ID != id || id == "mock" {
+		return errors.New("local provider entry requires a canonical catalog provider ID")
+	}
+	return nil
+}
+
+// ResolveLocalAPIKey reads only the selected account's inline key or explicit keyEnv.
+func ResolveLocalAPIKey(config localconfig.Config, id string, lookup func(string) (string, bool)) (string, error) {
+	if err := ValidateLocalEntry(id); err != nil {
+		return "", err
+	}
+	p, ok := config.Providers[id]
+	if !ok {
+		return "", fmt.Errorf("unknown provider entry %s; run sol auth set-key %s", id, id)
+	}
+	if p.Auth != localconfig.APIKeyMode {
+		return "", errors.New("selected entry does not use api-key authentication")
+	}
+	if p.Credentials != nil || p.Key != "" && p.KeyEnv != "" {
+		return "", errors.New("api-key entry requires a single credential source")
+	}
+	if p.KeyEnv != "" {
+		if lookup == nil {
+			return "", errors.New("keyEnv requires environment lookup")
+		}
+		key, present := lookup(p.KeyEnv)
+		if !present {
+			return "", errors.New("configured keyEnv is missing")
+		}
 		if strings.TrimSpace(key) == "" {
-			return "", fmt.Errorf("%s is explicitly empty", env)
+			return "", errors.New("configured keyEnv is empty")
 		}
 		if strings.ContainsAny(key, "\r\n") {
-			return "", fmt.Errorf("%s must contain a single API key", env)
+			return "", errors.New("configured keyEnv must contain a single API key")
 		}
 		return key, nil
 	}
-	if credential := config.Providers[id].APIKey; credential != nil {
-		if strings.TrimSpace(credential.Key) == "" || strings.ContainsAny(credential.Key, "\r\n") {
+	if p.Key != "" {
+		if strings.TrimSpace(p.Key) == "" || strings.ContainsAny(p.Key, "\r\n") || p.KeyEnv != "" {
 			return "", errors.New("invalid stored API key")
 		}
-		return credential.Key, nil
+		return p.Key, nil
 	}
-	return "", fmt.Errorf("configure an API key with sol auth set-key %s or set %s", id, env)
+	return "", fmt.Errorf("account disconnected; configure an API key with sol auth set-key %s", id)
 }
 
 func localLimits(id, modelID string, override *session.ModelLimits) (session.ModelLimits, error) {

@@ -28,7 +28,7 @@ import (
 
 func localTestStore(t *testing.T) *localconfig.FileStore {
 	t.Helper()
-	store, err := localconfig.NewFileStore(filepath.Join(t.TempDir(), "sol", "auth.json"))
+	store, err := localconfig.NewFileStore(filepath.Join(t.TempDir(), "sol", "config.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +36,7 @@ func localTestStore(t *testing.T) *localconfig.FileStore {
 }
 
 func localTestOptions(store localconfig.Store) provider.LocalModelOptions {
-	return provider.LocalModelOptions{Model: "openai/gpt-4o-mini", Auth: localconfig.APIKeyMode, Store: store, HTTPClient: http.DefaultClient, UserAgent: "resolver/test", SessionID: "explicit-session", LookupEnv: func(string) (string, bool) { return "", false }}
+	return provider.LocalModelOptions{Model: "personal/openai/gpt-4o-mini", Store: store, HTTPClient: http.DefaultClient, UserAgent: "resolver/test", SessionID: "explicit-session", LookupEnv: func(string) (string, bool) { return "", false }}
 }
 
 type localCountingTransport struct {
@@ -69,13 +69,18 @@ func TestResolveLocalModelAPIKey(t *testing.T) {
 		name, env, want  string
 		present, success bool
 	}{
-		{"stored", "", "stored-test-key", false, true}, {"environment", "env-test-key", "env-test-key", true, true}, {"explicit empty", "", "", true, false},
+		{"stored", "", "stored-test-key", false, true}, {"environment", "env-test-key", "env-test-key", true, true}, {"explicit empty", "", "", true, false}, {"missing explicit environment", "", "", false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := localTestStore(t)
 			_, err := store.Update(t.Context(), func(config *localconfig.Config) error {
-				config.Providers["openai"] = localconfig.ProviderAuth{APIKey: &localconfig.APIKeyCredential{Key: "stored-test-key"}}
-				config.DefaultModel = &localconfig.ModelSelection{Model: "openai/gpt-5.4", Auth: provider.CodexMode}
+				p := localconfig.ProviderConfig{Auth: "api-key", Key: "stored-test-key"}
+				if tc.name != "stored" {
+					p.Key = ""
+					p.KeyEnv = "EXPLICIT_OPENAI_KEY"
+				}
+				config.Providers["personal/openai"] = p
+				config.DefaultModel = "personal/openai/gpt-5.4"
 				return nil
 			})
 			if err != nil {
@@ -106,7 +111,7 @@ func TestResolveLocalModelAPIKey(t *testing.T) {
 			opts.HTTPClient = &client
 			opts.BaseURL = server.URL
 			opts.LookupEnv = func(name string) (string, bool) {
-				if name != "OPENAI_API_KEY" {
+				if name != "EXPLICIT_OPENAI_KEY" {
 					t.Error("wrong env variable")
 				}
 				return tc.env, tc.present
@@ -139,13 +144,13 @@ func TestResolveLocalModelAPIKey(t *testing.T) {
 }
 
 func TestResolveLocalModelConfigPath(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "sol", "auth.json")
+	path := filepath.Join(t.TempDir(), "sol", "config.json")
 	store, err := localconfig.NewFileStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, err = store.Update(t.Context(), func(config *localconfig.Config) error {
-		config.Providers["openai"] = localconfig.ProviderAuth{APIKey: &localconfig.APIKeyCredential{Key: "path-key"}}
+		config.Providers["personal/openai"] = localconfig.ProviderConfig{Auth: "api-key", Key: "path-key"}
 		return nil
 	})
 	if err != nil {
@@ -186,6 +191,13 @@ func TestResolveLocalModelExplicitOSDiscovery(t *testing.T) {
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("options construction accessed configuration")
 	}
+	store, _ := localconfig.NewFileStore(path)
+	if _, err := store.Update(t.Context(), func(config *localconfig.Config) error {
+		config.Providers["personal/openai"] = localconfig.ProviderConfig{Auth: "api-key", KeyEnv: "OPENAI_API_KEY"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 	model, limits, err := provider.ResolveLocalModel(t.Context(), opts)
 	if err != nil {
 		t.Fatal(err)
@@ -217,27 +229,19 @@ func TestResolveLocalModelRejectsBeforeDiscovery(t *testing.T) {
 		{"empty model", func(o *provider.LocalModelOptions) { o.Model = "" }},
 		{"slot name", func(o *provider.LocalModelOptions) { o.Model = "reasoner" }},
 		{"mock", func(o *provider.LocalModelOptions) { o.Model = "mock/scripted" }},
-		{"empty auth", func(o *provider.LocalModelOptions) { o.Auth = "" }},
-		{"unknown auth", func(o *provider.LocalModelOptions) { o.Auth = "browser" }},
 		{"missing client", func(o *provider.LocalModelOptions) { o.HTTPClient = nil }},
 		{"missing user agent", func(o *provider.LocalModelOptions) { o.UserAgent = "" }},
 		{"missing session", func(o *provider.LocalModelOptions) { o.SessionID = "" }},
 		{"ambiguous store", func(o *provider.LocalModelOptions) { o.ConfigPath = "/explicit/config.json" }},
-		{"incompatible Codex", func(o *provider.LocalModelOptions) { o.Model = "anthropic/claude-test"; o.Auth = provider.CodexMode }},
-		{"Codex API URL", func(o *provider.LocalModelOptions) {
-			o.Auth = provider.CodexMode
-			o.BaseURL = "https://example.invalid"
-		}},
-		{"wrong endpoint mode", func(o *provider.LocalModelOptions) { o.CodexURL = "https://example.invalid" }},
 		{"invalid URL", func(o *provider.LocalModelOptions) { o.BaseURL = "https://user:secret@example.invalid" }},
-		{"unknown limits", func(o *provider.LocalModelOptions) { o.Model = "openai/local-unknown-model" }},
+		{"unknown limits", func(o *provider.LocalModelOptions) { o.Model = "personal/openai/local-unknown-model" }},
 		{"invalid override", func(o *provider.LocalModelOptions) { o.Limits = &session.ModelLimits{Output: 100} }},
 		{"provider alias", func(o *provider.LocalModelOptions) {
-			o.Model = "fireworks/deployment"
+			o.Model = "personal/fireworks/deployment"
 			o.Limits = &session.ModelLimits{Input: 1000}
 		}},
 		{"unsupported Baseten endpoint override", func(o *provider.LocalModelOptions) {
-			o.Model = "baseten/deployment"
+			o.Model = "personal/baseten/deployment"
 			o.BaseURL = "http://localhost:1234"
 			o.Limits = &session.ModelLimits{Input: 1000}
 		}},
@@ -265,7 +269,7 @@ func TestResolveLocalModelRejectsBeforeDiscovery(t *testing.T) {
 func TestResolveLocalModelCompatibleOverride(t *testing.T) {
 	store := localTestStore(t)
 	_, err := store.Update(t.Context(), func(config *localconfig.Config) error {
-		config.Providers["openai-compatible"] = localconfig.ProviderAuth{APIKey: &localconfig.APIKeyCredential{Key: "compat-key"}}
+		config.Providers["personal/openai-compatible"] = localconfig.ProviderConfig{Auth: "api-key", Key: "compat-key"}
 		return nil
 	})
 	if err != nil {
@@ -281,7 +285,7 @@ func TestResolveLocalModelCompatibleOverride(t *testing.T) {
 	defer server.Close()
 	limits := session.ModelLimits{Input: 16000, Output: 2000}
 	opts := localTestOptions(store)
-	opts.Model = "openai-compatible/deployment"
+	opts.Model = "personal/openai-compatible/deployment"
 	opts.BaseURL = server.URL
 	opts.HTTPClient = server.Client()
 	opts.Limits = &limits
@@ -297,7 +301,7 @@ func TestResolveLocalModelCompatibleOverride(t *testing.T) {
 func TestResolveLocalModelNativeAnthropic(t *testing.T) {
 	store := localTestStore(t)
 	_, err := store.Update(t.Context(), func(config *localconfig.Config) error {
-		config.Providers["anthropic"] = localconfig.ProviderAuth{APIKey: &localconfig.APIKeyCredential{Key: "anthropic-key"}}
+		config.Providers["personal/anthropic"] = localconfig.ProviderConfig{Auth: "api-key", Key: "anthropic-key"}
 		return nil
 	})
 	if err != nil {
@@ -314,7 +318,7 @@ func TestResolveLocalModelNativeAnthropic(t *testing.T) {
 	}))
 	defer server.Close()
 	opts := localTestOptions(store)
-	opts.Model = "anthropic/claude-test"
+	opts.Model = "personal/anthropic/claude-test"
 	opts.BaseURL = server.URL
 	var transported atomic.Int32
 	opts.HTTPClient = &http.Client{Transport: localCountingTransport{calls: &transported, base: http.DefaultTransport}}
@@ -339,7 +343,7 @@ func TestResolveLocalModelRejectsAPIKeyRedirects(t *testing.T) {
 		"anthropic", "google", "cohere", "mistral", "deepseek", "groq",
 		"fireworks-ai", "cerebras", "perplexity", "togetherai", "deepinfra",
 		"baseten", "xai", "huggingface", "openai", "openrouter",
-		"openai-compatible", "local-gateway",
+		"openai-compatible",
 	} {
 		t.Run(id, func(t *testing.T) {
 			for _, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
@@ -410,14 +414,14 @@ func TestResolveLocalModelRejectsAPIKeyRedirects(t *testing.T) {
 					}
 					store := localTestStore(t)
 					_, err = store.Update(t.Context(), func(config *localconfig.Config) error {
-						config.Providers[id] = localconfig.ProviderAuth{APIKey: &localconfig.APIKeyCredential{Key: key}}
+						config.Providers["personal/"+id] = localconfig.ProviderConfig{Auth: "api-key", Key: key}
 						return nil
 					})
 					if err != nil {
 						t.Fatal(err)
 					}
 					opts := localTestOptions(store)
-					opts.Model, opts.BaseURL, opts.HTTPClient = id+"/deployment", source.URL, client
+					opts.Model, opts.BaseURL, opts.HTTPClient = "personal/"+id+"/deployment", source.URL, client
 					if id == "baseten" {
 						opts.BaseURL = ""
 					}
@@ -459,7 +463,7 @@ func TestResolveLocalModelRejectsNonLanguageFactoriesBeforeDiscovery(t *testing.
 		t.Run(id, func(t *testing.T) {
 			store := &unreadStore{}
 			opts := localTestOptions(store)
-			opts.Model = id + "/deployment"
+			opts.Model = "personal/" + id + "/deployment"
 			opts.Limits = &session.ModelLimits{Input: 8000}
 			if _, _, err := provider.ResolveLocalModel(t.Context(), opts); err == nil || !strings.Contains(err.Error(), "explicit HTTP client support") {
 				t.Fatalf("unsupported factory error = %v", err)
@@ -474,8 +478,9 @@ func TestResolveLocalModelRejectsNonLanguageFactoriesBeforeDiscovery(t *testing.
 func TestResolveLocalModelCodexRefresh(t *testing.T) {
 	store := localTestStore(t)
 	_, err := store.Update(t.Context(), func(config *localconfig.Config) error {
-		config.Providers["openai"] = localconfig.ProviderAuth{APIKey: &localconfig.APIKeyCredential{Key: "must-not-use"}, OAuth: map[string]localconfig.OAuthCredential{"codex": {AccessToken: "expired", RefreshToken: "old-refresh", ExpiresAt: time.Now().Add(-time.Hour), AccountID: "account"}}}
-		config.DefaultModel = &localconfig.ModelSelection{Model: "openai/gpt-4o", Auth: "api-key"}
+		config.Providers["work/openai"] = localconfig.ProviderConfig{Auth: "codex", Credentials: &localconfig.OAuthCredential{AccessToken: "expired", RefreshToken: "old-refresh", ExpiresAt: time.Now().Add(-time.Hour), AccountID: "account"}}
+		config.Providers["personal/openai"] = localconfig.ProviderConfig{Auth: "api-key", Key: "must-not-use"}
+		config.DefaultModel = "personal/openai/gpt-4o"
 		return nil
 	})
 	if err != nil {
@@ -509,8 +514,7 @@ func TestResolveLocalModelCodexRefresh(t *testing.T) {
 	}))
 	defer server.Close()
 	opts := localTestOptions(store)
-	opts.Model = "openai/gpt-5.4"
-	opts.Auth = provider.CodexMode
+	opts.Model = "work/openai/gpt-5.4"
 	opts.HTTPClient = server.Client()
 	opts.CodexURL = server.URL + "/codex/responses"
 	opts.Issuer = server.URL
@@ -526,15 +530,68 @@ func TestResolveLocalModelCodexRefresh(t *testing.T) {
 		t.Fatal("configured Codex request failed")
 	}
 	config, err := store.Load(t.Context())
-	if err != nil || config.Providers["openai"].OAuth["codex"].RefreshToken != "rotated" || config.Providers["openai"].APIKey.Key != "must-not-use" || config.DefaultModel.Model != "openai/gpt-4o" {
+	if err != nil || config.Providers["work/openai"].Credentials.RefreshToken != "rotated" || config.Providers["personal/openai"].Key != "must-not-use" || config.DefaultModel != "personal/openai/gpt-4o" {
 		t.Fatal("refresh lost shared configuration", err)
 	}
 }
 
 func TestResolveLocalModelLoggedOut(t *testing.T) {
-	opts := localTestOptions(localTestStore(t))
-	opts.Auth = provider.CodexMode
+	store := localTestStore(t)
+	if _, err := store.Update(t.Context(), func(c *localconfig.Config) error {
+		c.Providers["personal/openai"] = localconfig.ProviderConfig{Auth: "codex"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	opts := localTestOptions(store)
 	if _, _, err := provider.ResolveLocalModel(t.Context(), opts); !errors.Is(err, codex.ErrNotLoggedIn) {
 		t.Fatal("missing device auth did not fail explicitly", err)
+	}
+}
+
+func TestNamedAPIKeyAccounts(t *testing.T) {
+	store := localTestStore(t)
+	if _, err := store.Update(t.Context(), func(c *localconfig.Config) error {
+		c.Providers["work/openai"] = localconfig.ProviderConfig{Auth: "api-key", Key: "work-key"}
+		c.Providers["personal/openai"] = localconfig.ProviderConfig{Auth: "api-key", Key: "personal-key"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range []string{"work/openai", "personal/openai"} {
+		t.Run(entry, func(t *testing.T) {
+			want := "work-key"
+			if entry == "personal/openai" {
+				want = "personal-key"
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Authorization") != "Bearer "+want {
+					t.Error("account credentials crossed")
+				}
+				writeCodexText(w, "account")
+			}))
+			defer server.Close()
+			opts := localTestOptions(store)
+			opts.Model, opts.BaseURL = entry+"/gpt-4o-mini", server.URL
+			opts.LookupEnv = func(string) (string, bool) { t.Error("inline key consulted environment"); return "global-key", true }
+			model, _, err := provider.ResolveLocalModel(t.Context(), opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if localStreamText(t, model) != "account" {
+				t.Fatal("wrong model")
+			}
+		})
+	}
+	opts := localTestOptions(store)
+	opts.Model = "missing/openai/gpt-4o-mini"
+	opts.LookupEnv = func(string) (string, bool) { t.Error("unknown entry consulted environment"); return "global-key", true }
+	if _, _, err := provider.ResolveLocalModel(t.Context(), opts); err == nil {
+		t.Fatal("unknown entry silently created")
+	}
+	for _, entry := range []string{"work/fireworks", "work/unknown-provider", "work/OpenAI"} {
+		if provider.ValidateLocalEntry(entry) == nil {
+			t.Fatal("accepted noncanonical provider")
+		}
 	}
 }

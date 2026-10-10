@@ -1,438 +1,349 @@
-// Sol CLI - Minimal thinking loop in Go (matching OpenCode behavior)
-//
-// Usage:
-//
-//	sol [options] <prompt>
-//
-// Options:
-//
-//	-model string     Model to use (default "gpt-4o")
-//	-agent string     Agent type: build, plan, explore, general (default "build")
-//	-session string   Session ID for prompt caching (default: auto-generated)
-//	-h                Show help
+// Sol executes a single batch request against an explicitly selected local session.
 package main
 
 import (
-	"bufio"
 	"context"
-	"crypto/rand"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/airlockrun/goai"
 	"github.com/airlockrun/goai/stream"
 	"github.com/airlockrun/sol"
 	"github.com/airlockrun/sol/agent"
-	"github.com/airlockrun/sol/auth/codex"
 	"github.com/airlockrun/sol/bus"
 	"github.com/airlockrun/sol/localconfig"
 	"github.com/airlockrun/sol/provider"
+	"github.com/airlockrun/sol/session"
 	"github.com/airlockrun/sol/tools"
 )
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
-	if len(os.Args) > 1 && (os.Args[1] == "auth" || os.Args[1] == "config") {
-		store, err := localStore()
-		if err == nil && os.Args[1] == "config" {
-			err = runConfig(ctx, os.Args[2:], os.Stdout, store)
-		} else if err == nil {
-			var client *codex.Client
-			client, err = localCodex(store)
-			if err == nil {
-				err = runAuth(ctx, os.Args[2:], os.Stdout, client, store, func(ctx context.Context, stdin bool) (string, error) {
-					return readAPIKey(ctx, os.Stdin, os.Stderr, stdin)
-				})
-			}
-		}
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "[sol]", err)
-			os.Exit(1)
-		}
-		return
-	}
-	// Flags
-	authFlag := flag.String("auth", "", "Authentication: api-key or codex; explicit model overrides default auth to api-key")
-	modelFlag := flag.String("model", "", "Model to use (provider/model); uses saved default or openai/gpt-4o")
-	agentFlag := flag.String("agent", "build", "Agent type: build, plan, explore, general")
-	nameFlag := flag.String("name", "", "Agent name for prompts (default: agent type name)")
-	noTitleFlag := flag.Bool("notitle", false, "Disable title generation (for replay testing)")
-	titleModelFlag := flag.String("title-model", "", "Model for title generation (default: selected main model)")
-	mcpFlag := flag.String("mcp", "", "MCP servers (comma-separated name=url pairs, e.g., 'docs=http://localhost:8080/mcp')")
-	searchFlag := flag.Bool("search", false, "Enable web search (native provider key, or independent Brave/Perplexity key from env/store)")
-	interactiveFlag := flag.Bool("i", false, "Interactive mode - prompt for permissions (default: auto-approve)")
-	helpFlag := flag.Bool("h", false, "Show help")
-	flag.Parse()
-	explicitModel, explicitTitle, explicitAuth := false, false, false
-	flag.Visit(func(f *flag.Flag) {
-		if f.Name == "model" {
-			explicitModel = true
-		}
-		if f.Name == "title-model" {
-			explicitTitle = true
-		}
-		if f.Name == "auth" {
-			explicitAuth = true
-		}
-	})
-
-	// Determine prompts from CLI args
-	var prompts []string
-	if flag.NArg() > 0 {
-		prompts = []string{strings.Join(flag.Args(), " ")}
-	}
-
-	if *helpFlag || len(prompts) == 0 {
-		fmt.Println(`sol - Minimal thinking loop in Go (matching OpenCode behavior)
-
-Usage:
-  sol [options] <prompt>
-  sol auth login|status|logout codex
-  sol auth set-key PROVIDER [--stdin]
-  sol auth status|remove-key PROVIDER
-  sol config model [--auth api-key|codex] [PROVIDER/MODEL]
-  sol config model --clear
-
-Options:
-  -auth string      Authentication: api-key or codex (uses saved model/auth pair)
-  -model string     Model override; uses api-key unless -auth is also supplied
-  -agent string     Agent type: build, plan, explore, general (default "build")
-  -name string      Agent name for prompts (default: agent type name)
-  -mcp string       MCP servers (comma-separated name=url pairs)
-  -search           Enable web search tool
-  -notitle          Disable title generation (for replay testing)
-  -title-model      Title model override (default: selected main model)
-  -i                Interactive mode - prompt for permissions (default: auto-approve)
-  -h                Show help
-
-Agent Types:
-  build    Full-access agent for software engineering tasks (default)
-  plan     Read-only agent for planning and design
-  explore  Fast agent for codebase exploration
-  general  General-purpose subagent for delegated tasks
-
-Examples:
-  sol "Hello world"
-  sol -model openai/gpt-4o-mini "Create a hello.py file"
-  sol -model anthropic/claude-3-5-sonnet "Explain this code"
-  sol -agent plan "Design a user authentication system"
-  sol -name opencode -model openai/gpt-4o-mini "List files"`)
-		if *helpFlag {
-			os.Exit(0)
-		}
+	if err := runCLI(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, "sol:", err)
 		os.Exit(1)
 	}
+}
 
-	// Hosted proxy requests do not discover local credentials or inherit local
-	// model/auth defaults. Configuration commands above remain explicitly local.
+func runCLI(ctx context.Context) error {
+	if len(os.Args) > 1 && (os.Args[1] == "auth" || os.Args[1] == "config") {
+		store, err := localStore()
+		if err != nil {
+			return err
+		}
+		if os.Args[1] == "config" {
+			return runConfig(ctx, os.Args[2:], os.Stdout, store)
+		}
+		return runAuth(ctx, os.Args[2:], os.Stdout, nil, store, func(ctx context.Context, stdin bool) (string, error) {
+			return readAPIKey(ctx, os.Stdin, os.Stderr, stdin)
+		})
+	}
+	if len(os.Args) > 1 && os.Args[1] == "session" {
+		return runSessionCommand(ctx, os.Args[2:])
+	}
+	model := flag.String("model", "", "Local model reference slug/provider/model")
+	agentName := flag.String("agent", "", "Agent override (uses session or configured default)")
+	name := flag.String("name", "", "Agent name for prompts")
+	id := flag.String("session", "", "Existing session ID; overrides SOL_SESSION")
+	mcp := flag.String("mcp", "", "MCP servers: name=url,name2=url2")
+	search := flag.Bool("search", false, "Enable web search")
+	searchEntry := flag.String("search-provider", "", "Named API-key account for independent search")
+	verbose := flag.Bool("verbose", false, "Print tool progress to stderr")
+	help := flag.Bool("h", false, "Show help")
+	version := flag.Bool("version", false, "Show version")
+	flag.Parse()
+	var emptySelector bool
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "session" && *id == "" {
+			emptySelector = true
+		}
+	})
+	if emptySelector {
+		return errors.New("-session requires a nonempty existing session ID")
+	}
+	if *version {
+		fmt.Fprintln(os.Stdout, sol.Version)
+		return nil
+	}
+	if *help || flag.NArg() == 0 {
+		fmt.Fprintln(os.Stdout, `Usage:
+  sol [options] 'request'
+  sol config agent [build|plan|explore|general|--clear]
+  sol config model [slug/provider/model|--clear]
+  sol auth login ENTRY [--method codex]
+  sol auth set-key ENTRY [--stdin]
+  sol auth status [ENTRY]
+  sol auth logout|remove-key ENTRY
+  sol session new
+  sol session list
+  sol session show ID
+  sol session compact [ID]
+
+Batch requests print assistant text to stdout. -verbose prints tool progress to stderr.
+Select an existing session with -session ID or SOL_SESSION. With neither, each request
+creates a new session. No global current session is stored. Sessions retain their
+model, agent and working directory; explicit -model and -agent override selections.
+
+Example:
+  export SOL_SESSION="$(sol session new)"
+  sol 'Inspect this project'
+  sol 'Continue with the change'
+  sol session compact "$SOL_SESSION"
+
+Options:`)
+		flag.CommandLine.SetOutput(os.Stdout)
+		flag.PrintDefaults()
+		if *help {
+			return nil
+		}
+		return errors.New("a request is required")
+	}
+	return executeBatch(ctx, strings.Join(flag.Args(), " "), *id, *model, *agentName, *name, *mcp, *search, *searchEntry, *verbose, false)
+}
+
+func nestedDepth() (int, error) {
+	value, present := os.LookupEnv("SOL_DEPTH")
+	if !present {
+		return 0, nil
+	}
+	depth, err := strconv.Atoi(value)
+	if err != nil || depth < 0 {
+		return 0, errors.New("SOL_DEPTH must be a nonnegative integer")
+	}
+	if depth > 1 {
+		return 0, errors.New("nested Sol limit reached: a child Sol cannot launch another model execution")
+	}
+	return depth, nil
+}
+
+func childEnvironment(depth int) []string {
+	var env []string
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		if key != "SOL_DEPTH" && key != "SOL_SESSION" {
+			env = append(env, entry)
+		}
+	}
+	return append(env, "SOL_DEPTH="+strconv.Itoa(depth+1))
+}
+
+func selectedSession(explicit string) (string, error) {
+	if explicit != "" {
+		return explicit, nil
+	}
+	if value, present := os.LookupEnv("SOL_SESSION"); present {
+		if value == "" {
+			return "", errors.New("SOL_SESSION is empty; unset it or select an existing session")
+		}
+		return value, nil
+	}
+	return "", nil
+}
+
+func executeBatch(ctx context.Context, prompt, id, modelRef, agentName, name, mcp string, search bool, searchEntry string, verbose, compact bool) error {
+	depth, err := nestedDepth()
+	if err != nil {
+		return err
+	}
+	id, err = selectedSession(id)
+	if err != nil {
+		return err
+	}
+	root, err := localconfig.SessionPath()
+	if err != nil {
+		return err
+	}
+	if compact && id == "" {
+		return errors.New("compact requires a session ID or SOL_SESSION")
+	}
+	newSession := id == ""
+	s, err := localconfig.OpenSession(ctx, root, id, newSession)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	cwd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	if cwd != s.Record.WorkDir {
+		return fmt.Errorf("session belongs to %s; run Sol from that directory", s.Record.WorkDir)
+	}
 	proxyURL := os.Getenv("AIRLOCK_API_URL")
-	proxyToken := os.Getenv("AIRLOCK_BUILD_TOKEN")
 	var store localconfig.Store
-	config := localconfig.Config{Providers: make(map[string]localconfig.ProviderAuth)}
-	var err error
+	config := localconfig.Config{Providers: make(map[string]localconfig.ProviderConfig)}
 	if proxyURL == "" {
 		store, err = localStore()
 		if err == nil {
 			config, err = store.Load(ctx)
 		}
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "[sol]", err)
-			os.Exit(1)
+			return err
 		}
-	} else if explicitAuth && *authFlag == "codex" {
-		fmt.Fprintln(os.Stderr, "[sol] -auth codex requires direct local mode; unset AIRLOCK_API_URL")
-		os.Exit(1)
 	}
-	selection, err := selectModel(config, *modelFlag, *authFlag, explicitModel, explicitAuth)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "[sol]", err)
-		os.Exit(1)
+	if agentName == "" {
+		agentName = s.Record.Agent
 	}
-	*modelFlag = selection.Model
-	*authFlag = selection.Auth
-
-	// Parse model to determine provider
-	providerID, modelID := provider.ParseModel(*modelFlag)
+	if agentName == "" {
+		agentName = config.DefaultAgent
+	}
+	if agentName == "" {
+		agentName = "build"
+	}
+	if modelRef == "" {
+		modelRef = s.Record.Model
+	}
+	var model stream.Model
+	var limits session.ModelLimits
+	var apiKey, providerID, modelID, auth string
 	baseURL := os.Getenv("OPENAI_BASE_URL")
-	if err := validateAuthMode(*authFlag, providerID, modelID, proxyURL, baseURL, explicitModel || config.DefaultModel != nil); err != nil {
-		fmt.Fprintln(os.Stderr, "[sol]", err)
-		os.Exit(1)
-	}
-	var directModel, titleModel stream.Model
-	if *authFlag == "codex" {
-		client, err := localCodex(store)
+	if proxyURL == "" {
+		ref, binding, err := selectModel(config, modelRef)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "[sol]", err)
-			os.Exit(1)
+			return err
 		}
-		opts := provider.CodexOptions{Credentials: client, HTTPClient: &http.Client{}, URL: provider.CodexURL, UserAgent: "sol/" + sol.Version, SessionID: rand.Text()}
-		directModel, titleModel, err = codexModels(modelID, *titleModelFlag, explicitTitle, opts)
+		modelRef = ref.Entry + "/" + ref.Model
+		providerID, modelID, auth = ref.Provider, ref.Model, binding.Auth
+		model, limits, err = provider.ResolveLocalModel(ctx, provider.LocalModelOptions{Model: modelRef, Store: store, HTTPClient: &http.Client{}, UserAgent: "sol/" + sol.Version, SessionID: s.Record.ID, BaseURL: baseURL})
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "[sol]", err)
-			os.Exit(1)
+			return err
 		}
-	}
-
-	// Load API key based on provider (not needed in proxy mode)
-	var apiKey string
-	if proxyURL == "" && *authFlag == "api-key" {
-		apiKey, err = provider.ResolveLocalAPIKey(config, providerID, os.LookupEnv)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "[sol]", err)
-			os.Exit(1)
-		}
-		directModel = provider.CreateModel(providerID, modelID, provider.Options{APIKey: apiKey, BaseURL: baseURL})
-		titleModel = directModel
-		if explicitTitle && !*noTitleFlag {
-			id, model := provider.ParseModel(*titleModelFlag)
-			key, err := provider.ResolveLocalAPIKey(config, id, os.LookupEnv)
+		if auth == localconfig.APIKeyMode {
+			apiKey, err = provider.ResolveLocalAPIKey(config, ref.Entry, os.LookupEnv)
 			if err != nil {
-				fmt.Fprintln(os.Stderr, "[sol] title:", err)
-				os.Exit(1)
+				return err
 			}
-			titleModel = provider.CreateModel(id, model, provider.Options{APIKey: key, BaseURL: baseURL})
 		}
-	}
-
-	// Get agent from registry (factory creates it with right tools for this model)
-	selectedAgent, exists := agent.Get(*agentFlag, modelID)
-	if !exists {
-		fmt.Fprintf(os.Stderr, "[sol] Error: Unknown agent type: %s\n", *agentFlag)
-		fmt.Fprintf(os.Stderr, "Available agents: %v\n", agent.List())
-		os.Exit(1)
-	}
-
-	// Set the full model string and optional name override
-	selectedAgent.Model = *modelFlag
-	if *nameFlag != "" {
-		selectedAgent.Name = *nameFlag
-	}
-
-	// Enable web search if requested
-	if *searchFlag {
-		t, ok := resolveSearch(*authFlag, providerID, apiKey, config)
-		if !ok {
-			fmt.Fprintf(os.Stderr, "[sol] Error: -search requires a search-capable provider or an independent Brave/Perplexity API key in env/store\n")
-			os.Exit(1)
-		}
-		selectedAgent.Tools.Add(t)
-		fmt.Printf("[%s] Web search: enabled\n", selectedAgent.Name)
-	}
-
-	// Connect to MCP servers if configured
-	if *mcpFlag != "" {
-		servers := parseMCPFlag(*mcpFlag)
-		mcpClient, mcpTools, err := sol.ConnectMCPServers(ctx, servers)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[sol] MCP error: %v\n", err)
-			os.Exit(1)
-		}
-		defer mcpClient.DisconnectAll()
-		selectedAgent.Tools = tools.MergeToolSets(selectedAgent.Tools, mcpTools)
-		fmt.Printf("[%s] MCP: %d server(s), %d tool(s)\n", selectedAgent.Name, len(servers), len(mcpTools))
-	}
-
-	cwd, _ := os.Getwd()
-
-	// Build the proxy model if in proxy mode.
-	proxyModel := directModel
-	if proxyURL != "" {
-		proxyModel = provider.CreateProxyModel(*modelFlag, provider.ProxyOptions{
-			BaseURL: proxyURL,
-			Token:   proxyToken,
-		})
-	}
-	if titleModel == nil {
-		titleModel = proxyModel
-	}
-
-	fmt.Printf("[%s] Starting...\n", selectedAgent.Name)
-	if len(prompts) == 1 {
-		fmt.Printf("[%s] Prompt: %s\n", selectedAgent.Name, prompts[0])
 	} else {
-		fmt.Printf("[%s] Test mode: %d prompts\n", selectedAgent.Name, len(prompts))
-	}
-	fmt.Printf("[%s] Model: %s (auth: %s; using %s prompt)\n", selectedAgent.Name, *modelFlag, *authFlag, sol.GetPromptForModel(modelID))
-
-	if proxyURL != "" {
-		fmt.Printf("[%s] Using Airlock proxy: %s\n", selectedAgent.Name, proxyURL)
-	} else if baseURL != "" {
-		fmt.Printf("[%s] Using base URL: %s\n", selectedAgent.Name, baseURL)
-	}
-
-	// Build permission rules
-	var rules []bus.PermissionRule
-	if !*interactiveFlag {
-		rules = []bus.PermissionRule{{Permission: "*", Pattern: "*", Action: "allow"}}
-	}
-
-	// Channel for title generation result (async) - only for single prompt mode
-	enableTitleGen := !*noTitleFlag
-	var titleChan <-chan sol.TitleResult
-	if enableTitleGen && len(prompts) == 1 {
-		titleChan = sol.GenerateTitleWithModelAsync(ctx, prompts[0], titleModel)
-	}
-
-	var totalSteps int
-	var messages []goai.Message // nil for first run
-
-	for i, prompt := range prompts {
-		if len(prompts) > 1 {
-			fmt.Printf("\n[%s] === Prompt %d/%d: %s ===\n", selectedAgent.Name, i+1, len(prompts), prompt)
+		if modelRef == "" {
+			modelRef = "openai/gpt-4o"
 		}
-
-		for {
-			opts := sol.RunnerOptions{
-				Agent:   selectedAgent,
-				APIKey:  apiKey,
-				BaseURL: baseURL,
-				WorkDir: cwd,
-				Quiet:   false,
-				Model:   proxyModel,
+		providerID, modelID = provider.ParseModel(modelRef)
+		model = provider.CreateProxyModel(modelRef, provider.ProxyOptions{BaseURL: proxyURL, Token: os.Getenv("AIRLOCK_BUILD_TOKEN")})
+	}
+	a, exists := agent.Get(agentName, modelID)
+	if !exists {
+		return fmt.Errorf("unknown agent %q; available: %v", agentName, agent.List())
+	}
+	// The runner receives the transport identity, not the local account namespace.
+	a.Model = providerID + "/" + modelID
+	if name != "" {
+		a.Name = name
+	}
+	if search {
+		searchAuth, searchID, searchKey := auth, providerID, apiKey
+		if searchEntry != "" {
+			if proxyURL != "" {
+				return errors.New("named search accounts require direct local mode")
 			}
-			if messages != nil {
-				opts.InitialMessages = messages
+			_, searchID, err = localconfig.ParseEntry(searchEntry)
+			if err == nil {
+				searchKey, err = provider.ResolveLocalAPIKey(config, searchEntry, os.LookupEnv)
 			}
-
-			runner := sol.NewRunner(opts)
-			runner.PermissionManager().SetRules(rules)
-
-			if !*interactiveFlag {
-				runner.QuestionManager().SetAutoAnswer(true)
+			if err != nil {
+				return err
 			}
-
-			// Run the agent with context values for tool execution
-			runCtx := context.WithValue(ctx, tools.RunnerKey, runner)
-			runCtx = context.WithValue(runCtx, tools.WorkDirKey, cwd)
-
-			result, runErr := runner.Run(runCtx, prompt)
-			if runErr != nil {
-				fmt.Fprintf(os.Stderr, "[%s] Error: %s\n", selectedAgent.Name, runErr)
-				os.Exit(1)
-			}
-
-			totalSteps += len(result.Steps)
-			messages = result.Messages
-
-			if result.Status == sol.RunCompleted {
-				break // done with this prompt
-			}
-
-			if result.Status == sol.RunSuspended { // Interactive: handle suspension
-				if !*interactiveFlag {
-					fmt.Fprintf(os.Stderr, "[%s] Unexpected suspension in auto-approve mode\n", selectedAgent.Name)
-					os.Exit(1)
-				}
-
-				sc := result.SuspensionContext
-				fmt.Printf("\n[%s] Suspended: %s\n", selectedAgent.Name, sc.Reason)
-				if sc.Reason == "permission" {
-					for sc != nil {
-						if len(sc.PendingToolCalls) == 0 {
-							fmt.Fprintf(os.Stderr, "[%s] Permission suspension has no pending tool call\n", selectedAgent.Name)
-							os.Exit(1)
-						}
-						tc := sc.PendingToolCalls[0]
-						fmt.Printf("[%s] Pending tool: %s (call %s)\n", selectedAgent.Name, tc.Name, tc.ID)
-						fmt.Printf("[%s] Allow? [y]es / [a]lways / [n]o: ", selectedAgent.Name)
-
-						scanner := bufio.NewScanner(os.Stdin)
-						if !scanner.Scan() {
-							fmt.Fprintf(os.Stderr, "[%s] Failed to read input\n", selectedAgent.Name)
-							os.Exit(1)
-						}
-
-						response := strings.ToLower(strings.TrimSpace(scanner.Text()))
-						approved := response != "n" && response != "no"
-						if response == "a" || response == "always" {
-							rule := bus.PermissionRule{Permission: "*", Pattern: "*", Action: "allow"}
-							rules = append(rules, rule)
-							runner.PermissionManager().AddRule(rule)
-						}
-
-						resolution, resolveErr := runner.ResolvePermissionSuspension(runCtx, sc, approved)
-						if resolveErr != nil {
-							fmt.Fprintf(os.Stderr, "[%s] Failed to resolve permission: %s\n", selectedAgent.Name, resolveErr)
-							os.Exit(1)
-						}
-						messages = append(messages, resolution.Messages...)
-						sc = resolution.SuspensionContext
-					}
-
-					prompt = ""
-					continue
-				}
-
-				for _, tc := range sc.PendingToolCalls {
-					fmt.Printf("[%s] Pending tool: %s (call %s)\n", selectedAgent.Name, tc.Name, tc.ID)
-					fmt.Printf("[%s] Allow? [y]es / [a]lways / [n]o: ", selectedAgent.Name)
-
-					scanner := bufio.NewScanner(os.Stdin)
-					if !scanner.Scan() {
-						fmt.Fprintf(os.Stderr, "[%s] Failed to read input\n", selectedAgent.Name)
-						os.Exit(1)
-					}
-
-					response := strings.ToLower(strings.TrimSpace(scanner.Text()))
-					switch response {
-					case "y", "yes", "":
-						// Allow once — tool will re-execute on next loop
-					case "a", "always":
-						rules = append(rules, bus.PermissionRule{
-							Permission: "*", Pattern: "*", Action: "allow",
-						})
-					case "n", "no":
-						messages = append(messages, goai.NewToolResultDenied(
-							tc.ID, tc.Name, "permission denied by user",
-						))
-					default:
-						// Treat as allow once
-					}
-				}
-
-				prompt = "" // resume with no new prompt
-				continue    // re-enter loop with updated messages + rules
-			}
-
-			// Any other status (failed, cancelled) — exit
-			fmt.Fprintf(os.Stderr, "[%s] Run ended with status: %s\n", selectedAgent.Name, result.Status)
-			os.Exit(1)
+			searchAuth = localconfig.APIKeyMode
+		}
+		t, ok := resolveSearch(searchAuth, searchID, searchKey)
+		if !ok {
+			return errors.New("-search requires a search-capable API-key account; use -search-provider slug/provider")
+		}
+		a.Tools.Add(t)
+	}
+	if mcp != "" {
+		servers, err := parseMCPFlag(mcp)
+		if err != nil {
+			return err
+		}
+		client, mcpTools, err := sol.ConnectMCPServers(ctx, servers)
+		if err != nil {
+			return err
+		}
+		defer client.DisconnectAll()
+		a.Tools = tools.MergeToolSets(a.Tools, mcpTools)
+	}
+	if s.Record.Active && compact {
+		return errors.New("session was interrupted; send an explicit request before compacting")
+	}
+	if s.Record.Active {
+		warning := session.FromGoAIMessage(goai.NewUserMessage("The previous local execution was interrupted. Tool effects after the last saved step have unknown outcomes. Inspect the workspace before retrying any action; do not automatically replay prior work."))
+		if err := s.Append(ctx, []session.Message{warning}); err != nil {
+			return err
 		}
 	}
-
-	// Wait for title generation to complete
-	if titleChan != nil {
-		if titleResult := <-titleChan; titleResult.Error == nil && titleResult.Title != "" {
-			fmt.Printf("[%s] Title: %s\n", selectedAgent.Name, titleResult.Title)
-		}
+	s.Record.Model, s.Record.Agent = modelRef, agentName
+	if s.Record.Title == "" && prompt != "" {
+		title := []rune(strings.Join(strings.Fields(prompt), " "))
+		s.Record.Title = string(title[:min(80, len(title))])
 	}
-
-	fmt.Printf("\n[%s] Done (%d steps)\n", selectedAgent.Name, totalSteps)
+	runner := sol.NewRunner(sol.RunnerOptions{Agent: a, WorkDir: cwd, Quiet: true, Model: model, ModelLimits: limits, SessionStore: s})
+	runner.PermissionManager().SetRules([]bus.PermissionRule{{Permission: "*", Pattern: "*", Action: "allow"}})
+	runner.QuestionManager().SetAutoAnswer(true)
+	runCtx := context.WithValue(ctx, tools.RunnerKey, runner)
+	runCtx = context.WithValue(runCtx, tools.WorkDirKey, cwd)
+	runCtx = tools.WithProcessEnvironment(runCtx, childEnvironment(depth))
+	if compact {
+		result, err := runner.Compact(runCtx)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stdout, "Compacted %s (%d estimated tokens freed).\n", s.Record.ID, result.TokensFreed)
+		return nil
+	}
+	s.Record.Active = true
+	if err := s.Save(ctx); err != nil {
+		return err
+	}
+	if newSession {
+		fmt.Fprintln(os.Stderr, "Session:", s.Record.ID)
+	}
+	var outputMu sync.Mutex
+	unsubscribe := runner.Bus().SubscribeAll(func(e bus.Event) {
+		outputMu.Lock()
+		defer outputMu.Unlock()
+		switch e.Type {
+		case bus.StreamToolCall:
+			if verbose {
+				fmt.Fprintln(os.Stderr, "Tool:", e.Properties.(stream.ToolCallEvent).ToolName)
+			}
+		}
+	})
+	defer unsubscribe()
+	result, runErr := runner.Run(runCtx, prompt)
+	if result != nil && result.TotalText != "" {
+		fmt.Fprintln(os.Stdout, result.TotalText)
+	}
+	// Keep the interruption marker on failure; the next explicit turn receives it.
+	if runErr != nil {
+		return runErr
+	}
+	if result.Status != sol.RunCompleted {
+		return fmt.Errorf("run ended with status %s", result.Status)
+	}
+	s.Record.Active = false
+	commitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
+	return s.Save(commitCtx)
 }
 
-// parseMCPFlag parses the -mcp flag value into MCPServer entries.
-// Format: "name=url,name2=url2"
-func parseMCPFlag(value string) []sol.MCPServer {
+func parseMCPFlag(value string) ([]sol.MCPServer, error) {
 	var servers []sol.MCPServer
 	for _, pair := range strings.Split(value, ",") {
-		pair = strings.TrimSpace(pair)
-		if pair == "" {
-			continue
+		name, url, ok := strings.Cut(strings.TrimSpace(pair), "=")
+		if !ok || strings.TrimSpace(name) == "" || strings.TrimSpace(url) == "" {
+			return nil, fmt.Errorf("invalid MCP server %q: expected name=url", pair)
 		}
-		name, url, ok := strings.Cut(pair, "=")
-		if !ok {
-			fmt.Fprintf(os.Stderr, "[sol] Warning: invalid MCP server spec %q (expected name=url)\n", pair)
-			continue
-		}
-		servers = append(servers, sol.MCPServer{
-			Name: strings.TrimSpace(name),
-			URL:  strings.TrimSpace(url),
-		})
+		servers = append(servers, sol.MCPServer{Name: strings.TrimSpace(name), URL: strings.TrimSpace(url)})
 	}
-	return servers
+	return servers, nil
 }
