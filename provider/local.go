@@ -209,7 +209,7 @@ func ResolveLocalAPIKey(config localconfig.Config, id string, lookup func(string
 	}
 	p, ok := config.Providers[id]
 	if !ok {
-		return "", fmt.Errorf("unknown provider entry %s; run sol auth set-key %s", id, id)
+		return "", fmt.Errorf("unknown provider entry %s; run sol --auth set-key %s", id, id)
 	}
 	if p.Auth != localconfig.APIKeyMode {
 		return "", errors.New("selected entry does not use api-key authentication")
@@ -239,7 +239,7 @@ func ResolveLocalAPIKey(config localconfig.Config, id string, lookup func(string
 		}
 		return p.Key, nil
 	}
-	return "", fmt.Errorf("account disconnected; configure an API key with sol auth set-key %s", id)
+	return "", fmt.Errorf("account disconnected; configure an API key with sol --auth set-key %s", id)
 }
 
 func localLimits(id, modelID string, override *session.ModelLimits) (session.ModelLimits, error) {

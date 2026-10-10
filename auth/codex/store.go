@@ -8,7 +8,7 @@ import (
 	"github.com/airlockrun/sol/localconfig"
 )
 
-var ErrNotLoggedIn = errors.New("codex: account disconnected; run sol auth login ENTRY --method codex")
+var ErrNotLoggedIn = errors.New("codex: account disconnected; run sol --auth login ENTRY --method codex")
 
 type Credential = localconfig.OAuthCredential
 type Store interface {

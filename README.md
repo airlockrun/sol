@@ -27,16 +27,28 @@ Requires Go 1.26+.
 
 ```bash
 sol "summarize the contents of README.md"
-sol -model personal/openai/gpt-4o -agent plan "outline a migration to postgres 17"
+sol --model personal/openai/gpt-4o --agent plan "outline a migration to postgres 17"
 sol "Summarize README.md" > summary.txt
 ```
 
 Flags:
 
-- `-model` — explicit `slug/provider/model` reference; otherwise the saved default
-- `-agent` — override the session/configured agent: `build`, `plan`, `explore`, `general`
-- `-session` — existing durable session ID; overrides `SOL_SESSION`
-- `-verbose` — tool progress on stderr
+- `--model` — explicit `slug/provider/model` reference; otherwise the saved default
+- `--agent` — override the session/configured agent: `build`, `plan`, `explore`, `general`
+- `--sid` — existing durable session ID; overrides `SOL_SESSION` for this invocation
+- `--verbose` — tool progress on stderr
+- `--compact` — summarize the selected session's model context
+- `--clear` — reset the selected session's active context, retaining full history
+- `--help`, `--version` — usage and version without configuration or credential access
+
+Administrative commands require `--session`, `--auth`, or `--config`. Positional
+words always form the prompt: `sol session list` sends `session list` to the model.
+Options are parsed only before the first prompt word; `sol request --session list`
+sends `request --session list`. A leading bare `--` ends option parsing:
+`sol -- --help` sends the literal prompt `--help`. A bare `--` after the prompt
+starts is literal too. Unknown options before a prompt fail without model access.
+Administrative options require double hyphens; operational options such as
+`--model` also accept Go's single-hyphen spelling.
 
 Requests are noninteractive batch executions: assistant text goes to stdout,
 errors and newly created session IDs to stderr. Permissions are auto-approved and
@@ -45,17 +57,19 @@ questions use the runner's automatic answers. No title-generation request runs.
 ### Default agent and local sessions
 
 ```bash
-sol config agent plan
-sol config agent                         # read the default
-export SOL_SESSION="$(sol session new)"  # create/select this terminal's session
+sol --config agent plan
+sol --config agent                       # read the default
+export SOL_SESSION="$(sol --session new)" # create/select this terminal's session
 sol 'Inspect the project'
 sol 'Continue with the implementation'   # resume the same history
-sol session compact "$SOL_SESSION"       # summarize model context without running tools
-sol session show "$SOL_SESSION"          # JSON record including full history
-sol session list
-sol -session OTHER_ID 'Continue that session'
+sol --session compact "$SOL_SESSION"     # summarize model context without running tools
+sol --compact                            # compact SOL_SESSION
+sol --sid OTHER_ID --clear                # reset context; retain the full transcript
+sol --session show "$SOL_SESSION"        # JSON record including full history and context
+sol --session list
+sol --sid OTHER_ID 'Continue that session'
 export SOL_SESSION=OTHER_ID              # switch this shell's selection
-sol config agent --clear                 # default to build
+sol --config agent --clear               # default to build
 ```
 
 Each shell selects its own ID explicitly. No global current-session file, terminal
@@ -70,6 +84,16 @@ from the compacted model context. One cross-process lease protects an entire tur
 a concurrent writer to the same session fails busy while unrelated sessions run
 independently. Interrupted turns retain an explicit unknown-effect marker for the
 next requested turn; commands are not automatically replayed.
+
+`--clear` uses the same exclusive session lease as a request or compaction. It
+atomically empties model context and resets the interruption marker, preserving
+the session ID, agent, model, working directory and full transcript. Repeating it
+adds no history entries. The next request starts with fresh instructions and only
+new messages, while the transcript continues accumulating. Clear works from any
+directory without model resolution, credentials, tools or configuration writes.
+It changes only session context, not workspace files, Git state or external processes.
+`--sid ID --compact` and `--sid ID --clear` override the shell's selection locally.
+`--session compact ID` also overrides it; combining that ID with `--sid` fails.
 
 `SOL_DEPTH` guards nested model executions. An outer Sol passes `SOL_DEPTH=1` to
 launched programs, allowing one child Sol. That child passes `SOL_DEPTH=2`, which
@@ -89,14 +113,14 @@ reference in one private user configuration file:
 `.sol` directories or load project `.env` files.
 
 ```bash
-sol auth set-key personal/openai                # hidden terminal prompt
-secret-manager-command | sol auth set-key work/anthropic --stdin
-sol auth status personal/openai                 # presence only, never the key
-sol auth remove-key personal/openai
-sol config model personal/openai/gpt-4o-mini     # save explicit account/model
-sol config model                               # read the selected default
+sol --auth set-key personal/openai              # hidden terminal prompt
+secret-manager-command | sol --auth set-key work/anthropic --stdin
+sol --auth status personal/openai               # presence only, never the key
+sol --auth remove-key personal/openai
+sol --config model personal/openai/gpt-4o-mini   # save explicit account/model
+sol --config model                             # read the selected default
 sol "Summarize README.md"                       # use that default
-sol config model --clear
+sol --config model --clear
 ```
 
 `secret-manager-command` represents a command that writes the API key to stdout.
@@ -141,11 +165,11 @@ variable; missing/empty values fail. Global provider environment variables never
 override inline keys or create accounts. Optional account `baseURL` selects an
 API-key endpoint. Disconnected entries retain their method with no credentials.
 
-`-model` overrides the saved reference, including its account. Without an explicit
+`--model` overrides the saved reference, including its account. Without an explicit
 reference or `defaultModel`, startup fails with configuration instructions. Missing
 accounts and disconnected accounts fail without choosing another account, method,
 or environment key. Login, refresh and logout preserve the default reference.
-`sol config model --clear` clears it. `-auth` is not a model-selection flag.
+`sol --config model --clear` clears it. `--auth` selects account administration.
 
 Sol uses private files/directories (`0600`/`0700` on Unix and protected current-user
 ACLs on Windows), fsync and atomic replacement. `config.json.lock` serializes short
@@ -177,13 +201,13 @@ logout. Remove the inactive backup manually when it is no longer needed.
 Use a ChatGPT account with access to the selected Codex model:
 
 ```bash
-sol auth login work/openai --method codex
-sol auth login personal/openai --method codex    # independent account session
-sol auth status work/openai
-sol -model work/openai/gpt-5.4 -agent plan "Summarize README.md"
-sol config model work/openai/gpt-5.4
-sol -agent plan "Summarize README.md"
-sol auth logout work/openai
+sol --auth login work/openai --method codex
+sol --auth login personal/openai --method codex  # independent account session
+sol --auth status work/openai
+sol --model work/openai/gpt-5.4 --agent plan "Summarize README.md"
+sol --config model work/openai/gpt-5.4
+sol --agent plan "Summarize README.md"
+sol --auth logout work/openai
 ```
 
 Login prints `https://auth.openai.com/codex/device` and a code to enter there.
@@ -195,7 +219,7 @@ the local credential only.
 
 Codex is a method attached to each named OpenAI entry. Each login persists only
 that entry's tokens after success. Configured Codex entries support
-`sol auth login ENTRY` without repeating the method. Per-entry locks serialize
+`sol --auth login ENTRY` without repeating the method. Per-entry locks serialize
 refresh-token rotation across processes, including concurrent runs and subagents.
 Refresh starts when access expires within one minute; successful refresh is
 persisted before a model request is sent. Auth failures are reported to the caller;
@@ -209,8 +233,8 @@ alone does not change another entry's requests. It does not require
 availability depends on the account's Codex entitlements; an ordinary OpenAI
 catalog entry does not establish subscription access.
 
-With Codex, `-search -search-provider personal/brave` selects an independent API-key entry,
-configured with `sol auth set-key personal/brave`. Device credentials never reach
+With Codex, `--search --search-provider personal/brave` selects an independent API-key entry,
+configured with `sol --auth set-key personal/brave`. Device credentials never reach
 API-key search backends. Session titles are deterministic excerpts of the first request.
 
 ### Explicit Codex models for library and local SDK tests

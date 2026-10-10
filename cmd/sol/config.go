@@ -23,7 +23,7 @@ func runConfig(ctx context.Context, args []string, output io.Writer, store local
 		return runAgentConfig(ctx, args[1:], output, store)
 	}
 	if len(args) < 1 || args[0] != "model" || len(args) > 2 {
-		return errors.New("usage: sol config model [slug/provider/model | --clear]")
+		return errors.New("usage: sol --config model [slug/provider/model | --clear]")
 	}
 	if len(args) == 1 {
 		config, err := store.Load(ctx)
@@ -74,7 +74,7 @@ func runConfig(ctx context.Context, args []string, output io.Writer, store local
 
 func runAgentConfig(ctx context.Context, args []string, output io.Writer, store localconfig.Store) error {
 	if len(args) > 1 {
-		return errors.New("usage: sol config agent [name | --clear]")
+		return errors.New("usage: sol --config agent [name | --clear]")
 	}
 	if len(args) == 0 {
 		c, err := store.Load(ctx)
@@ -109,7 +109,7 @@ func selectModel(config localconfig.Config, model string) (localconfig.ModelRef,
 		model = config.DefaultModel
 	}
 	if model == "" {
-		return localconfig.ModelRef{}, localconfig.ProviderConfig{}, errors.New("no model selected; use -model slug/provider/model or sol config model slug/provider/model")
+		return localconfig.ModelRef{}, localconfig.ProviderConfig{}, errors.New("no model selected; use --model slug/provider/model or sol --config model slug/provider/model")
 	}
 	return config.Resolve(model)
 }

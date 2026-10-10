@@ -4,7 +4,6 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"net/http"
 	"os"
@@ -35,79 +34,36 @@ func main() {
 }
 
 func runCLI(ctx context.Context) error {
-	if len(os.Args) > 1 && (os.Args[1] == "auth" || os.Args[1] == "config") {
+	options, err := parseCLI(os.Args[1:])
+	if err != nil {
+		return err
+	}
+	switch options.action {
+	case "help":
+		fmt.Fprint(os.Stdout, cliUsage)
+		return nil
+	case "version":
+		fmt.Fprintln(os.Stdout, sol.Version)
+		return nil
+	case "auth", "config":
 		store, err := localStore()
 		if err != nil {
 			return err
 		}
-		if os.Args[1] == "config" {
-			return runConfig(ctx, os.Args[2:], os.Stdout, store)
+		if options.action == "config" {
+			return runConfig(ctx, options.args, os.Stdout, store)
 		}
-		return runAuth(ctx, os.Args[2:], os.Stdout, nil, store, func(ctx context.Context, stdin bool) (string, error) {
+		return runAuth(ctx, options.args, os.Stdout, nil, store, func(ctx context.Context, stdin bool) (string, error) {
 			return readAPIKey(ctx, os.Stdin, os.Stderr, stdin)
 		})
+	case "session":
+		return runSessionCommand(ctx, options.args, options.id)
+	case "compact":
+		return executeBatch(ctx, "", options.id, options.model, options.agent, options.name, options.mcp, options.search, options.searchEntry, options.verbose, true)
+	case "clear":
+		return clearSession(ctx, options.id)
 	}
-	if len(os.Args) > 1 && os.Args[1] == "session" {
-		return runSessionCommand(ctx, os.Args[2:])
-	}
-	model := flag.String("model", "", "Local model reference slug/provider/model")
-	agentName := flag.String("agent", "", "Agent override (uses session or configured default)")
-	name := flag.String("name", "", "Agent name for prompts")
-	id := flag.String("session", "", "Existing session ID; overrides SOL_SESSION")
-	mcp := flag.String("mcp", "", "MCP servers: name=url,name2=url2")
-	search := flag.Bool("search", false, "Enable web search")
-	searchEntry := flag.String("search-provider", "", "Named API-key account for independent search")
-	verbose := flag.Bool("verbose", false, "Print tool progress to stderr")
-	help := flag.Bool("h", false, "Show help")
-	version := flag.Bool("version", false, "Show version")
-	flag.Parse()
-	var emptySelector bool
-	flag.Visit(func(f *flag.Flag) {
-		if f.Name == "session" && *id == "" {
-			emptySelector = true
-		}
-	})
-	if emptySelector {
-		return errors.New("-session requires a nonempty existing session ID")
-	}
-	if *version {
-		fmt.Fprintln(os.Stdout, sol.Version)
-		return nil
-	}
-	if *help || flag.NArg() == 0 {
-		fmt.Fprintln(os.Stdout, `Usage:
-  sol [options] 'request'
-  sol config agent [build|plan|explore|general|--clear]
-  sol config model [slug/provider/model|--clear]
-  sol auth login ENTRY [--method codex]
-  sol auth set-key ENTRY [--stdin]
-  sol auth status [ENTRY]
-  sol auth logout|remove-key ENTRY
-  sol session new
-  sol session list
-  sol session show ID
-  sol session compact [ID]
-
-Batch requests print assistant text to stdout. -verbose prints tool progress to stderr.
-Select an existing session with -session ID or SOL_SESSION. With neither, each request
-creates a new session. No global current session is stored. Sessions retain their
-model, agent and working directory; explicit -model and -agent override selections.
-
-Example:
-  export SOL_SESSION="$(sol session new)"
-  sol 'Inspect this project'
-  sol 'Continue with the change'
-  sol session compact "$SOL_SESSION"
-
-Options:`)
-		flag.CommandLine.SetOutput(os.Stdout)
-		flag.PrintDefaults()
-		if *help {
-			return nil
-		}
-		return errors.New("a request is required")
-	}
-	return executeBatch(ctx, strings.Join(flag.Args(), " "), *id, *model, *agentName, *name, *mcp, *search, *searchEntry, *verbose, false)
+	return executeBatch(ctx, options.prompt, options.id, options.model, options.agent, options.name, options.mcp, options.search, options.searchEntry, options.verbose, false)
 }
 
 func nestedDepth() (int, error) {
@@ -256,7 +212,7 @@ func executeBatch(ctx context.Context, prompt, id, modelRef, agentName, name, mc
 		}
 		t, ok := resolveSearch(searchAuth, searchID, searchKey)
 		if !ok {
-			return errors.New("-search requires a search-capable API-key account; use -search-provider slug/provider")
+			return errors.New("--search requires a search-capable API-key account; use --search-provider slug/provider")
 		}
 		a.Tools.Add(t)
 	}

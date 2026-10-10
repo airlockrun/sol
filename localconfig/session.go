@@ -148,6 +148,24 @@ func (s *SessionFile) Compact(ctx context.Context, messages []session.Message, _
 	return s.Save(ctx)
 }
 
+// Clear resets model context and interruption state under the session lease.
+// The complete transcript and session identity are retained.
+func (s *SessionFile) Clear(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	context, active, updated := s.Record.Context, s.Record.Active, s.Record.Updated
+	s.Record.Context = []session.Message{}
+	s.Record.Active = false
+	if err := s.Save(ctx); err != nil {
+		s.Record.Context, s.Record.Active, s.Record.Updated = context, active, updated
+		return err
+	}
+	return nil
+}
+
 func ListSessions(root string) ([]LocalSession, error) {
 	entries, err := os.ReadDir(root)
 	if errors.Is(err, os.ErrNotExist) {
