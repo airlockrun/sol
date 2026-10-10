@@ -110,7 +110,7 @@ func (c Config) Resolve(value string) (ModelRef, ProviderConfig, error) {
 	}
 	p, exists := c.Providers[ref.Entry]
 	if !exists {
-		return ModelRef{}, ProviderConfig{}, fmt.Errorf("sol config: unknown provider entry %s; configure it with sol auth set-key or sol auth login", ref.Entry)
+		return ModelRef{}, ProviderConfig{}, fmt.Errorf("sol config: unknown provider entry %s; configure it with sol --auth set-key or sol --auth login", ref.Entry)
 	}
 	return ref, p, nil
 }

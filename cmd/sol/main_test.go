@@ -80,9 +80,9 @@ func TestCLIAccountAndProxyIsolation(t *testing.T) {
 				}
 			}))
 			defer server.Close()
-			args := []string{"-agent", "plan"}
+			args := []string{"--agent", "plan"}
 			if tc.model != "" {
-				args = append(args, "-model", tc.model)
+				args = append(args, "--model", tc.model)
 			}
 			args = append(args, "Reply cli-ok")
 			raw, _ := json.Marshal(args)

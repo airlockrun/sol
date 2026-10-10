@@ -31,7 +31,7 @@ type deviceClient interface {
 }
 
 func runAuth(ctx context.Context, args []string, output io.Writer, client deviceClient, store localconfig.Store, secret func(context.Context, bool) (string, error)) error {
-	const usage = "usage: sol auth login ENTRY [--method codex]; sol auth set-key ENTRY [--stdin]; sol auth status [ENTRY]; sol auth logout|remove-key ENTRY"
+	const usage = "usage: sol --auth login ENTRY [--method codex]; sol --auth set-key ENTRY [--stdin]; sol --auth status [ENTRY]; sol --auth logout|remove-key ENTRY"
 	if len(args) == 0 {
 		return errors.New(usage)
 	}
