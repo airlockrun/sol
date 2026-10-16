@@ -25,7 +25,12 @@ func main() {
 	spaceDir := flag.String("space-dir", "/home/agent/space", "space directory (overlayfs merged mount)")
 	homeDir := flag.String("home-dir", "", "set HOME environment variable to this path")
 	skillsDir := flag.String("skills-dir", "", "comma-separated extra skill roots (each scanned for skills/**/SKILL.md); overrides the SKILLS_DIRS env var")
+	capabilities := flag.Bool("capabilities", false, "print executable transport capabilities and exit")
 	flag.Parse()
+	if *capabilities {
+		fmt.Println(executor.CommandResultsCapability)
+		return
+	}
 
 	// Set HOME if specified (container bind-mounts a per-run home directory)
 	if *homeDir != "" {

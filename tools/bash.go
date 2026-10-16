@@ -266,7 +266,7 @@ Before executing the command, please follow these steps:
 
 Usage notes:
   - The command argument is required.
-  - You can specify an optional timeout in milliseconds. If not specified, commands will time out after 45000ms (45 seconds). When the timeout fires the whole process tree is killed. Long-running commands (go build, go test, dependency installs) WILL exceed the default; pass a larger timeout for those (e.g. 300000 for a five-minute build).
+  - You can specify an optional timeout in milliseconds. If not specified, commands will time out after 45000ms (45 seconds). When the timeout fires the whole process tree is killed. A larger tool timeout does not extend the caller's shared model/tool-batch step deadline. Use the host's durable workspace command/task tool for long builds, tests and dependency installs when available; return its task handle promptly instead of backgrounding a shell process.
   - It is very helpful if you write a clear, concise description of what this command does in 5-10 words.
   - If the output exceeds 2000 lines or 51200 bytes, it will be truncated and the full output will be written to a file. You can use Read with offset/limit to read specific sections or Grep to search the full content. Because of this, you do NOT need to use ` + "`head`" + `, ` + "`tail`" + `, or other truncation commands to limit output - just run the command directly.
 
@@ -483,10 +483,18 @@ Important:
 			if title == "" {
 				title = truncateStr(args.Command, 50)
 			}
+			exitCode := -1
+			if cmd.ProcessState != nil {
+				exitCode = cmd.ProcessState.ExitCode()
+			}
+			cancelled := execCtx.Err() == context.Canceled
+			// The model receives text output, independently of structured metadata.
+			truncResult.Content += fmt.Sprintf("\n\n<bash_metadata>\nexitCode: %d\ntimedOut: %t\ncancelled: %t\n</bash_metadata>", exitCode, timedOut, cancelled)
 
 			return tool.Result{
-				Output: truncResult.Content,
-				Title:  title,
+				Output:   truncResult.Content,
+				Title:    title,
+				Metadata: map[string]any{"exitCode": exitCode, "timedOut": timedOut, "cancelled": cancelled},
 			}, nil
 		}).
 		Build()

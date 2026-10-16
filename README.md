@@ -23,6 +23,25 @@ go install github.com/airlockrun/sol/cmd/sol@latest
 
 Requires Go 1.26+.
 
+### Execution deadlines
+
+Each `Runner` step has a 60-second deadline covering one model response and its
+entire tool batch. `Run`, `Continue`, and permission-resumed ordered batches use
+the same rule; each subsequent model step receives a fresh deadline. Set
+`RunnerOptions.StepTimeout` to a positive duration to choose a different bound.
+Compaction uses its own `MaintenanceTimeout` (60 seconds by default), and durable
+appends use `SettlementTimeout` (15 seconds by default), including after cancellation.
+Negative durations panic; zero selects the documented default.
+
+`errors.Is(err, sol.ErrStepDeadline)` identifies a terminal step deadline, also
+matching `context.DeadlineExceeded`. It is not a provider-retry instruction.
+Go cancellation is cooperative: Sol drains the stream and joins tool callbacks
+before releasing transcript ownership. A callback that ignores cancellation can
+delay return beyond the deadline. Cancellation does not undo effects. Missing
+dispatched results are recorded as unknown; undispatched calls are identified
+separately. Inspect state before retrying unknown effects; never automatically
+replay them. Long operations should return durable task handles promptly.
+
 ## CLI
 
 ```bash
