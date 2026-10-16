@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"sync/atomic"
-	"time"
 
 	"github.com/airlockrun/goai"
 	"github.com/airlockrun/goai/message"
@@ -36,9 +35,11 @@ type PermissionResolution struct {
 // under the runner's normal managers. Denial records the current call as
 // denied and every later call as skipped. Each result is attached or persisted
 // before its stream event is published.
-func (r *Runner) ResolvePermissionSuspension(ctx context.Context, suspension *SuspensionContext, approved bool) (*PermissionResolution, error) {
+func (r *Runner) ResolvePermissionSuspension(ctx context.Context, suspension *SuspensionContext, approved bool) (resolution *PermissionResolution, resolutionErr error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	ctx, cancel := context.WithTimeoutCause(ctx, r.stepTimeout, ErrStepDeadline)
+	defer cancel()
 
 	currentID, err := validatePermissionSuspension(suspension)
 	if err != nil {
@@ -66,7 +67,7 @@ func (r *Runner) ResolvePermissionSuspension(ctx context.Context, suspension *Su
 		return nil, err
 	}
 
-	resolution := &PermissionResolution{}
+	resolution = &PermissionResolution{}
 	completed := append([]stream.ToolResultEvent(nil), suspension.CompletedResults...)
 	pending := suspension.PendingToolCalls
 
@@ -93,6 +94,30 @@ func (r *Runner) ResolvePermissionSuspension(ctx context.Context, suspension *Su
 	if executor == nil {
 		executor = tool.NewLocalExecutor(r.toolSet, nil)
 	}
+	tracker := &stepExecutor{next: executor, dispatched: make(map[string]bool)}
+	executor = tracker
+	ctx = context.WithValue(ctx, stepExecutorKey{}, tracker)
+	defer func() {
+		var appendErr *sessionStoreAppendError
+		if errors.As(resolutionErr, &appendErr) {
+			return
+		}
+		if ctx.Err() == nil && resolutionErr == nil {
+			return
+		}
+		resolutionErr = errors.Join(resolutionErr, stepContextError(ctx))
+		resolved := make(map[string]bool)
+		for _, result := range resolution.Results {
+			resolved[result.ToolCallID] = true
+		}
+		var missing []stream.ToolResultEvent
+		for _, tc := range pending {
+			if !resolved[tc.ID] {
+				missing = append(missing, stream.ToolResultEvent{ToolCallID: tc.ID, ToolName: tc.Name, Input: tc.Input, Output: message.ErrorTextOutput{Value: missingOutcome(ctx, tc.ID)}})
+			}
+		}
+		resolutionErr = errors.Join(resolutionErr, r.attachPermissionResults(ctx, resolution, missing))
+	}()
 
 	privateBus := bus.New()
 	allowCurrent := bus.NewPermissionManager(privateBus)
@@ -230,21 +255,34 @@ func (r *Runner) publishSuspensionGate(suspension *SuspensionContext) {
 }
 
 func (r *Runner) attachPermissionResult(ctx context.Context, resolution *PermissionResolution, result stream.ToolResultEvent) error {
-	msg := goai.NewToolMessage(result.ToolCallID, result.ToolName, result.Output)
+	return r.attachPermissionResults(ctx, resolution, []stream.ToolResultEvent{result})
+}
+
+func (r *Runner) attachPermissionResults(ctx context.Context, resolution *PermissionResolution, results []stream.ToolResultEvent) error {
+	if len(results) == 0 {
+		return nil
+	}
+	msgs := make([]goai.Message, len(results))
+	for i, result := range results {
+		msgs[i] = goai.NewToolMessage(result.ToolCallID, result.ToolName, result.Output)
+	}
 	if r.store != nil {
-		storeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
-		err := r.store.Append(storeCtx, []session.Message{session.FromGoAIMessage(msg)})
+		storeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.settlementTimeout)
+		err := r.store.Append(storeCtx, session.FromGoAIMessages(msgs))
 		cancel()
 		if err != nil {
-			return fmt.Errorf("store append tool result %q: %w", result.ToolCallID, err)
+			r.canContinue = false
+			return &sessionStoreAppendError{err: fmt.Errorf("permission results: %w", err)}
 		}
 	} else {
-		r.initialMessages = append(r.initialMessages, msg)
+		r.initialMessages = append(r.initialMessages, msgs...)
 	}
 
-	resolution.Messages = append(resolution.Messages, msg)
-	resolution.Results = append(resolution.Results, result)
-	r.bus.Publish(bus.StreamToolResult, result)
+	resolution.Messages = append(resolution.Messages, msgs...)
+	resolution.Results = append(resolution.Results, results...)
+	for _, result := range results {
+		r.bus.Publish(bus.StreamToolResult, result)
+	}
 	return nil
 }
 

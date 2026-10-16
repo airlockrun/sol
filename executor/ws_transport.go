@@ -111,6 +111,8 @@ func NewWSTransport(url string, headers ...http.Header) (*WSTransport, error) {
 }
 
 // Send implements Transport.
+// A settled cancellation returns both the remote response and the context error.
+// Transport errors without a response cannot establish a command's exit outcome.
 func (t *WSTransport) Send(ctx context.Context, req tool.Request) (tool.Response, error) {
 	if t.closed.Load() {
 		return tool.Response{}, transportError("closed", errTransportClosed)
@@ -124,6 +126,9 @@ func (t *WSTransport) Send(ctx context.Context, req tool.Request) (tool.Response
 
 	resp, err := t.roundTrip(ctx, msg)
 	if err != nil {
+		if resp.Response != nil {
+			return *resp.Response, err
+		}
 		return tool.Response{}, err
 	}
 
@@ -145,6 +150,21 @@ func (t *WSTransport) Send(ctx context.Context, req tool.Request) (tool.Response
 		return tool.Response{}, errors.New("empty response")
 	}
 	return *resp.Response, nil
+}
+
+// RequireCommandResults checks the executable's contract without executing a tool.
+// Source mounts and application runtime versions do not identify this executable.
+func (t *WSTransport) RequireCommandResults(ctx context.Context) error {
+	resp, err := t.roundTrip(ctx, message{Type: "tools", ID: t.allocID()})
+	if err != nil {
+		return err
+	}
+	for _, capability := range resp.Capabilities {
+		if capability == CommandResultsCapability {
+			return nil
+		}
+	}
+	return fmt.Errorf("toolserver requires rebuild: missing %s capability (exitCode, timedOut, cancelled and cancellation settlement); rebuild the agent-builder image with matching Sol source and recreate workspace toolservers before retrying; no command was dispatched", CommandResultsCapability)
 }
 
 // FetchTools requests the tool definitions from the remote server.
@@ -237,6 +257,23 @@ func (t *WSTransport) roundTrip(ctx context.Context, msg message) (message, erro
 
 	select {
 	case <-ctx.Done():
+		if msg.Type == "request" {
+			// Cancellation is an out-of-band control. Wait for the original
+			// response, which is sent only after the remote callback returns.
+			// Never release the next workspace writer on local timeout alone.
+			cancelCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), wsWriteTimeout)
+			err := t.writeMsg(cancelCtx, message{Type: "cancel", CancelID: msg.ID})
+			cancel()
+			if err != nil {
+				return message{}, transportError("cancel", err)
+			}
+			select {
+			case resp := <-respCh:
+				return resp, ctx.Err()
+			case <-t.done:
+				return message{}, transportError("cancel settlement", errTransportClosed)
+			}
+		}
 		return message{}, ctx.Err()
 	case <-t.done:
 		return message{}, transportError("closed", errTransportClosed)

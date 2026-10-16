@@ -59,6 +59,51 @@ func TestToolServer_RealToolList(t *testing.T) {
 	t.Logf("Got %d tools from ToolServer", len(remoteTools))
 }
 
+func TestToolServerBashResults(t *testing.T) {
+	_, transport, remote, cleanup := setupPipeline(t, tool.Set{"bash": tools.Bash(t.TempDir())})
+	defer cleanup()
+	if err := transport.RequireCommandResults(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := transport.SetRules(t.Context(), []bus.PermissionRule{{Permission: "*", Pattern: "*", Action: "allow"}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, command string
+		timeout       int
+		code          float64
+		timedOut      bool
+	}{
+		{"success", "printf completed", 5000, 0, false},
+		{"nonzero", "printf failed; exit 7", 5000, 7, false},
+		{"timeout", "sleep 30", 30, -1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			input, _ := json.Marshal(map[string]any{"command": tc.command, "timeout": tc.timeout})
+			resp, err := remote.Execute(t.Context(), tool.Request{ToolName: "bash", Input: input, WorkDir: t.TempDir()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.Metadata["exitCode"] != tc.code || resp.Metadata["timedOut"] != tc.timedOut || resp.Metadata["cancelled"] != false {
+				t.Fatalf("metadata = %+v", resp.Metadata)
+			}
+			if !strings.Contains(resp.Output, "exitCode:") {
+				t.Fatalf("model output lacks outcome: %q", resp.Output)
+			}
+		})
+	}
+	t.Run("cancel", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		// Tool timeout is independent; cancellation travels over the socket.
+		time.AfterFunc(100*time.Millisecond, cancel)
+		resp, err := remote.Execute(ctx, tool.Request{ToolName: "bash", WorkDir: t.TempDir(), Input: json.RawMessage(`{"command":"printf started; sleep 30","timeout":5000}`)})
+		if !errors.Is(err, context.Canceled) || resp.Metadata["exitCode"] != float64(-1) || resp.Metadata["cancelled"] != true || !strings.Contains(resp.Output, "started") {
+			t.Fatalf("settled cancellation = %+v, %v", resp, err)
+		}
+	})
+}
+
 // TestToolServer_ExecuteThroughPipeline tests executing a mock tool through
 // the full ToolServer → WSTransport → RemoteExecutor pipeline.
 // This complements the existing executor_test.go tests by testing with
@@ -171,6 +216,47 @@ func TestToolServer_ReadsPongsWhileToolRuns(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("tool did not return")
+	}
+}
+
+func TestToolServerCancellationWaitsForRemoteCallbackSettlement(t *testing.T) {
+	started, cancelled, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	ts := tool.Set{"block": tool.New("block").Execute(func(ctx context.Context, _ json.RawMessage, _ tool.CallOptions) (tool.Result, error) {
+		close(started)
+		<-ctx.Done()
+		close(cancelled)
+		<-release
+		return tool.Result{}, ctx.Err()
+	}).Build()}
+	_, _, remote, cleanup := setupPipeline(t, ts)
+	defer cleanup()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := remote.Execute(ctx, tool.Request{ToolName: "block", ToolCallID: "one", Input: json.RawMessage(`{}`)})
+		done <- err
+	}()
+	<-started
+	cancel()
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("remote cancellation was not delivered")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("returned before callback settled: %v", err)
+	default:
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("settled callback did not release caller")
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/airlockrun/goai"
@@ -157,7 +158,7 @@ func TestRunnerResolvePermissionSuspensionStoreOrdering(t *testing.T) {
 		{
 			name:          "append failure prevents later execution",
 			failAppendAt:  1,
-			wantErr:       "store append tool result \"gated-1\": append failed",
+			wantErr:       "store append: permission results: append failed",
 			wantOrder:     []string{"load", "execute:gated-1", "append:gated-1"},
 			wantToolCalls: []string{"gated-1"},
 		},
@@ -442,10 +443,11 @@ func TestRunnerResolvePermissionSuspensionExecutionOutcomes(t *testing.T) {
 			wantOutcomes: []string{"denied", "denied"},
 		},
 		{
-			name:       "unrecognized fatal error fails",
-			firstError: permissionFatalError{},
-			wantErr:    true,
-			wantCalls:  []string{"first"},
+			name:         "unrecognized fatal error fails",
+			firstError:   permissionFatalError{},
+			wantErr:      true,
+			wantCalls:    []string{"first"},
+			wantOutcomes: []string{"error", "error"},
 		},
 		{
 			name:    "cancelled context prevents execution",
@@ -536,13 +538,16 @@ func TestRunnerResolvePermissionSuspensionPersistsCompletedResultAfterCancellati
 			if !reflect.DeepEqual(executor.calls, []string{"first"}) {
 				t.Errorf("executor calls = %v, want [first]", executor.calls)
 			}
-			if len(store.appended) != 1 || store.appended[0].Parts[0].Tool.CallID != "first" {
+			if len(store.appended) != 2 || store.appended[0].Parts[0].Tool.CallID != "first" {
 				t.Fatalf("appended messages = %#v, want first result", store.appended)
 			}
 			if store.appendContextErr != nil {
 				t.Errorf("append context error = %v, want nil", store.appendContextErr)
 			}
-			assertPermissionResults(t, resolution.Results, []string{"first"}, []string{"success"})
+			assertPermissionResults(t, resolution.Results, []string{"first", "second"}, []string{"success", "error"})
+			if !strings.Contains(message.ToolOutputText(resolution.Results[1].Output), "Not dispatched") {
+				t.Fatal("remaining call must be explicitly not dispatched")
+			}
 		})
 	}
 }

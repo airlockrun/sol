@@ -21,6 +21,9 @@ import (
 // own output, so a generous ceiling here only guards against a runaway frame.
 const maxWSMessageBytes = 100 << 20 // 100 MiB
 
+// CommandResultsCapability identifies bash exit metadata and settled cancellation.
+const CommandResultsCapability = "bash-results.v1"
+
 const (
 	wsPingInterval = 30 * time.Second
 	wsWriteTimeout = 10 * time.Second
@@ -58,12 +61,13 @@ func (s *ToolServer) QuestionManager() *bus.QuestionManager { return s.qm }
 
 // message is the wire format for request/response.
 type message struct {
-	Type     string         `json:"type"`               // "request", "response", "tools", "set_rules", "set_active_tools", "push_answers"
-	ID       string         `json:"id,omitempty"`       // Request ID for correlation
-	Request  *tool.Request  `json:"request,omitempty"`  // Tool request
-	Response *tool.Response `json:"response,omitempty"` // Tool response
-	Tools    []tool.Info    `json:"tools,omitempty"`    // Tool definitions
-	Error    string         `json:"error,omitempty"`    // Error message
+	Type         string         `json:"type"`               // "request", "response", "tools", "set_rules", "set_active_tools", "push_answers"
+	ID           string         `json:"id,omitempty"`       // Request ID for correlation
+	Request      *tool.Request  `json:"request,omitempty"`  // Tool request
+	Response     *tool.Response `json:"response,omitempty"` // Tool response
+	Tools        []tool.Info    `json:"tools,omitempty"`    // Tool definitions
+	Capabilities []string       `json:"capabilities,omitempty"`
+	Error        string         `json:"error,omitempty"` // Error message
 
 	// Structured fatal errors (server → client)
 	PermissionNeeded *bus.ErrPermissionNeeded `json:"permission_needed,omitempty"`
@@ -73,6 +77,8 @@ type message struct {
 	Rules       []bus.PermissionRule `json:"rules,omitempty"`
 	Answers     [][]string           `json:"answers,omitempty"`
 	ActiveTools []string             `json:"active_tools,omitempty"` // tool names to expose
+	CancelID    string               `json:"cancel_id,omitempty"`
+	requestCtx  context.Context
 }
 
 // serverConn wraps a connection with a write mutex. coder/websocket forbids
@@ -120,6 +126,8 @@ func (s *ToolServer) handleConnection(ws *websocket.Conn) {
 	defer ws.Close(websocket.StatusNormalClosure, "")
 
 	sc := &serverConn{ws: ws}
+	var pendingMu sync.Mutex
+	pending := make(map[string]context.CancelFunc)
 	go s.pingLoop(ctx, ws, cancel)
 	messages := make(chan message)
 	dispatches := make(chan message)
@@ -127,6 +135,12 @@ func (s *ToolServer) handleConnection(ws *websocket.Conn) {
 	go func() {
 		for msg := range dispatches {
 			s.dispatch(ctx, sc, msg)
+			pendingMu.Lock()
+			if stop := pending[msg.ID]; stop != nil {
+				stop()
+				delete(pending, msg.ID)
+			}
+			pendingMu.Unlock()
 		}
 	}()
 
@@ -142,6 +156,21 @@ func (s *ToolServer) handleConnection(ws *websocket.Conn) {
 		if err := json.Unmarshal(data, &msg); err != nil {
 			s.sendError(ctx, sc, "", fmt.Sprintf("invalid message: %v", err))
 			continue
+		}
+		if msg.Type == "cancel" {
+			pendingMu.Lock()
+			if stop := pending[msg.CancelID]; stop != nil {
+				stop()
+			}
+			pendingMu.Unlock()
+			continue
+		}
+		if msg.Type == "request" {
+			var stop context.CancelFunc
+			msg.requestCtx, stop = context.WithCancel(ctx)
+			pendingMu.Lock()
+			pending[msg.ID] = stop
+			pendingMu.Unlock()
 		}
 		select {
 		case messages <- msg:
@@ -248,6 +277,13 @@ func (s *ToolServer) handleRequest(ctx context.Context, sc *serverConn, msg mess
 	// A broken connection cancels the tool because no client remains to receive
 	// its result.
 	execCtx := ctx
+	if msg.requestCtx != nil {
+		execCtx = msg.requestCtx
+	}
+	if err := execCtx.Err(); err != nil {
+		s.sendError(ctx, sc, msg.ID, "Not dispatched: request cancelled before execution")
+		return
+	}
 	execCtx = bus.WithBus(execCtx, s.bus)
 	execCtx = bus.WithPermissionManager(execCtx, s.pm)
 	execCtx = bus.WithQuestionManager(execCtx, s.qm)
@@ -291,7 +327,7 @@ func (s *ToolServer) handleToolsRequest(ctx context.Context, sc *serverConn, msg
 		filtered = allTools
 	}
 
-	s.writeMsg(ctx, sc, message{Type: "tools", ID: msg.ID, Tools: filtered})
+	s.writeMsg(ctx, sc, message{Type: "tools", ID: msg.ID, Tools: filtered, Capabilities: []string{CommandResultsCapability}})
 }
 
 // handleSetRules sets the permission rules and sends an ack.

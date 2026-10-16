@@ -6,14 +6,17 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/airlockrun/goai"
 	goaierrors "github.com/airlockrun/goai/errors"
 	"github.com/airlockrun/goai/message"
+	"github.com/airlockrun/goai/provider/anthropic"
 	"github.com/airlockrun/goai/stream"
 	"github.com/airlockrun/goai/testutil"
 	"github.com/airlockrun/goai/tool"
@@ -573,6 +576,31 @@ func TestRunner_InputTokenLimit(t *testing.T) {
 	}
 	if len(model.Requests()) != 2 {
 		t.Fatalf("model calls = %d, want 2", len(model.Requests()))
+	}
+}
+
+func TestRunner_AnthropicCachedInputTokenLimit(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(testutil.AnthropicCachedMessageSSE))
+	}))
+	defer server.Close()
+	a := testAgent(tool.Set{"noop": tool.New("noop").Build()})
+	a.MaxSteps = 10
+	a.MaxInputTokens = 150
+	model := anthropic.New(anthropic.Options{APIKey: "fixture", BaseURL: server.URL}).Model("claude-test")
+	r := NewRunner(RunnerOptions{Agent: a, Model: model, Quiet: true})
+	result, err := r.Run(t.Context(), "go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != RunInputTokenLimitReached || len(result.Steps) != 1 || result.Usage.InputTotal() != 200 || result.Usage.GrandTotal() != 242 {
+		t.Fatalf("result = %+v", result)
+	}
+	if result.Error == nil || result.Error.Error() != "input token limit reached: 200 of 150" || calls.Load() != 1 {
+		t.Fatalf("error = %v, calls = %d", result.Error, calls.Load())
 	}
 }
 
