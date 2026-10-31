@@ -25,10 +25,15 @@ Requires Go 1.26+.
 
 ### Execution deadlines
 
-Each `Runner` step has a 60-second deadline covering one model response and its
-entire tool batch. `Run`, `Continue`, and permission-resumed ordered batches use
-the same rule; each subsequent model step receives a fresh deadline. Set
-`RunnerOptions.StepTimeout` to a positive duration to choose a different bound.
+Each provider attempt has a 15-minute wall deadline and a five-minute meaningful
+progress inactivity deadline, including setup and first-token thinking. Text,
+reasoning and tool-input deltas refresh inactivity; empty framing and raw SSE
+heartbeats do not. Consumer backpressure pauses inactivity, not the wall clock.
+Each tool receives its own fresh ten-minute ceiling; its operation-specific
+timeout and the caller's deadline can impose shorter bounds. Model generation
+and earlier tools do not consume a tool's allowance. `Run`, `Continue`, and
+permission/question-resumed batches use this policy. Inject `ModelTimeout`,
+`ModelIdleTimeout`, and `ToolTimeout` in `RunnerOptions` to choose other bounds.
 Compaction uses its own `MaintenanceTimeout` (60 seconds by default), and durable
 appends use `SettlementTimeout` (15 seconds by default), including after cancellation.
 Negative durations panic; zero selects the documented default.
@@ -36,8 +41,14 @@ Negative durations panic; zero selects the documented default.
 `errors.Is(err, sol.ErrStepDeadline)` identifies a terminal step deadline, also
 matching `context.DeadlineExceeded`. It is not a provider-retry instruction.
 Go cancellation is cooperative: Sol drains the stream and joins tool callbacks
-before releasing transcript ownership. A callback that ignores cancellation can
-delay return beyond the deadline. Cancellation does not undo effects. Missing
+before releasing transcript ownership or saving a cancelled response checkpoint.
+`stream.Model.Stream` must honor its context and close its returned event channel
+only after request work and callbacks settle. Sol joins this channel separately
+from goai's `FullStream`, whose setup inspection can finish on cancellation.
+A synchronous `Stream` error return must already have settled its request work.
+Settlement output is drained even when downstream consumption has stopped.
+An uncooperative producer or callback holds ownership until it settles; a timeout
+is not evidence of completion. Cancellation does not undo effects. Missing
 dispatched results are recorded as unknown; undispatched calls are identified
 separately. Inspect state before retrying unknown effects; never automatically
 replay them. Long operations should return durable task handles promptly.
@@ -59,6 +70,12 @@ Flags:
 - `--compact` — summarize the selected session's model context
 - `--clear` — reset the selected session's active context, retaining full history
 - `--help`, `--version` — usage and version without configuration or credential access
+
+Compaction summarizes only history before the latest human input. That input,
+its host context, and all following assistant/tool messages remain intact.
+Repeating compaction without another human input reports that no older history
+is eligible. An oversized latest turn fails rather than discarding executed
+actions or replaying tools.
 
 Administrative commands require `--session`, `--auth`, or `--config`. Positional
 words always form the prompt: `sol session list` sends `session list` to the model.

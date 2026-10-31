@@ -29,6 +29,42 @@ type PermissionResolution struct {
 	SuspensionContext *SuspensionContext
 }
 
+// ResolveStoppedSuspension records an already-stopped call without dispatching
+// any pending tool. Hosts use this when a decision authorizes fresh reasoning,
+// not replay of an interrupted command or its ordered remainder.
+func (r *Runner) ResolveStoppedSuspension(ctx context.Context, suspension *SuspensionContext, outcome string) (*PermissionResolution, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	current, err := validatePendingSuspension(suspension)
+	if err != nil {
+		return nil, err
+	}
+	if r.store != nil {
+		history, err := r.store.Load(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if !containsAssistantToolCall(history, current) {
+			return nil, errors.New("stopped call is absent from history")
+		}
+	} else if len(r.messages) > 0 {
+		r.initialMessages = append([]goai.Message(nil), r.messages...)
+		r.messages = nil
+	}
+	resolution := &PermissionResolution{}
+	for i, call := range suspension.PendingToolCalls {
+		text := outcome
+		if i > 0 {
+			text = "Not executed: an earlier command was stopped for a server operation challenge. Do not automatically replay this ordered batch."
+		}
+		result := stream.ToolResultEvent{ToolCallID: call.ID, ToolName: call.Name, Input: call.Input, Output: message.ErrorTextOutput{Value: text}}
+		if err := r.attachPermissionResult(ctx, resolution, result); err != nil {
+			return nil, err
+		}
+	}
+	return resolution, nil
+}
+
 // ResolvePermissionSuspension resolves the current call in a permission
 // suspension without invoking the model. Approval executes the current call
 // with call-scoped permission and then executes later pending calls in order
@@ -36,12 +72,19 @@ type PermissionResolution struct {
 // denied and every later call as skipped. Each result is attached or persisted
 // before its stream event is published.
 func (r *Runner) ResolvePermissionSuspension(ctx context.Context, suspension *SuspensionContext, approved bool) (resolution *PermissionResolution, resolutionErr error) {
+	if _, err := validatePermissionSuspension(suspension); err != nil {
+		return nil, err
+	}
+	return r.resolveSuspension(ctx, suspension, approved, nil)
+}
+
+func (r *Runner) resolveSuspension(ctx context.Context, suspension *SuspensionContext, approved bool, answers [][]string) (resolution *PermissionResolution, resolutionErr error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	ctx, cancel := context.WithTimeoutCause(ctx, r.stepTimeout, ErrStepDeadline)
-	defer cancel()
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 
-	currentID, err := validatePermissionSuspension(suspension)
+	currentID, err := validatePendingSuspension(suspension)
 	if err != nil {
 		return nil, err
 	}
@@ -94,7 +137,7 @@ func (r *Runner) ResolvePermissionSuspension(ctx context.Context, suspension *Su
 	if executor == nil {
 		executor = tool.NewLocalExecutor(r.toolSet, nil)
 	}
-	tracker := &stepExecutor{next: executor, dispatched: make(map[string]bool)}
+	tracker := &stepExecutor{next: executor, timeout: r.toolTimeout, stopStep: cancel, dispatched: make(map[string]bool)}
 	executor = tracker
 	ctx = context.WithValue(ctx, stepExecutorKey{}, tracker)
 	defer func() {
@@ -125,6 +168,15 @@ func (r *Runner) ResolvePermissionSuspension(ctx context.Context, suspension *Su
 	currentCtx := bus.WithBus(ctx, privateBus)
 	currentCtx = bus.WithPermissionManager(currentCtx, allowCurrent)
 	currentCtx = bus.WithQuestionManager(currentCtx, r.questionMgr)
+	if suspension.Reason == "question" {
+		// Answer authority is scoped to the current call and never grants permission.
+		questions := bus.NewQuestionManager(r.bus)
+		questions.PushAnswers(answers)
+		currentCtx = bus.WithBus(ctx, r.bus)
+		currentCtx = bus.WithPermissionManager(currentCtx, r.permissionMgr)
+		currentCtx = bus.WithQuestionManager(currentCtx, questions)
+		currentCtx = bus.WithCallQuestionAnswers(currentCtx, bus.CallQuestionAnswers{ToolCallID: currentID, Answers: answers})
+	}
 
 	normalCtx := bus.WithBus(ctx, r.bus)
 	normalCtx = bus.WithPermissionManager(normalCtx, r.permissionMgr)
@@ -307,8 +359,15 @@ func validatePermissionSuspension(suspension *SuspensionContext) (string, error)
 	if suspension.Reason != "permission" {
 		return "", fmt.Errorf("cannot resolve %q suspension as permission", suspension.Reason)
 	}
+	return validatePendingSuspension(suspension)
+}
+
+func validatePendingSuspension(suspension *SuspensionContext) (string, error) {
+	if suspension == nil {
+		return "", errors.New("suspension is required")
+	}
 	if len(suspension.PendingToolCalls) == 0 {
-		return "", errors.New("permission suspension has no pending tool calls")
+		return "", errors.New("suspension has no pending tool calls")
 	}
 
 	dataID, err := suspensionDataToolCallID(suspension.Data)
@@ -320,13 +379,13 @@ func validatePermissionSuspension(suspension *SuspensionContext) (string, error)
 		currentID = dataID
 	}
 	if currentID == "" {
-		return "", errors.New("permission suspension has no tool call ID")
+		return "", errors.New("suspension has no tool call ID")
 	}
 	if dataID != "" && dataID != currentID {
-		return "", fmt.Errorf("permission suspension tool call ID %q does not match data tool call ID %q", currentID, dataID)
+		return "", fmt.Errorf("suspension tool call ID %q does not match data tool call ID %q", currentID, dataID)
 	}
 	if first := suspension.PendingToolCalls[0].ID; first != currentID {
-		return "", fmt.Errorf("permission suspension current call %q is not first pending call %q", currentID, first)
+		return "", fmt.Errorf("suspension current call %q is not first pending call %q", currentID, first)
 	}
 	return currentID, nil
 }

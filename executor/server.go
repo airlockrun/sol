@@ -34,22 +34,24 @@ const (
 // It owns a Bus, PermissionManager, and QuestionManager so that tools
 // executing inside the container can call AskPermission/AskQuestion.
 type ToolServer struct {
-	executor    tool.Executor
-	mu          sync.RWMutex
-	bus         *bus.Bus
-	pm          *bus.PermissionManager
-	qm          *bus.QuestionManager
-	activeTools map[string]struct{} // if non-nil, only these tools are exposed
+	executor       tool.Executor
+	mu             sync.RWMutex
+	bus            *bus.Bus
+	pm             *bus.PermissionManager
+	qm             *bus.QuestionManager
+	activeTools    map[string]struct{} // if non-nil, only these tools are exposed
+	attachmentRoot string
 }
 
 // NewToolServer creates a ToolServer with the given executor.
 func NewToolServer(executor tool.Executor) *ToolServer {
 	b := bus.New()
 	return &ToolServer{
-		executor: executor,
-		bus:      b,
-		pm:       bus.NewPermissionManager(b),
-		qm:       bus.NewQuestionManager(b),
+		executor:       executor,
+		bus:            b,
+		pm:             bus.NewPermissionManager(b),
+		qm:             bus.NewQuestionManager(b),
+		attachmentRoot: "/attachments",
 	}
 }
 
@@ -74,11 +76,14 @@ type message struct {
 	QuestionNeeded   *bus.ErrQuestionNeeded   `json:"question_needed,omitempty"`
 
 	// Control payloads (client → server)
-	Rules       []bus.PermissionRule `json:"rules,omitempty"`
-	Answers     [][]string           `json:"answers,omitempty"`
-	ActiveTools []string             `json:"active_tools,omitempty"` // tool names to expose
-	CancelID    string               `json:"cancel_id,omitempty"`
-	requestCtx  context.Context
+	QuestionAnswer *bus.CallQuestionAnswers   `json:"question_answer,omitempty"`
+	Rules          []bus.PermissionRule       `json:"rules,omitempty"`
+	Answers        [][]string                 `json:"answers,omitempty"`
+	ActiveTools    []string                   `json:"active_tools,omitempty"` // tool names to expose
+	CancelID       string                     `json:"cancel_id,omitempty"`
+	Attachment     *AttachmentMaterialization `json:"attachment,omitempty"`
+	Materialized   *MaterializedAttachment    `json:"materialized,omitempty"`
+	requestCtx     context.Context
 }
 
 // serverConn wraps a connection with a write mutex. coder/websocket forbids
@@ -87,8 +92,9 @@ type message struct {
 // (Ping is safe to call concurrently with Write per coder/websocket, so it
 // stays outside the lock.)
 type serverConn struct {
-	ws      *websocket.Conn
-	writeMu sync.Mutex
+	ws              *websocket.Conn
+	writeMu         sync.Mutex
+	attachmentScope string
 }
 
 func (c *serverConn) writeMsg(ctx context.Context, msg message) error {
@@ -165,7 +171,7 @@ func (s *ToolServer) handleConnection(ws *websocket.Conn) {
 			pendingMu.Unlock()
 			continue
 		}
-		if msg.Type == "request" {
+		if msg.Type == "request" || msg.Type == "materialize_attachment" {
 			var stop context.CancelFunc
 			msg.requestCtx, stop = context.WithCancel(ctx)
 			pendingMu.Lock()
@@ -238,6 +244,26 @@ func (s *ToolServer) dispatch(ctx context.Context, sc *serverConn, msg message) 
 	}()
 
 	switch msg.Type {
+	case "materialize_attachment":
+		if msg.Attachment == nil {
+			s.sendError(ctx, sc, msg.ID, "missing attachment grant")
+			return
+		}
+		if sc.attachmentScope != "" && sc.attachmentScope != msg.Attachment.Scope {
+			s.sendError(ctx, sc, msg.ID, "attachment executor scope mismatch")
+			return
+		}
+		sc.attachmentScope = msg.Attachment.Scope
+		execCtx := ctx
+		if msg.requestCtx != nil {
+			execCtx = msg.requestCtx
+		}
+		result, err := materializeAttachment(execCtx, s.attachmentRoot, *msg.Attachment)
+		if err != nil {
+			s.sendError(ctx, sc, msg.ID, err.Error())
+			return
+		}
+		s.writeMsg(ctx, sc, message{Type: "response", ID: msg.ID, Materialized: &result})
 	case "request":
 		s.handleRequest(ctx, sc, msg)
 	case "tools":
@@ -287,6 +313,15 @@ func (s *ToolServer) handleRequest(ctx context.Context, sc *serverConn, msg mess
 	execCtx = bus.WithBus(execCtx, s.bus)
 	execCtx = bus.WithPermissionManager(execCtx, s.pm)
 	execCtx = bus.WithQuestionManager(execCtx, s.qm)
+	if msg.QuestionAnswer != nil {
+		if msg.QuestionAnswer.ToolCallID != msg.Request.ToolCallID {
+			s.sendError(ctx, sc, msg.ID, "question answer does not match tool call")
+			return
+		}
+		qm := bus.NewQuestionManager(s.bus)
+		qm.PushAnswers(msg.QuestionAnswer.Answers)
+		execCtx = bus.WithQuestionManager(execCtx, qm)
+	}
 
 	resp, err := executor.Execute(execCtx, *msg.Request)
 	if err != nil {
@@ -327,7 +362,7 @@ func (s *ToolServer) handleToolsRequest(ctx context.Context, sc *serverConn, msg
 		filtered = allTools
 	}
 
-	s.writeMsg(ctx, sc, message{Type: "tools", ID: msg.ID, Tools: filtered, Capabilities: []string{CommandResultsCapability}})
+	s.writeMsg(ctx, sc, message{Type: "tools", ID: msg.ID, Tools: filtered, Capabilities: []string{CommandResultsCapability, AttachmentMaterializationCapability, CallQuestionAnswersCapability}})
 }
 
 // handleSetRules sets the permission rules and sends an ack.

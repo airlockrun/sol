@@ -381,6 +381,9 @@ func TestCodexRunnerReadNativeImagePersistenceAndCompaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertCodexReadImageInput(t, <-requests, encoded)
+	if err := store.Append(t.Context(), []session.Message{{Role: "user", Content: "A new task after inspecting the image."}}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := replay.Compact(t.Context()); err != nil {
 		t.Fatal(err)
 	}

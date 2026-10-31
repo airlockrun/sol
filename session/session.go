@@ -100,7 +100,8 @@ type Message struct {
 	Role            string         `json:"role"` // "system", "user", "assistant", "tool"
 	Content         string         `json:"content,omitempty"`
 	Parts           []Part         `json:"parts,omitempty"`
-	ParentID        string         `json:"parentId,omitempty"`  // For assistant messages, links to user message
+	ParentID        string         `json:"parentId,omitempty"`  // Links assistant replies or preceding user-level context to its user message
+	Generated       bool           `json:"generated,omitempty"` // Host-authored context or observation, not a human input boundary
 	Summary         bool           `json:"summary,omitempty"`   // True if this is a compaction summary
 	Tokens          Tokens         `json:"tokens,omitempty"`    // Token usage for this message
 	Compacted       bool           `json:"compacted,omitempty"` // True if tool outputs have been pruned

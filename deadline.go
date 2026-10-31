@@ -9,7 +9,9 @@ import (
 	"github.com/airlockrun/goai/tool"
 )
 
-const DefaultStepTimeout = 60 * time.Second
+const DefaultModelTimeout = 15 * time.Minute
+const DefaultModelIdleTimeout = 5 * time.Minute
+const DefaultToolTimeout = 10 * time.Minute
 const DefaultMaintenanceTimeout = 60 * time.Second
 const DefaultSettlementTimeout = 15 * time.Second
 
@@ -21,6 +23,8 @@ type stepExecutorKey struct{}
 
 type stepExecutor struct {
 	next       tool.Executor
+	timeout    time.Duration
+	stopStep   context.CancelCauseFunc
 	mu         sync.Mutex
 	dispatched map[string]bool
 }
@@ -33,9 +37,14 @@ func (e *stepExecutor) Execute(ctx context.Context, req tool.Request) (tool.Resp
 	e.mu.Lock()
 	e.dispatched[req.ToolCallID] = true
 	e.mu.Unlock()
-	resp, err := e.next.Execute(ctx, req)
-	if err != nil && ctx.Err() != nil {
-		return tool.Response{}, errors.New(missingOutcome(ctx, req.ToolCallID))
+	callCtx, cancel := context.WithTimeoutCause(ctx, e.timeout, errors.Join(ErrStepDeadline, errors.New("tool execution deadline exceeded")))
+	defer cancel()
+	resp, err := e.next.Execute(callCtx, req)
+	if callCtx.Err() != nil {
+		e.stopStep(stepContextError(callCtx))
+		if err != nil {
+			return tool.Response{}, errors.New(missingOutcome(callCtx, req.ToolCallID))
+		}
 	}
 	return resp, err
 }

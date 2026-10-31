@@ -91,12 +91,18 @@ func TestBatchSessionResumeCompactAndIsolation(t *testing.T) {
 		t.Fatal("resume or request count incorrect", requests)
 	}
 	mu.Unlock()
-	for _, args := range [][]string{
+	for i, args := range [][]string{
 		{"--sid", id, "--compact"},
 		{"--session", "compact", id},
 		{"--sid", id, "--session", "compact"},
 	} {
 		out, diagnostic, err := run(args, "missing", "")
+		if i > 0 {
+			if err == nil || !strings.Contains(diagnostic, "no older history") {
+				t.Fatalf("repeated compact %q: %v %q %q", args, err, out, diagnostic)
+			}
+			continue
+		}
 		if err != nil || !strings.Contains(out, "Compacted "+id) || diagnostic != "" {
 			t.Fatalf("explicit compact %q: %v %q %q", args, err, out, diagnostic)
 		}

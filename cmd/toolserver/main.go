@@ -29,6 +29,8 @@ func main() {
 	flag.Parse()
 	if *capabilities {
 		fmt.Println(executor.CommandResultsCapability)
+		fmt.Println(executor.AttachmentMaterializationCapability)
+		fmt.Println(executor.CallQuestionAnswersCapability)
 		return
 	}
 

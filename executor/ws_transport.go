@@ -123,6 +123,12 @@ func (t *WSTransport) Send(ctx context.Context, req tool.Request) (tool.Response
 		ID:      t.allocID(),
 		Request: &req,
 	}
+	if answers, ok := bus.QuestionAnswersForCall(ctx, req.ToolCallID); ok {
+		if err := t.RequireCallQuestionAnswers(ctx); err != nil {
+			return tool.Response{}, transportError("question answers", err)
+		}
+		msg.QuestionAnswer = &bus.CallQuestionAnswers{ToolCallID: req.ToolCallID, Answers: answers}
+	}
 
 	resp, err := t.roundTrip(ctx, msg)
 	if err != nil {
@@ -239,6 +245,9 @@ func (t *WSTransport) allocID() string {
 
 // roundTrip sends a message and waits for the correlated response.
 func (t *WSTransport) roundTrip(ctx context.Context, msg message) (message, error) {
+	if err := ctx.Err(); err != nil {
+		return message{}, err
+	}
 	respCh := make(chan message, 1)
 	t.pendingMu.Lock()
 	t.pending[msg.ID] = respCh
@@ -250,14 +259,21 @@ func (t *WSTransport) roundTrip(ctx context.Context, msg message) (message, erro
 		t.pendingMu.Unlock()
 	}()
 
-	if err := t.writeMsg(ctx, msg); err != nil {
+	writeCtx := ctx
+	if msg.Type == "request" || msg.Type == "materialize_attachment" {
+		// Complete the bounded frame write before delivering cancellation as
+		// its separate control message. Cancelling a websocket write can tear
+		// down the connection after the peer has already dispatched the work.
+		writeCtx = context.WithoutCancel(ctx)
+	}
+	if err := t.writeMsg(writeCtx, msg); err != nil {
 		log.Printf("tool runtime websocket send failed: type=%s id=%s: %v", msg.Type, msg.ID, err)
 		return message{}, transportError("send", err)
 	}
 
 	select {
 	case <-ctx.Done():
-		if msg.Type == "request" {
+		if msg.Type == "request" || msg.Type == "materialize_attachment" {
 			// Cancellation is an out-of-band control. Wait for the original
 			// response, which is sent only after the remote callback returns.
 			// Never release the next workspace writer on local timeout alone.

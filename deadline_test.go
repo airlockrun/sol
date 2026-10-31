@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/airlockrun/sol/session"
 	"strings"
 	"testing"
 	"time"
@@ -14,7 +15,7 @@ import (
 	"github.com/airlockrun/goai/tool"
 )
 
-func TestStepDeadlineOwnsWholeBatchAndJoinsCallbacks(t *testing.T) {
+func TestToolDeadlineJoinsCallbacksAndStopsBatch(t *testing.T) {
 	for _, entry := range []string{"Run", "Continue"} {
 		t.Run(entry, func(t *testing.T) {
 			var modelDeadline time.Time
@@ -35,8 +36,8 @@ func TestStepDeadlineOwnsWholeBatchAndJoinsCallbacks(t *testing.T) {
 				tools[name] = tool.New(name).Execute(func(ctx context.Context, _ json.RawMessage, _ tool.CallOptions) (tool.Result, error) {
 					calls <- name
 					deadline, _ := ctx.Deadline()
-					if !deadline.Equal(modelDeadline) {
-						t.Error("tool reset the model step deadline")
+					if deadline.Equal(modelDeadline) {
+						t.Error("tool inherited model deadline")
 					}
 					if name == "blocked" {
 						<-ctx.Done()
@@ -48,7 +49,7 @@ func TestStepDeadlineOwnsWholeBatchAndJoinsCallbacks(t *testing.T) {
 				}).Build()
 			}
 			store := &testStore{}
-			r := NewRunner(RunnerOptions{Agent: testAgent(tools), Model: model, SessionStore: store, StepTimeout: 30 * time.Millisecond, ToolCallExecutionMode: stream.ToolCallExecutionSync, Quiet: true})
+			r := NewRunner(RunnerOptions{Agent: testAgent(tools), Model: model, SessionStore: store, ToolTimeout: 30 * time.Millisecond, ToolCallExecutionMode: stream.ToolCallExecutionSync, Quiet: true})
 			if entry == "Continue" {
 				// Initialize without consuming the model fixture.
 				r.agent.MaxSteps = 0
@@ -108,7 +109,7 @@ func TestPermissionBatchDeadlineSettlesUnknownAndUndispatched(t *testing.T) {
 		<-ctx.Done()
 		return tool.Result{}, ctx.Err()
 	}).Build()}
-	r := NewRunner(RunnerOptions{Agent: testAgent(tools), StepTimeout: 5 * time.Millisecond, Quiet: true})
+	r := NewRunner(RunnerOptions{Agent: testAgent(tools), ToolTimeout: 5 * time.Millisecond, Quiet: true})
 	resolution, err := r.ResolvePermissionSuspension(t.Context(), permissionSuspension("one", stream.ToolCall{ID: "one", Name: "blocked"}, stream.ToolCall{ID: "two", Name: "blocked"}), true)
 	if !errors.Is(err, ErrStepDeadline) {
 		t.Fatalf("error = %v", err)
@@ -125,8 +126,8 @@ func TestModelAndMaintenanceDeadlines(t *testing.T) {
 				<-ctx.Done()
 				return nil, ctx.Err()
 			}})
-			store := &testStore{}
-			r := NewRunner(RunnerOptions{Agent: testAgent(nil), Model: model, SessionStore: store, StepTimeout: 5 * time.Millisecond, MaintenanceTimeout: 5 * time.Millisecond, Quiet: true})
+			store := &testStore{messages: []session.Message{{Role: "user", Content: "older"}, {Role: "user", Content: "latest"}}}
+			r := NewRunner(RunnerOptions{Agent: testAgent(nil), Model: model, SessionStore: store, ModelTimeout: 5 * time.Millisecond, MaintenanceTimeout: 5 * time.Millisecond, Quiet: true})
 			var err error
 			if operation == "model" {
 				_, err = r.Run(t.Context(), "test")
