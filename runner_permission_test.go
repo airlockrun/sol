@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -16,6 +17,82 @@ import (
 	"github.com/airlockrun/sol/bus"
 	"github.com/airlockrun/sol/session"
 )
+
+func TestResolveSuspensionRejectsNilWithoutEffects(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		resolve func(context.Context, *Runner) (*PermissionResolution, error)
+	}{
+		{"stopped", func(ctx context.Context, r *Runner) (*PermissionResolution, error) {
+			return r.ResolveStoppedSuspension(ctx, nil, "not executed")
+		}},
+		{"permission", func(ctx context.Context, r *Runner) (*PermissionResolution, error) {
+			return r.ResolvePermissionSuspension(ctx, nil, true)
+		}},
+		{"question", func(ctx context.Context, r *Runner) (*PermissionResolution, error) {
+			return r.ResolveQuestionSuspension(ctx, nil, [][]string{{"answer"}})
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, persisted := range []bool{false, true} {
+				t.Run(fmt.Sprintf("persisted=%t", persisted), func(t *testing.T) {
+					var order []string
+					executor := &permissionTestExecutor{order: &order}
+					opts := RunnerOptions{Agent: testAgent(tool.Set{}), Executor: executor, Quiet: true}
+					if persisted {
+						opts.SessionStore = &permissionTestStore{order: &order}
+					}
+					runner := NewRunner(opts)
+					runner.initialMessages = []goai.Message{goai.NewUserMessage("initial history")}
+					runner.messages = []goai.Message{goai.NewUserMessage("current history")}
+					initial := append([]goai.Message(nil), runner.initialMessages...)
+					current := append([]goai.Message(nil), runner.messages...)
+					runner.Bus().Subscribe(bus.StreamToolResult, func(bus.Event) {
+						order = append(order, "result")
+					})
+
+					resolution, err := tt.resolve(t.Context(), runner)
+					if err == nil || resolution != nil {
+						t.Fatalf("resolution = %+v, error = %v; want nil resolution and error", resolution, err)
+					}
+					if len(order) != 0 {
+						t.Fatalf("unexpected effects: %v", order)
+					}
+					if !reflect.DeepEqual(runner.initialMessages, initial) || !reflect.DeepEqual(runner.messages, current) {
+						t.Fatal("nil suspension changed runner history")
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestResolveStoppedSuspensionNeverReplays(t *testing.T) {
+	for _, decision := range []string{"approved until a finite deadline", "denied", "expired", "revoked"} {
+		t.Run(decision, func(t *testing.T) {
+			var order []string
+			store := &permissionTestStore{order: &order, history: assistantToolCallHistory("stopped", "bash", "pending")}
+			executor := &permissionTestExecutor{order: &order}
+			runner := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Executor: executor, SessionStore: store, Quiet: true})
+			suspension := &SuspensionContext{Reason: "permission", ToolCallID: "stopped", PendingToolCalls: []stream.ToolCall{{ID: "stopped", Name: "bash", Input: json.RawMessage(`{"command":"prior; protected; tail"}`)}, {ID: "tail", Name: "bash", Input: json.RawMessage(`{"command":"later"}`)}}}
+			resolution, err := runner.ResolveStoppedSuspension(t.Context(), suspension, "Blocked operation was not executed; prior effects may exist; "+decision)
+			if err != nil || len(resolution.Results) != 2 {
+				t.Fatal(resolution, err)
+			}
+			for _, event := range order {
+				if strings.HasPrefix(event, "execute:") {
+					t.Fatalf("replayed call: %s", event)
+				}
+			}
+			if !strings.Contains(fmt.Sprint(resolution.Results[0].Output), decision) {
+				t.Fatal("decision missing from result")
+			}
+			if !strings.Contains(fmt.Sprint(resolution.Results[1].Output), "Not executed") {
+				t.Fatal("ordered remainder was not skipped")
+			}
+		})
+	}
+}
 
 func TestRunnerResolvePermissionSuspensionOrderedBatch(t *testing.T) {
 	calls := []stream.ToolCall{

@@ -81,7 +81,9 @@ type Runner struct {
 	// caller hasn't pre-registered one.
 	exitState          *tools.ExitState
 	boundaryHook       SafeBoundaryHook
-	stepTimeout        time.Duration
+	modelTimeout       time.Duration
+	modelIdleTimeout   time.Duration
+	toolTimeout        time.Duration
 	maintenanceTimeout time.Duration
 	settlementTimeout  time.Duration
 }
@@ -104,10 +106,15 @@ type SafeBoundaryHook func(context.Context, SafeBoundary) ([]session.Message, er
 
 // RunnerOptions configures a new runner.
 type RunnerOptions struct {
-	// StepTimeout bounds one model response and its entire tool batch. Zero uses
-	// DefaultStepTimeout. Cancellation is cooperative: callbacks must return before
-	// the runner releases transcript ownership. Durable settlement has its own bound.
-	StepTimeout time.Duration
+	// ModelTimeout bounds one provider attempt; ModelIdleTimeout bounds waiting
+	// for meaningful model progress, including setup and first-token thinking.
+	// ToolTimeout is a fresh ceiling per tool, independent of model time and other
+	// tools. Operation-specific and caller deadlines can impose shorter bounds.
+	// Zero selects the corresponding Default*Timeout. Cancellation is cooperative:
+	// producers and callbacks settle before transcript ownership is released.
+	ModelTimeout     time.Duration
+	ModelIdleTimeout time.Duration
+	ToolTimeout      time.Duration
 	// MaintenanceTimeout bounds compaction independently of foreground steps.
 	// SettlementTimeout bounds a durability-critical append after cancellation.
 	// Zero values use DefaultMaintenanceTimeout and DefaultSettlementTimeout.
@@ -204,11 +211,17 @@ type RunnerOptions struct {
 
 // NewRunner creates a new agent runner.
 func NewRunner(opts RunnerOptions) *Runner {
-	if opts.StepTimeout < 0 {
-		panic("RunnerOptions.StepTimeout must be >= 0")
+	if opts.ModelTimeout < 0 || opts.ModelIdleTimeout < 0 || opts.ToolTimeout < 0 {
+		panic("RunnerOptions execution timeouts must be >= 0")
 	}
-	if opts.StepTimeout == 0 {
-		opts.StepTimeout = DefaultStepTimeout
+	if opts.ModelTimeout == 0 {
+		opts.ModelTimeout = DefaultModelTimeout
+	}
+	if opts.ModelIdleTimeout == 0 {
+		opts.ModelIdleTimeout = DefaultModelIdleTimeout
+	}
+	if opts.ToolTimeout == 0 {
+		opts.ToolTimeout = DefaultToolTimeout
 	}
 	if opts.MaintenanceTimeout < 0 || opts.SettlementTimeout < 0 {
 		panic("RunnerOptions maintenance and settlement timeouts must be >= 0")
@@ -303,7 +316,9 @@ func NewRunner(opts RunnerOptions) *Runner {
 		questionMgr:        bus.NewQuestionManager(b),
 		exitState:          opts.ExitState,
 		boundaryHook:       opts.SafeBoundaryHook,
-		stepTimeout:        opts.StepTimeout,
+		modelTimeout:       opts.ModelTimeout,
+		modelIdleTimeout:   opts.ModelIdleTimeout,
+		toolTimeout:        opts.ToolTimeout,
 		maintenanceTimeout: opts.MaintenanceTimeout,
 		settlementTimeout:  opts.SettlementTimeout,
 	}
@@ -363,20 +378,10 @@ func (r *Runner) Run(ctx context.Context, prompt string) (*RunResult, error) {
 		r.session.Messages = history
 
 		// Convert to goai format, applying history policy.
-		goaiHistory := session.MessagesToGoAI(history)
+		goaiHistory := r.modelHistory(history)
 		r.messages = make([]goai.Message, 0, 1+len(goaiHistory)+1)
 		r.messages = append(r.messages, goai.NewSystemMessage(systemPrompt))
-		policy := r.agent.HistoryPolicy
-		for _, m := range goaiHistory {
-			if m.Role == "system" {
-				continue
-			}
-			if m.Role == "tool" && policy.ExcludeToolCalls {
-				continue
-			}
-			m = filterMessageParts(m, policy)
-			r.messages = append(r.messages, m)
-		}
+		r.messages = append(r.messages, goaiHistory...)
 		if prompt != "" {
 			userMsg := goai.NewUserMessage(prompt)
 			r.messages = append(r.messages, userMsg)
@@ -587,11 +592,9 @@ func (r *Runner) initSession() error {
 }
 
 func (r *Runner) prune() int {
-	// Prune exactly the model-facing transcript, not unfiltered stored history.
-	r.session.Messages = session.FromGoAIMessages(r.messages[1:])
 	pruned := r.session.Prune()
 	if pruned > 0 {
-		r.messages = append(r.messages[:1:1], r.session.ToGoAIMessages()...)
+		r.messages = append(r.messages[:1:1], r.modelHistory(r.session.GetMessages())...)
 	}
 	return pruned
 }
@@ -636,20 +639,10 @@ func (r *Runner) Compact(ctx context.Context) (*CompactResult, error) {
 	history = r.stripOldFilesFromHistory(history)
 	r.session.Messages = history
 
-	goaiHistory := session.MessagesToGoAI(history)
+	goaiHistory := r.modelHistory(history)
 	r.messages = make([]goai.Message, 0, 1+len(goaiHistory))
 	r.messages = append(r.messages, goai.NewSystemMessage(systemPrompt))
-	policy := r.agent.HistoryPolicy
-	for _, m := range goaiHistory {
-		if m.Role == "system" {
-			continue
-		}
-		if m.Role == "tool" && policy.ExcludeToolCalls {
-			continue
-		}
-		m = filterMessageParts(m, policy)
-		r.messages = append(r.messages, m)
-	}
+	r.messages = append(r.messages, goaiHistory...)
 
 	// No turn has run yet so there's no LLM-reported token count. Estimate
 	// from the loaded history so compactNow's preTokens is meaningful.
@@ -688,17 +681,27 @@ func (r *Runner) compactNow(ctx context.Context, systemPrompt string) (int, erro
 		ProviderOptions: provider.ProviderOptions(r.providerID, r.modelID, r.sessionID),
 		MaxOutputTokens: maxOutputTokens,
 		TransformMessages: func(msgs []goai.Message) []goai.Message {
-			return coalesceConsecutiveUser(redactMessages(msgs, r.agent.Redactor))
+			var filtered []goai.Message
+			for _, msg := range msgs {
+				if msg.Role == "tool" && r.agent.HistoryPolicy.ExcludeToolCalls {
+					continue
+				}
+				filtered = append(filtered, filterMessageParts(msg, r.agent.HistoryPolicy))
+			}
+			return coalesceConsecutiveUser(redactMessages(filtered, r.agent.Redactor))
 		},
 	}
-	if err := r.session.CompactAndContinue(ctx, r.model, r.messages, compactOpts); err != nil {
+	if err := r.session.CompactAndContinue(ctx, r.model, compactOpts); err != nil {
 		return 0, fmt.Errorf("compaction error: %w", err)
 	}
 
-	compactedMsgs := r.session.ToGoAIMessages()
+	compactedMsgs := r.modelHistory(r.session.GetMessages())
 	r.messages = append([]goai.Message{goai.NewSystemMessage(systemPrompt)}, compactedMsgs...)
 	r.compactionState = &CompactionState{Messages: compactedMsgs}
 	r.session.Tokens = session.Tokens{Input: session.EstimateMessagesTokens(session.FromGoAIMessages(r.messages))}
+	if r.session.IsOverflow() {
+		return 0, errors.New("compacted history and intact latest turn exceed model input limit")
+	}
 
 	tokensFreed := max(0, preTokens-session.EstimateMessagesTokens(r.session.GetMessages()))
 	if r.store != nil {
@@ -711,6 +714,19 @@ func (r *Runner) compactNow(ctx context.Context, systemPrompt string) (int, erro
 	return tokensFreed, nil
 }
 
+// modelHistory projects canonical history without replacing its identities or
+// metadata. System instructions come from the runner's current agent prompt.
+func (r *Runner) modelHistory(history []session.Message) []goai.Message {
+	var out []goai.Message
+	for _, msg := range session.MessagesToGoAI(history) {
+		if msg.Role == "system" || (msg.Role == "tool" && r.agent.HistoryPolicy.ExcludeToolCalls) {
+			continue
+		}
+		out = append(out, filterMessageParts(msg, r.agent.HistoryPolicy))
+	}
+	return out
+}
+
 // compactAutomatically emits lifecycle events around an overflow-triggered
 // compaction attempt. User-triggered Compact calls compactNow directly.
 func (r *Runner) compactAutomatically(ctx context.Context, systemPrompt string) (tokensFreed int, err error) {
@@ -718,6 +734,7 @@ func (r *Runner) compactAutomatically(ctx context.Context, systemPrompt string) 
 	defer func() {
 		payload := bus.AutomaticCompactionFinishedPayload{TokensFreed: tokensFreed}
 		if err != nil {
+			r.canContinue = false
 			payload.Error = err.Error()
 		}
 		r.bus.Publish(bus.AutomaticCompactionFinished, payload)
@@ -993,8 +1010,8 @@ func (r *Runner) stopForSafeBoundaryError(ctx context.Context, result *RunResult
 
 // runStep executes a single step of the thinking loop.
 func (r *Runner) runStep(ctx context.Context) (result *StepResult, runErr error) {
-	ctx, cancel := context.WithTimeoutCause(ctx, r.stepTimeout, ErrStepDeadline)
-	defer cancel()
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 	// Inject scoped bus and managers into context for tools
 	ctx = bus.WithBus(ctx, r.bus)
 	ctx = bus.WithPermissionManager(ctx, r.permissionMgr)
@@ -1051,10 +1068,11 @@ func (r *Runner) runStep(ctx context.Context) (result *StepResult, runErr error)
 	if executor == nil {
 		executor = tool.NewLocalExecutor(r.toolSet, activeTools)
 	}
-	tracked := &stepExecutor{next: executor, dispatched: make(map[string]bool)}
+	tracked := &stepExecutor{next: executor, timeout: r.toolTimeout, stopStep: cancel, dispatched: make(map[string]bool)}
 	ctx = context.WithValue(ctx, stepExecutorKey{}, tracked)
+	boundedModel := &deadlineModel{Model: r.model, wall: r.modelTimeout, idle: r.modelIdleTimeout, stopStep: cancel}
 	input := stream.Input{
-		Model:       r.model,
+		Model:       boundedModel,
 		Messages:    llmMessages,
 		Tools:       r.toolSet,
 		ActiveTools: activeTools,
@@ -1084,9 +1102,12 @@ func (r *Runner) runStep(ctx context.Context) (result *StepResult, runErr error)
 		if ctx.Err() != nil && !errors.As(runErr, &appendErr) {
 			runErr = errors.Join(runErr, stepContextError(ctx))
 		}
-		cancel()
+		cancel(nil)
 		for range streamResult.FullStream {
 		}
+		// Setup cancellation can close FullStream before the model adapter has
+		// drained its provider. No new attempts can start after FullStream closes.
+		boundedModel.producers.Wait()
 	}()
 
 	// Process stream events
@@ -1243,6 +1264,13 @@ func (r *Runner) runStep(ctx context.Context) (result *StepResult, runErr error)
 			toolResults = append(toolResults, tr)
 			r.log("[result] %s\n", message.ToolOutputText(tr.Output))
 		case stream.ErrorEvent:
+			if ctx.Err() != nil {
+				// Setup cancellation can precede provider settlement. Partial
+				// checkpoints must not commit while that producer still owns work.
+				for range streamResult.FullStream {
+				}
+				boundedModel.producers.Wait()
+			}
 			var permErr *bus.ErrPermissionNeeded
 			var questErr *bus.ErrQuestionNeeded
 			var delErr *bus.ErrDelegatedSuspend
@@ -1352,6 +1380,9 @@ func (r *Runner) runStep(ctx context.Context) (result *StepResult, runErr error)
 		ToolResults:  toolResults,
 		FinishReason: finishReason,
 		Usage:        usage,
+	}
+	if ctx.Err() != nil {
+		boundedModel.producers.Wait()
 	}
 
 	if err := r.appendMessages(ctx, true, assistantParts, toolCalls, toolResults, usage); err != nil {

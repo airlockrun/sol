@@ -125,28 +125,43 @@ func TestSessionCompactAndContinue_MessageOrder(t *testing.T) {
 	model := newMockModel(t, testutil.MockConfig{ID: "fixture",
 		Default: &testutil.MockResponse{Events: testutil.MockTextResponse("internal summary", testutil.MockUsage(10, 3))}})
 	s := New("test", "agent", "model", ModelLimits{})
-	s.Messages = []Message{{Role: "assistant", Content: "state replaced by compaction"}}
-
-	err := s.CompactAndContinue(context.Background(), model, []goai.Message{
-		goai.NewSystemMessage("system prompt"),
-		goai.NewUserMessage("initial request"),
-		goai.NewAssistantMessage("work in progress"),
-		goai.NewUserMessage("latest request"),
-	}, nil)
+	s.Messages = []Message{
+		{ID: "system", Role: "system", Content: "system prompt"},
+		{ID: "old", Role: "user", Content: "initial request"},
+		{Role: "assistant", Content: "work in progress"},
+		{ID: "context", ParentID: "human", Role: "user", Content: "immutable workspace A"},
+		{ID: "human", Role: "user", Parts: []Part{{ID: "text", Type: "text", Text: "latest request"}, {ID: "file", Type: "file", File: &FilePart{MimeType: "text/plain", Data: "contents", Source: "source"}}}},
+		{ID: "call", ParentID: "human", Role: "assistant", Parts: []Part{{Type: "tool", Tool: &ToolPart{CallID: "effect", Name: "write", Input: "{}", Status: "pending"}}}},
+		{ID: "result", ParentID: "human", Role: "tool", Parts: []Part{{Type: "tool", Tool: &ToolPart{CallID: "effect", Name: "write", Output: "already executed", Status: "completed"}}}},
+		{ID: "event", Role: "user", Generated: true, Content: "host task completed"},
+	}
+	before := s.GetMessages()
+	err := s.CompactAndContinue(context.Background(), model, nil)
 	if err != nil {
 		t.Fatalf("CompactAndContinue failed: %v", err)
 	}
 
-	want := []Message{
-		{Role: "user", Content: "latest request"},
-		{Role: "assistant", Content: "internal summary", Summary: true},
-		{
-			Role:    "user",
-			Content: "The preceding assistant message is an internal compaction summary for context, not a user-visible assistant reply. Continue with the next steps if there are any, or ask the user for clarification if needed.",
-		},
-	}
+	want := append([]Message{before[0], {ID: s.Messages[1].ID, Role: "assistant", Content: "internal summary", Summary: true}}, before[3:]...)
 	if got := s.GetMessages(); !reflect.DeepEqual(got, want) {
 		t.Errorf("messages = %#v, want %#v", got, want)
+	}
+	for _, msg := range model.Requests()[0].Messages {
+		if strings.Contains(msg.Content.Text, "immutable workspace A") || strings.Contains(msg.Content.Text, "latest request") || strings.Contains(msg.Content.Text, "already executed") {
+			t.Fatal("summarizer received latest turn")
+		}
+	}
+	if err := s.CompactAndContinue(context.Background(), model, nil); err == nil {
+		t.Fatal("repeated compaction must reject a summary-only prefix")
+	}
+	if len(model.Requests()) != 1 || !reflect.DeepEqual(s.Messages, want) {
+		t.Fatal("repeated compaction changed history or called the model")
+	}
+	s.AddMessage(Message{ID: "next", Role: "user", Content: "new human input"})
+	if err := s.CompactAndContinue(context.Background(), model, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Messages) != 3 || s.Messages[2].ID != "next" || !s.Messages[1].Summary {
+		t.Fatalf("next turn compaction: %+v", s.Messages)
 	}
 }
 
@@ -289,10 +304,11 @@ func TestCompactAndContinue_PreservesMultipartUser(t *testing.T) {
 		Default: &testutil.MockResponse{Events: testutil.MockTextResponse("summary", testutil.MockUsage(10, 2))}})
 	s := New("test", "agent", "model", ModelLimits{})
 	user := message.NewUserMessageWithParts(goai.TextPart{Text: "look"}, message.FilePart{Data: message.FileDataText{Text: "file text"}, MimeType: "text/plain"})
-	if err := s.CompactAndContinue(context.Background(), model, []goai.Message{user}, nil); err != nil {
+	s.Messages = []Message{{Role: "user", Content: "older request"}, FromGoAIMessage(user)}
+	if err := s.CompactAndContinue(context.Background(), model, nil); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.ToGoAIMessages()[0]; !reflect.DeepEqual(got, user) {
+	if got := s.ToGoAIMessages()[1]; !reflect.DeepEqual(got, user) {
 		t.Fatalf("user = %#v", got)
 	}
 	if s.Tokens.Input != EstimateMessagesTokens(s.Messages) {
@@ -309,11 +325,11 @@ func TestCompact_RejectsIncompleteSummary(t *testing.T) {
 					{Type: stream.EventFinish, Data: stream.FinishEvent{FinishReason: finish}},
 				}}})
 			s := New("test", "agent", "model", ModelLimits{})
-			s.Messages = []Message{{Role: "user", Content: "keep"}}
-			if err := s.CompactAndContinue(context.Background(), model, s.ToGoAIMessages(), nil); err == nil {
+			s.Messages = []Message{{Role: "user", Content: "old"}, {Role: "user", Content: "keep"}}
+			if err := s.CompactAndContinue(context.Background(), model, nil); err == nil {
 				t.Fatal("expected error")
 			}
-			if len(s.Messages) != 1 || s.Messages[0].Content != "keep" {
+			if len(s.Messages) != 2 || s.Messages[1].Content != "keep" {
 				t.Fatal("history mutated")
 			}
 		})

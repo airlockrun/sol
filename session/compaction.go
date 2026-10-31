@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"strings"
@@ -238,7 +239,7 @@ loop:
 		msg := &s.Messages[msgIdx]
 
 		// Count user message turns
-		if msg.Role == "user" {
+		if msg.Role == "user" && !msg.Generated && !isInputContext(s.Messages, msgIdx) {
 			turns++
 		}
 
@@ -336,7 +337,7 @@ loop:
 
 // CompactionPrompt is the default prompt for context compaction.
 // This is appended as a user message to ask for a summary.
-const CompactionPrompt = `Provide a detailed prompt for continuing our conversation above. Focus on information that would be helpful for continuing the conversation, including what we did, what we're doing, which files we're working on, and what we're going to do next considering new session will not have access to our conversation.`
+const CompactionPrompt = `Summarize the preceding history as background context. Preserve user constraints, decisions, completed actions and their outcomes, and unresolved work. The latest user turn is retained separately; do not invent or restate it. Completed actions are records, not instructions to execute them again.`
 
 // DefaultCompactionSystemPrompt is the system prompt used for the compaction agent.
 // This matches opencode's agent/prompt/compaction.txt exactly (including trailing space on line 3 and trailing newline).
@@ -345,9 +346,6 @@ const DefaultCompactionSystemPrompt = "You are a helpful AI assistant tasked wit
 // CompactionTriggerPrompt is added by opencode when a compaction part is converted to model messages.
 // This matches MessageV2.toModelMessages() behavior for compaction parts.
 const CompactionTriggerPrompt = "What did we do so far?"
-
-// CompactionContinuationPrompt tells the model how to interpret the summary and resume the conversation.
-const CompactionContinuationPrompt = "The preceding assistant message is an internal compaction summary for context, not a user-visible assistant reply. Continue with the next steps if there are any, or ask the user for clarification if needed."
 
 // CompactOptions contains options for compaction requests.
 // This matches opencode's behavior of passing the same provider options to compaction.
@@ -363,9 +361,8 @@ type CompactOptions struct {
 	TransformMessages func([]goai.Message) []goai.Message
 }
 
-// Compact performs context compaction by asking the model to summarize.
-// conversationMessages should be the current conversation history (from the runner).
-// Returns the summary text that should be used to continue the conversation.
+// Compact asks the model to summarize the supplied history without changing the
+// canonical transcript. CompactAndContinue applies prefix compaction.
 func (s *Session) Compact(ctx context.Context, model stream.Model, conversationMessages []goai.Message, opts *CompactOptions) (string, error) {
 	s.mu.RLock()
 	agent := s.CompactionConfig.Agent
@@ -437,67 +434,66 @@ func (s *Session) Compact(ctx context.Context, model stream.Model, conversationM
 		return "", errors.New("compaction summary is empty")
 	}
 
-	// Mark this as a compaction summary
-	s.mu.Lock()
-	s.Messages = append(s.Messages, Message{
-		Role:    "assistant",
-		Content: summary,
-		Summary: true,
-	})
-	s.mu.Unlock()
-
-	// Publish compaction event on the session's bus
-	if s.bus != nil {
-		s.bus.Publish(bus.EventSessionCompacted, bus.SessionCompactedPayload{
-			SessionID: s.ID,
-		})
-	}
-
 	return summary, nil
 }
 
-// CompactAndContinue performs compaction and adds a continuation instruction.
-// This is used for automatic compaction during the thinking loop.
-// conversationMessages should be the current conversation history (from the runner).
-func (s *Session) CompactAndContinue(ctx context.Context, model stream.Model, conversationMessages []goai.Message, opts *CompactOptions) error {
-	// Find the last user message before compaction (to preserve it)
-	var lastUserMsg *goai.Message
-	for i := len(conversationMessages) - 1; i >= 0; i-- {
-		if conversationMessages[i].Role == "user" {
-			lastUserMsg = &conversationMessages[i]
+// isInputContext identifies user-level data associated with a following human
+// input. Text and provider roles cannot establish this association.
+func isInputContext(messages []Message, i int) bool {
+	msg := messages[i]
+	return msg.Role == "user" && msg.ParentID != "" && i+1 < len(messages) &&
+		messages[i+1].Role == "user" && messages[i+1].ID == msg.ParentID
+}
+
+// CompactAndContinue summarizes only history before the latest human input.
+// Its associated context and complete assistant/tool suffix remain canonical.
+// A summary alone is not eligible history for another compaction.
+func (s *Session) CompactAndContinue(ctx context.Context, model stream.Model, opts *CompactOptions) error {
+	history := s.GetMessages()
+	start := -1
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Role == "user" && !history[i].Generated && !isInputContext(history, i) {
+			start = i
+			if i > 0 && isInputContext(history, i-1) {
+				start--
+			}
 			break
 		}
 	}
-
-	summary, err := s.Compact(ctx, model, conversationMessages, opts)
+	if start < 0 {
+		return errors.New("compaction requires a human input boundary")
+	}
+	eligible := false
+	var systems []Message
+	for _, msg := range history[:start] {
+		if msg.Role == "system" {
+			systems = append(systems, msg)
+		} else if !msg.Summary {
+			eligible = true
+		}
+	}
+	if !eligible {
+		return errors.New("no older history to compact; latest turn must remain intact")
+	}
+	summary, err := s.Compact(ctx, model, MessagesToGoAI(history[:start]), opts)
 	if err != nil {
 		return err
 	}
 
-	// Rebuild s.Messages with: original user message + summary + continue
-	// This matches opencode's filterCompacted behavior
 	s.mu.Lock()
-	s.Messages = nil // Clear existing messages
-
-	// Add the original user message that triggered compaction
-	if lastUserMsg != nil {
-		s.Messages = append(s.Messages, FromGoAIMessage(*lastUserMsg))
-	}
-
-	// Add the compaction summary
-	s.Messages = append(s.Messages, Message{
+	s.Messages = append(systems, Message{
+		ID:      rand.Text(),
 		Role:    "assistant",
 		Content: summary,
 		Summary: true,
 	})
 
-	// Add the instruction that resumes the conversation after the internal summary.
-	s.Messages = append(s.Messages, Message{
-		Role:    "user",
-		Content: CompactionContinuationPrompt,
-	})
+	s.Messages = append(s.Messages, history[start:]...)
 	s.Tokens = Tokens{Input: EstimateMessagesTokens(s.Messages)}
 	s.mu.Unlock()
+	if s.bus != nil {
+		s.bus.Publish(bus.EventSessionCompacted, bus.SessionCompactedPayload{SessionID: s.ID})
+	}
 
 	return nil
 }

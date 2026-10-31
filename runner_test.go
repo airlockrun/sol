@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -356,7 +357,7 @@ func TestRunner_ModelLimits(t *testing.T) {
 		wantErr bool
 	}{
 		{"catalog", "openai/gpt-4o", session.ModelLimits{}, nil, false},
-		{"explicit unknown", "openai-compatible/private", session.ModelLimits{Context: 2000, Input: 1500, Output: 500}, nil, false},
+		{"explicit unknown", "openai-compatible/private", session.ModelLimits{Context: 20000, Input: 15000, Output: 500}, nil, false},
 		{"unknown auto", "openai-compatible/private", session.ModelLimits{}, nil, false},
 		{"proxy auto", "", session.ModelLimits{}, nil, false},
 		{"unknown disabled", "openai-compatible/private", session.ModelLimits{}, &session.CompactionConfig{Auto: false}, false},
@@ -371,7 +372,7 @@ func TestRunner_ModelLimits(t *testing.T) {
 					a.Model = tt.model
 					model := newMockModel(t, testutil.MockConfig{ID: "fixture",
 						Default: &testutil.MockResponse{Events: testutil.MockTextResponse("ok", testutil.MockUsage(1, 1))}})
-					r := NewRunner(RunnerOptions{Agent: a, Model: model, ModelLimits: tt.limits, CompactionConfig: tt.config, SessionStore: &testStore{}, Quiet: true})
+					r := NewRunner(RunnerOptions{Agent: a, Model: model, ModelLimits: tt.limits, CompactionConfig: tt.config, SessionStore: &testStore{messages: []session.Message{{Role: "user", Content: "older"}, {Role: "user", Content: "latest"}}}, Quiet: true})
 					var err error
 					switch entry {
 					case "Run":
@@ -411,10 +412,10 @@ func TestRunner_CompactionOutputLimit(t *testing.T) {
 		limits session.ModelLimits
 		want   int
 	}{
-		{"explicit", "openai/gpt-4o", session.ModelLimits{Input: 1000, Output: 2048}, 2048},
-		{"explicit unknown", "openai-compatible/private", session.ModelLimits{Input: 1000, Output: 2048}, 2048},
-		{"compaction cap", "openai-compatible/private", session.ModelLimits{Input: 1000, Output: 100_000}, session.OutputTokenMax},
-		{"unknown output", "openai-compatible/private", session.ModelLimits{Input: 1000}, session.OutputTokenMax},
+		{"explicit", "openai/gpt-4o", session.ModelLimits{Input: 10000, Output: 2048}, 2048},
+		{"explicit unknown", "openai-compatible/private", session.ModelLimits{Input: 10000, Output: 2048}, 2048},
+		{"compaction cap", "openai-compatible/private", session.ModelLimits{Input: 10000, Output: 100_000}, session.OutputTokenMax},
+		{"unknown output", "openai-compatible/private", session.ModelLimits{Input: 10000}, session.OutputTokenMax},
 		{"catalog", "openai/gpt-4o", session.ModelLimits{}, 16384},
 		{"gpt-4 catalog", "openai/gpt-4", session.ModelLimits{}, 8192},
 		{"small context", "openai-compatible/private", session.ModelLimits{Context: 8192, Output: 8192}, 8192},
@@ -437,7 +438,7 @@ func TestRunner_CompactionOutputLimit(t *testing.T) {
 					}
 					model := newMockModel(t, testutil.MockConfig{ID: "fixture",
 						Responses: responses})
-					r := NewRunner(RunnerOptions{Agent: a, Model: model, ModelLimits: tt.limits, SessionStore: &testStore{}, Quiet: true})
+					r := NewRunner(RunnerOptions{Agent: a, Model: model, ModelLimits: tt.limits, SessionStore: &testStore{messages: []session.Message{{Role: "user", Content: "old"}, {Role: "user", Content: "latest"}}}, Quiet: true})
 					var err error
 					switch entry {
 					case "Compact":
@@ -451,6 +452,12 @@ func TestRunner_CompactionOutputLimit(t *testing.T) {
 						_, err = r.Continue(context.Background(), "again")
 					case "child":
 						_, err = r.SpawnSubagent(context.Background(), "general", "go")
+					}
+					if entry == "child" {
+						if err == nil || !strings.Contains(err.Error(), "no older history") || len(model.Requests()) != 1 {
+							t.Fatalf("single child turn must fail without summarizing or replaying: %v", err)
+						}
+						return
 					}
 					if err != nil {
 						t.Fatal(err)
@@ -667,14 +674,97 @@ func TestRunner_PrunePreservesFileSource(t *testing.T) {
 		goai.NewToolResultText("c", "read", strings.Repeat("x", 240_000)),
 		goai.NewUserMessage("recent"), goai.NewUserMessage("latest"),
 	)
+	r.session.Messages = append(stored, session.FromGoAIMessages(r.messages[2:])...)
 	if got := r.prune(); got != 2 {
 		t.Fatalf("pruned = %d, want 2", got)
 	}
 	if len(files) != 1 || files[0].Source != "tmp/id-report.pdf" || files[0].Filename != "report.pdf" {
 		t.Fatalf("pruned files = %+v", files)
 	}
-	if got := r.messages[1].Content.Parts[0].(message.TextPart).Text; got != "Reload tmp/id-report.pdf" {
+	if got := r.messages[1].Content.Text; got != "Reload tmp/id-report.pdf" {
 		t.Fatalf("reload instruction = %q", got)
+	}
+}
+
+func TestRunner_PruneNoOpPreservesCanonicalInput(t *testing.T) {
+	r := NewRunner(RunnerOptions{Agent: testAgent(nil), Quiet: true})
+	if err := r.initSession(); err != nil {
+		t.Fatal(err)
+	}
+	history := []session.Message{
+		{ID: "context", ParentID: "human", Role: "user", Content: "workspace A"},
+		{ID: "human", Role: "user", Parts: []session.Part{{ID: "part", Type: "text", Text: "request"}}},
+	}
+	r.session.Messages = history
+	r.messages = append([]goai.Message{goai.NewSystemMessage("instructions")}, session.MessagesToGoAI(history)...)
+	if n := r.prune(); n != 0 {
+		t.Fatalf("pruned = %d", n)
+	}
+	if !reflect.DeepEqual(r.session.Messages, history) {
+		t.Fatal("no-op prune replaced canonical history")
+	}
+}
+
+func TestRunner_CompactionRetainsExecutedCurrentTurn(t *testing.T) {
+	for _, overlarge := range []bool{false, true} {
+		t.Run(map[bool]string{false: "older prefix", true: "latest turn alone"}[overlarge], func(t *testing.T) {
+			effects := 0
+			write := tool.New("write").Execute(func(context.Context, json.RawMessage, tool.CallOptions) (tool.Result, error) {
+				effects++
+				return tool.Result{Output: "executed exactly once"}, nil
+			}).Build()
+			store := &testStore{}
+			if !overlarge {
+				store.messages = []session.Message{{ID: "old", Role: "user", Content: "older request"}}
+			}
+			model := newMockModel(t, testutil.MockConfig{ID: "fixture", Responses: []testutil.MockResponse{
+				{Events: testutil.MockToolCallResponse("effect", "write", map[string]any{}, testutil.MockUsage(20000, 1))},
+				{Events: testutil.MockTextResponse("older history summary", testutil.MockUsage(10, 2))},
+				{Events: testutil.MockTextResponse("done", testutil.MockUsage(10, 2))},
+			}})
+			r := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{"write": write}), Model: model, ModelLimits: session.ModelLimits{Input: 10000}, SessionStore: store, Quiet: true})
+			result, err := r.Run(t.Context(), "current request")
+			if effects != 1 {
+				t.Fatalf("side effects = %d", effects)
+			}
+			if result.Usage.InputTotal() != 20000+map[bool]int{false: 10, true: 0}[overlarge] {
+				t.Fatalf("reasoning usage: %+v", result.Usage)
+			}
+			if overlarge {
+				if err == nil || !strings.Contains(err.Error(), "no older history") || len(model.Requests()) != 1 {
+					t.Fatalf("uncompactable turn replayed: %v", err)
+				}
+				return
+			}
+			if err != nil || result.Status != RunCompleted || len(model.Requests()) != 3 {
+				t.Fatalf("result %+v, error %v", result, err)
+			}
+			request, _ := json.Marshal(model.Requests()[2].Messages)
+			if !strings.Contains(string(request), "executed exactly once") || !strings.Contains(string(request), "current request") {
+				t.Fatalf("current actions lost: %s", request)
+			}
+			if len(store.messages) != 5 || !store.messages[0].Summary || store.messages[1].Content != "current request" {
+				t.Fatalf("checkpoint order: %+v", store.messages)
+			}
+		})
+	}
+}
+
+func TestRunner_CompactionRejectsOversizedActiveTurn(t *testing.T) {
+	history := []session.Message{
+		{ID: "old", Role: "user", Content: "older history"},
+		{ID: "human", Role: "user", Content: "current request"},
+		{ID: "call", ParentID: "human", Role: "assistant", Parts: []session.Part{{Type: "tool", Tool: &session.ToolPart{CallID: "effect", Name: "write", Input: "{}", Status: "pending"}}}},
+		{ID: "result", ParentID: "human", Role: "tool", Parts: []session.Part{{Type: "tool", Tool: &session.ToolPart{CallID: "effect", Name: "write", Output: strings.Repeat("executed", 10000), Status: "completed"}}}},
+	}
+	store := &testStore{messages: history}
+	model := newMockModel(t, testutil.MockConfig{ID: "fixture", Default: &testutil.MockResponse{Events: testutil.MockTextResponse("summary", testutil.MockUsage(10, 2))}})
+	r := NewRunner(RunnerOptions{Agent: testAgent(nil), Model: model, ModelLimits: session.ModelLimits{Input: 10000}, SessionStore: store, Quiet: true})
+	if _, err := r.Compact(t.Context()); err == nil || !strings.Contains(err.Error(), "intact latest turn exceed") {
+		t.Fatalf("oversized active turn: %v", err)
+	}
+	if len(model.Requests()) != 1 || !reflect.DeepEqual(store.messages, history) {
+		t.Fatal("oversized active turn was discarded or model execution resumed")
 	}
 }
 
@@ -717,17 +807,18 @@ func TestRunner_CompactionRedactsCompleteRequest(t *testing.T) {
 			store := &testStore{messages: session.FromGoAIMessages([]goai.Message{
 				goai.NewUserMessage("request secret"),
 				goai.NewToolMessage("c", "noop", message.JSONOutput{Value: map[string]any{"key": "secret"}}),
+				goai.NewUserMessage("latest request"),
 			})}
 			responses := []testutil.MockResponse{{Events: testutil.MockTextResponse("summary", testutil.MockUsage(10, 2))}}
 			if automatic {
 				responses = []testutil.MockResponse{
-					{Events: testutil.MockToolCallResponse("new", "noop", map[string]any{}, testutil.MockUsage(2000, 1))},
+					{Events: testutil.MockToolCallResponse("new", "noop", map[string]any{}, testutil.MockUsage(20000, 1))},
 					responses[0], {Events: testutil.MockTextResponse("done", testutil.MockUsage(10, 2))},
 				}
 			}
 			model := newMockModel(t, testutil.MockConfig{ID: "fixture",
 				Responses: responses})
-			r := NewRunner(RunnerOptions{Agent: a, Model: model, SessionStore: store, CompactionConfig: &config, ModelLimits: session.ModelLimits{Input: 1000}, Quiet: true})
+			r := NewRunner(RunnerOptions{Agent: a, Model: model, SessionStore: store, CompactionConfig: &config, ModelLimits: session.ModelLimits{Input: 10000}, Quiet: true})
 			var err error
 			if automatic {
 				_, err = r.Run(context.Background(), "continue")
@@ -2814,8 +2905,7 @@ func TestRunner_Compact(t *testing.T) {
 		t.Errorf("store.tokensFreed = %d, want %d (store.Compact should receive same value)", store.tokensFreed, result.TokensFreed)
 	}
 
-	// After Compact, the store's messages are the new post-checkpoint set —
-	// original user message + summary + synthetic continue, per CompactAndContinue.
+	// The checkpoint contains the summary followed by the intact latest turn.
 	if len(store.messages) == 0 {
 		t.Fatal("store should have messages after Compact")
 	}
@@ -2848,13 +2938,14 @@ func TestRunner_AutomaticCompactionLifecycle(t *testing.T) {
 			store: &testStore{messages: []session.Message{
 				{Role: "user", Content: "question " + strings.Repeat("a", 500)},
 				{Role: "assistant", Content: "answer " + strings.Repeat("b", 500)},
+				{Role: "user", Content: "latest"},
 			}},
 		},
 		{
 			name: "failure",
 			model: newMockModel(t, testutil.MockConfig{ID: "fixture",
 				Default: &testutil.MockResponse{Events: testutil.MockErrorResponse(errors.New("summary failed"))}}),
-			store:       &testStore{messages: []session.Message{{Role: "user", Content: "question"}}},
+			store:       &testStore{messages: []session.Message{{Role: "user", Content: "question"}, {Role: "user", Content: "latest"}}},
 			wantErr:     true,
 			wantErrText: "summary failed",
 		},
@@ -2924,7 +3015,7 @@ func TestRunner_Compact_NoStore(t *testing.T) {
 func TestRunner_Compact_StoreError(t *testing.T) {
 	compactErr := errors.New("compact store failed")
 	store := &testStore{
-		messages:   []session.Message{{Role: "user", Content: "request"}},
+		messages:   []session.Message{{Role: "user", Content: "old"}, {Role: "user", Content: "request"}},
 		compactErr: compactErr,
 	}
 	model := newMockModel(t, testutil.MockConfig{ID: "fixture",
