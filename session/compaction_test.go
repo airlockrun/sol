@@ -36,6 +36,114 @@ func TestIsOverflow_UnknownBudget(t *testing.T) {
 	}
 }
 
+func TestIsOverflow_ContextLimit(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		limit, used int
+		model       ModelLimits
+		want        bool
+	}{
+		{"below custom", 400000, 399999, ModelLimits{Context: 1000000, Output: 32000}, false},
+		{"custom equality", 400000, 400000, ModelLimits{Context: 1000000, Output: 32000}, true},
+		{"above custom", 400000, 400001, ModelLimits{Context: 1000000, Output: 32000}, true},
+		{"reserve not subtracted from custom", 400000, 380000, ModelLimits{Context: 1000000, Output: 32000}, false},
+		{"model budget equality preserved", 400000, 68000, ModelLimits{Context: 100000, Output: 32000}, false},
+		{"model budget wins", 400000, 68001, ModelLimits{Context: 100000, Output: 32000}, true},
+		{"zero custom disabled", 0, 400000, ModelLimits{Input: 900000}, false},
+		{"zero model still applies", 0, 900001, ModelLimits{Input: 900000}, true},
+		{"equal budgets custom equality", 400000, 400000, ModelLimits{Input: 400000}, true},
+		{"unknown model custom applies", 400000, 400000, ModelLimits{}, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			config := DefaultCompactionConfig()
+			config.ContextLimit = tt.limit
+			s := NewWithOptions(SessionOptions{Limits: tt.model, CompactionConfig: &config})
+			t.Cleanup(s.Cancel)
+			s.Tokens = Tokens{Input: tt.used - 2, Output: 1}
+			s.Tokens.Cache.Read = 1
+			if got := s.IsOverflow(); got != tt.want {
+				t.Fatalf("overflow = %v, want %v", got, tt.want)
+			}
+			if s.ModelLimits != tt.model {
+				t.Fatal("custom threshold changed model capacities")
+			}
+			s.CompactionConfig.Auto = false
+			if s.IsOverflow() {
+				t.Fatal("disabled auto compaction triggered")
+			}
+		})
+	}
+}
+
+func TestPruneClearsCustomContextOverflow(t *testing.T) {
+	config := DefaultCompactionConfig()
+	config.ContextLimit = 400000
+	s := NewWithOptions(SessionOptions{Limits: ModelLimits{Input: 900000}, CompactionConfig: &config})
+	t.Cleanup(s.Cancel)
+	oldParts := make([]Part, 50)
+	for i := range oldParts {
+		oldParts[i] = Part{Type: "file", File: &FilePart{MimeType: "image/png", Source: "immutable-object"}}
+	}
+	latest := Message{Role: "user", Content: "latest request", Parts: []Part{{Type: "file", File: &FilePart{MimeType: "image/png", Source: "latest-object"}}}}
+	s.Messages = []Message{{Role: "user", Content: "old"}, {Role: "tool", Parts: oldParts}, {Role: "user", Content: "recent"}, {Role: "assistant", Content: "recent answer"}, latest}
+	s.Tokens = Tokens{Input: 399999, Output: 1}
+	if !s.IsOverflow() {
+		t.Fatal("custom equality did not trigger")
+	}
+	if !s.AutomaticCompactionNeeded() {
+		t.Fatal("eligible older context did not request compaction")
+	}
+	if s.Prune() == 0 {
+		t.Fatal("old context was not pruned")
+	}
+	if s.IsOverflow() {
+		t.Fatal("pruning did not clear custom overflow")
+	}
+	if s.AutomaticCompactionNeeded() {
+		t.Fatal("automatic compaction ignored pruned token state")
+	}
+	if !reflect.DeepEqual(s.Messages[len(s.Messages)-1], latest) {
+		t.Fatal("pruning changed latest turn")
+	}
+}
+
+func TestAutomaticCompactionEligibility(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		history []Message
+		want    bool
+	}{
+		{"single turn", []Message{{Role: "user", Content: "latest"}, {Role: "assistant", Content: "answer"}}, false},
+		{"summary only prefix", []Message{{Role: "assistant", Summary: true, Content: "summary"}, {Role: "user", Content: "latest"}}, false},
+		{"human input context", []Message{{Role: "user", ParentID: "human", Content: "attached context"}, {ID: "human", Role: "user", Content: "latest"}}, false},
+		{"generated user does not open turn", []Message{{Role: "assistant", Summary: true, Content: "summary"}, {Role: "user", Content: "latest"}, {Role: "assistant", Content: "answer"}, {Role: "user", Generated: true, Content: "host event"}}, false},
+		{"new human opens eligible prefix", []Message{{Role: "assistant", Summary: true, Content: "summary"}, {Role: "user", Content: "previous latest"}, {Role: "assistant", Content: "answer"}, {Role: "user", Content: "fresh human input"}}, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			config := DefaultCompactionConfig()
+			config.ContextLimit = 400000
+			s := NewWithOptions(SessionOptions{Limits: ModelLimits{Input: 900000}, CompactionConfig: &config})
+			t.Cleanup(s.Cancel)
+			s.Messages = tt.history
+			s.Tokens = Tokens{Input: 399999, Output: 1}
+			if !s.IsOverflow() {
+				t.Fatal("raw equality trigger lost")
+			}
+			if got := s.AutomaticCompactionNeeded(); got != tt.want {
+				t.Fatalf("automatic compaction = %v, want %v", got, tt.want)
+			}
+			s.Tokens.Input = 900000
+			if !s.AutomaticCompactionNeeded() {
+				t.Fatal("hard model pressure suppressed by eligibility")
+			}
+			s.CompactionConfig.Auto = false
+			if s.AutomaticCompactionNeeded() {
+				t.Fatal("disabled automatic compaction requested")
+			}
+		})
+	}
+}
+
 func TestIsOverflow_BoundedOutputReserve(t *testing.T) {
 	for _, tt := range []struct {
 		name   string

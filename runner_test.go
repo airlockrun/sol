@@ -528,6 +528,210 @@ func TestRunner_SmallContextCompactsOnce(t *testing.T) {
 	}
 }
 
+func TestRunner_CustomContextCompaction(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		limit, input int
+		wantCompact  bool
+	}{
+		{"below boundary", 400000, 399998, false},
+		{"exact boundary", 400000, 399999, true},
+		{"zero model only", 0, 399999, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			a := testAgent(tool.Set{})
+			limits := session.ModelLimits{Input: 900000, Output: 1000}
+			model := newMockModel(t, testutil.MockConfig{ID: "fixture", Responses: []testutil.MockResponse{
+				{Events: testutil.MockTextResponse("first answer", testutil.MockUsage(10, 1))},
+				{Events: testutil.MockTextResponse("second answer", testutil.MockUsage(tt.input, 1))},
+				{Events: testutil.MockTextResponse("short summary", testutil.MockUsage(20, 2))},
+				{Events: testutil.MockTextResponse("done", testutil.MockUsage(30, 1))},
+			}})
+			config := session.DefaultCompactionConfig()
+			config.ContextLimit = tt.limit
+			r := NewRunner(RunnerOptions{Agent: a, Model: model, ModelLimits: limits, CompactionConfig: &config, Quiet: true})
+			if _, err := r.Run(t.Context(), "first question"); err != nil {
+				t.Fatal(err)
+			}
+			result, err := r.Continue(t.Context(), "latest question")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (result.CompactionState != nil) != tt.wantCompact {
+				t.Fatalf("compaction state = %+v", result.CompactionState)
+			}
+			wantCalls := 2
+			if tt.wantCompact {
+				wantCalls = 4
+			}
+			if len(model.Requests()) != wantCalls {
+				t.Fatalf("model calls = %d", len(model.Requests()))
+			}
+			if r.session.ModelLimits != limits {
+				t.Fatal("model capacities changed")
+			}
+			if tt.wantCompact {
+				latest := false
+				for _, msg := range r.session.GetMessages() {
+					if msg.Content == "latest question" {
+						latest = true
+					}
+				}
+				if !latest {
+					t.Fatal("latest turn lost")
+				}
+				for _, msg := range model.Requests()[2].Messages {
+					if strings.Contains(msg.Content.Text, "latest question") {
+						t.Fatal("latest turn sent to summarizer")
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestRunner_ExplicitCompactIgnoresCustomTrigger(t *testing.T) {
+	for _, limit := range []int{0, 1, 400000} {
+		t.Run(fmt.Sprint(limit), func(t *testing.T) {
+			store := &testStore{messages: []session.Message{{Role: "user", Content: "old question"}, {Role: "assistant", Content: "old answer"}, {Role: "user", Content: "intact latest question"}}}
+			model := newMockModel(t, testutil.MockConfig{ID: "fixture", Default: &testutil.MockResponse{Events: testutil.MockTextResponse("summary", testutil.MockUsage(10, 2))}})
+			config := session.DefaultCompactionConfig()
+			config.ContextLimit = limit
+			r := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Model: model, ModelLimits: session.ModelLimits{Input: 1000000}, SessionStore: store, CompactionConfig: &config, Quiet: true})
+			result, err := r.Compact(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Summary != "summary" || len(model.Requests()) != 1 {
+				t.Fatalf("compact = %+v", result)
+			}
+			if store.messages[len(store.messages)-1].Content != "intact latest question" {
+				t.Fatal("latest turn changed")
+			}
+		})
+	}
+}
+
+func TestRunner_SoftContextSingleTurn(t *testing.T) {
+	for _, limit := range []int{0, 400000} {
+		t.Run(fmt.Sprint(limit), func(t *testing.T) {
+			model := newMockModel(t, testutil.MockConfig{ID: "fixture", Responses: []testutil.MockResponse{
+				{Events: testutil.MockTextResponse("completed answer", testutil.MockUsage(399999, 1))},
+			}})
+			config := session.DefaultCompactionConfig()
+			config.ContextLimit = limit
+			r := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Model: model, ModelLimits: session.ModelLimits{Input: 900000}, CompactionConfig: &config, Quiet: true})
+			result, err := r.Run(t.Context(), "single human turn")
+			if err != nil || result.Status != RunCompleted || len(model.Requests()) != 1 {
+				t.Fatalf("result=%+v error=%v calls=%d", result, err, len(model.Requests()))
+			}
+			if r.session.AutomaticCompactionNeeded() {
+				t.Fatal("irreducible soft context requested compaction")
+			}
+		})
+	}
+}
+
+func TestRunner_SoftContextHistoryProgress(t *testing.T) {
+	for _, entry := range []string{"Run", "Continue"} {
+		t.Run(entry, func(t *testing.T) {
+			model := newMockModel(t, testutil.MockConfig{ID: "fixture", Responses: []testutil.MockResponse{
+				{Events: testutil.MockToolCallResponse("c1", "noop", map[string]any{"step": 1}, testutil.MockUsage(399999, 1))},
+				{Events: testutil.MockTextResponse("first summary", testutil.MockUsage(10, 1))},
+				{Events: testutil.MockToolCallResponse("c2", "noop", map[string]any{"step": 2}, testutil.MockUsage(399999, 1))},
+				{Events: testutil.MockToolCallResponse("c3", "noop", map[string]any{"step": 3}, testutil.MockUsage(399999, 1))},
+				{Events: testutil.MockTextResponse("completed answer", testutil.MockUsage(399999, 1))},
+				{Events: testutil.MockToolCallResponse("c4", "noop", map[string]any{"step": 4}, testutil.MockUsage(399999, 1))},
+				{Events: testutil.MockTextResponse("second summary", testutil.MockUsage(10, 1))},
+				{Events: testutil.MockTextResponse("fresh turn answer", testutil.MockUsage(399999, 1))},
+			}})
+			config := session.DefaultCompactionConfig()
+			config.ContextLimit = 400000
+			r := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{"noop": tool.New("noop").Build()}), Model: model, ModelLimits: session.ModelLimits{Input: 900000}, CompactionConfig: &config, Quiet: true})
+			var result *RunResult
+			var err error
+			if entry == "Run" {
+				r.store = &testStore{messages: []session.Message{{Role: "user", Content: "older question"}, {Role: "assistant", Content: "older answer"}}}
+				result, err = r.Run(t.Context(), "intact latest question")
+			} else {
+				r.model = newMockModel(t, testutil.MockConfig{ID: "prime", Default: &testutil.MockResponse{Events: testutil.MockTextResponse("older answer", testutil.MockUsage(1, 1))}})
+				if _, err := r.Run(t.Context(), "older question"); err != nil {
+					t.Fatal(err)
+				}
+				r.model = model
+				result, err = r.Continue(t.Context(), "intact latest question")
+			}
+			if err != nil || result.Status != RunCompleted || len(model.Requests()) != 5 {
+				t.Fatalf("first turn status=%s error=%v calls=%d", result.Status, err, len(model.Requests()))
+			}
+			calls := map[string]bool{}
+			latest := false
+			for _, msg := range r.session.GetMessages() {
+				if msg.Content == "intact latest question" {
+					latest = true
+				}
+				for _, part := range msg.Parts {
+					if part.Tool != nil {
+						calls[part.Tool.CallID] = true
+					}
+				}
+			}
+			if !latest || !calls["c1"] || !calls["c2"] || !calls["c3"] {
+				t.Fatalf("latest turn or tool batch lost: %+v", r.session.GetMessages())
+			}
+			if !r.session.IsOverflow() || r.session.AutomaticCompactionNeeded() {
+				t.Fatal("soft pressure must remain observable without repeated compaction")
+			}
+			if r.session.Tokens.Input+r.session.Tokens.Output+r.session.Tokens.Cache.Read != 400000 {
+				t.Fatalf("usage was rewritten to suppress compaction: %+v", r.session.Tokens)
+			}
+			result, err = r.Continue(t.Context(), "fresh human turn")
+			if err != nil || result.Status != RunCompleted || len(model.Requests()) != 8 {
+				t.Fatalf("fresh turn status=%s error=%v calls=%d", result.Status, err, len(model.Requests()))
+			}
+			summaries := 0
+			for _, request := range model.Requests() {
+				if len(request.Tools) == 0 {
+					summaries++
+				}
+			}
+			if summaries != 2 {
+				t.Fatalf("summary calls = %d, want one per eligible human prefix", summaries)
+			}
+		})
+	}
+}
+
+func TestRunner_IrreducibleHardContextStillFails(t *testing.T) {
+	for _, limit := range []int{0, 400000} {
+		t.Run(fmt.Sprint(limit), func(t *testing.T) {
+			model := newMockModel(t, testutil.MockConfig{ID: "fixture", Default: &testutil.MockResponse{Events: testutil.MockTextResponse("over budget", testutil.MockUsage(900000, 1))}})
+			config := session.DefaultCompactionConfig()
+			config.ContextLimit = limit
+			r := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Model: model, ModelLimits: session.ModelLimits{Input: 900000}, CompactionConfig: &config, Quiet: true})
+			result, err := r.Run(t.Context(), "single human turn")
+			if err == nil || result.Status != RunFailed || !strings.Contains(err.Error(), "no older history") || len(model.Requests()) != 1 {
+				t.Fatalf("result=%+v error=%v calls=%d", result, err, len(model.Requests()))
+			}
+		})
+	}
+}
+
+func TestRunner_SoftContextSummaryFailureStillFails(t *testing.T) {
+	summaryErr := errors.New("summary provider failed")
+	model := newMockModel(t, testutil.MockConfig{ID: "fixture", Responses: []testutil.MockResponse{
+		{Events: testutil.MockTextResponse("answer", testutil.MockUsage(399999, 1))},
+		{Events: testutil.MockErrorResponse(summaryErr)},
+	}})
+	config := session.DefaultCompactionConfig()
+	config.ContextLimit = 400000
+	r := NewRunner(RunnerOptions{Agent: testAgent(tool.Set{}), Model: model, ModelLimits: session.ModelLimits{Input: 900000}, CompactionConfig: &config, SessionStore: &testStore{messages: []session.Message{{Role: "user", Content: "old question"}, {Role: "assistant", Content: "old answer"}}}, Quiet: true})
+	result, err := r.Run(t.Context(), "latest question")
+	if !errors.Is(err, summaryErr) || result.Status != RunFailed || len(model.Requests()) != 2 {
+		t.Fatalf("result=%+v error=%v calls=%d", result, err, len(model.Requests()))
+	}
+}
+
 func TestRunner_StepLimit(t *testing.T) {
 	for _, entry := range []string{"Run", "Continue", "RunUntilExit"} {
 		t.Run(entry, func(t *testing.T) {
