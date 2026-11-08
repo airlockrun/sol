@@ -50,6 +50,11 @@ type CompactionConfig struct {
 	// Auto enables automatic compaction when context overflows. Default: true.
 	Auto bool
 
+	// ContextLimit triggers compaction when total input, cache-read and output
+	// tokens reach this threshold. Zero uses only the model's input budget.
+	// The model's hard capacities and output reserve remain independent.
+	ContextLimit int
+
 	// Prune enables pruning of old tool outputs. Default: true.
 	Prune bool
 
@@ -195,20 +200,33 @@ func (s *Session) IsOverflow() bool {
 	if !s.CompactionConfig.Auto {
 		return false
 	}
-
-	// An unknown budget cannot trigger automatic compaction. Callers requiring
-	// a known budget can enforce it with ModelLimits.Validate before running.
-	if s.ModelLimits.Context == 0 && s.ModelLimits.Input == 0 {
-		return false
-	}
-	if err := s.ModelLimits.Validate(true); err != nil {
-		panic(err)
-	}
-
 	// Calculate total tokens used
 	totalUsed := s.Tokens.Input + s.Tokens.Cache.Read + s.Tokens.Output
+	modelOverflow := s.ModelLimits.ExceedsInputBudget(totalUsed)
+	return (s.CompactionConfig.ContextLimit > 0 && totalUsed >= s.CompactionConfig.ContextLimit) ||
+		modelOverflow
+}
 
-	return totalUsed > s.ModelLimits.inputBudget()
+// AutomaticCompactionNeeded distinguishes a soft context trigger from model
+// pressure. A soft trigger requires older history that can be summarized;
+// model pressure must be resolved even when the latest turn is irreducible.
+// Eligibility is derived from current history, so a fresh human turn makes its
+// preceding turn eligible without a process-local suppression latch.
+func (s *Session) AutomaticCompactionNeeded() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.CompactionConfig.Auto {
+		return false
+	}
+	totalUsed := s.Tokens.Input + s.Tokens.Cache.Read + s.Tokens.Output
+	if s.ModelLimits.ExceedsInputBudget(totalUsed) {
+		return true
+	}
+	if s.CompactionConfig.ContextLimit <= 0 || totalUsed < s.CompactionConfig.ContextLimit {
+		return false
+	}
+	start := compactionStart(s.Messages)
+	return start >= 0 && hasCompactableHistory(s.Messages[:start])
 }
 
 // Prune removes old tool outputs to reduce context size.
@@ -445,35 +463,44 @@ func isInputContext(messages []Message, i int) bool {
 		messages[i+1].Role == "user" && messages[i+1].ID == msg.ParentID
 }
 
+func compactionStart(history []Message) int {
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Role == "user" && !history[i].Generated && !isInputContext(history, i) {
+			if i > 0 && isInputContext(history, i-1) {
+				return i - 1
+			}
+			return i
+		}
+	}
+	return -1
+}
+
+func hasCompactableHistory(history []Message) bool {
+	for _, msg := range history {
+		if msg.Role != "system" && !msg.Summary {
+			return true
+		}
+	}
+	return false
+}
+
 // CompactAndContinue summarizes only history before the latest human input.
 // Its associated context and complete assistant/tool suffix remain canonical.
 // A summary alone is not eligible history for another compaction.
 func (s *Session) CompactAndContinue(ctx context.Context, model stream.Model, opts *CompactOptions) error {
 	history := s.GetMessages()
-	start := -1
-	for i := len(history) - 1; i >= 0; i-- {
-		if history[i].Role == "user" && !history[i].Generated && !isInputContext(history, i) {
-			start = i
-			if i > 0 && isInputContext(history, i-1) {
-				start--
-			}
-			break
-		}
-	}
+	start := compactionStart(history)
 	if start < 0 {
 		return errors.New("compaction requires a human input boundary")
 	}
-	eligible := false
+	if !hasCompactableHistory(history[:start]) {
+		return errors.New("no older history to compact; latest turn must remain intact")
+	}
 	var systems []Message
 	for _, msg := range history[:start] {
 		if msg.Role == "system" {
 			systems = append(systems, msg)
-		} else if !msg.Summary {
-			eligible = true
 		}
-	}
-	if !eligible {
-		return errors.New("no older history to compact; latest turn must remain intact")
 	}
 	summary, err := s.Compact(ctx, model, MessagesToGoAI(history[:start]), opts)
 	if err != nil {

@@ -74,6 +74,18 @@ func (l ModelLimits) Validate(auto bool) error {
 	return nil
 }
 
+// ExceedsInputBudget reports model-budget overflow independently of any custom
+// compaction trigger. An unknown budget cannot establish overflow.
+func (l ModelLimits) ExceedsInputBudget(tokens int) bool {
+	if l.Context == 0 && l.Input == 0 {
+		return false
+	}
+	if err := l.Validate(true); err != nil {
+		panic(err)
+	}
+	return tokens > l.inputBudget()
+}
+
 // inputBudget is shared by validation and overflow detection. It leaves the
 // declared maxima intact; Output is not a reservation made by every call.
 func (l ModelLimits) inputBudget() int {
@@ -178,12 +190,14 @@ func New(id, agentName, modelID string, limits ModelLimits) *Session {
 
 // NewWithOptions creates a new session with options.
 func NewWithOptions(opts SessionOptions) *Session {
-	ctx, cancel := context.WithCancel(context.Background())
-
 	compactionConfig := DefaultCompactionConfig()
 	if opts.CompactionConfig != nil {
 		compactionConfig = *opts.CompactionConfig
 	}
+	if compactionConfig.ContextLimit < 0 {
+		panic("session: compaction ContextLimit must be nonnegative")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Session{
 		ID:               opts.ID,

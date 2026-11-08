@@ -536,7 +536,7 @@ func (r *Runner) Run(ctx context.Context, prompt string) (*RunResult, error) {
 				r.log("[%s] Pruned %d old tool outputs\n", r.agent.Name, pruned)
 			}
 
-			if r.session.IsOverflow() {
+			if r.session.AutomaticCompactionNeeded() {
 				if _, err := r.compactAutomatically(ctx, systemPrompt); err != nil {
 					result.Status = RunFailed
 					result.Messages = r.copyMessages()
@@ -570,6 +570,9 @@ func (r *Runner) initSession() error {
 		config = *r.compactionConfig
 	}
 	limits := r.modelLimits
+	if config.ContextLimit < 0 {
+		return errors.New("RunnerOptions.CompactionConfig.ContextLimit must be nonnegative")
+	}
 	if limits != (session.ModelLimits{}) {
 		if err := limits.Validate(config.Auto); err != nil {
 			return fmt.Errorf("RunnerOptions.ModelLimits for %q: %w", r.agent.Model, err)
@@ -699,7 +702,7 @@ func (r *Runner) compactNow(ctx context.Context, systemPrompt string) (int, erro
 	r.messages = append([]goai.Message{goai.NewSystemMessage(systemPrompt)}, compactedMsgs...)
 	r.compactionState = &CompactionState{Messages: compactedMsgs}
 	r.session.Tokens = session.Tokens{Input: session.EstimateMessagesTokens(session.FromGoAIMessages(r.messages))}
-	if r.session.IsOverflow() {
+	if r.session.ModelLimits.ExceedsInputBudget(r.session.Tokens.Input) {
 		return 0, errors.New("compacted history and intact latest turn exceed model input limit")
 	}
 
@@ -947,7 +950,7 @@ func (r *Runner) Continue(ctx context.Context, prompt string) (*RunResult, error
 				r.log("[%s] Pruned %d old tool outputs\n", r.agent.Name, pruned)
 			}
 
-			if r.session.IsOverflow() {
+			if r.session.AutomaticCompactionNeeded() {
 				if _, err := r.compactAutomatically(ctx, systemPrompt); err != nil {
 					result.Status = RunFailed
 					result.Messages = r.copyMessages()
