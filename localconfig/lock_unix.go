@@ -11,16 +11,20 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func tryLockFile(ctx context.Context, f *os.File) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+	if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
+		return errFileBusy
+	}
+	return err
+}
+
 func lockFile(ctx context.Context, f *os.File) error {
 	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
-		if err == nil {
-			return nil
-		}
-		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EAGAIN) {
+		if err := tryLockFile(ctx, f); !errors.Is(err, errFileBusy) {
 			return err
 		}
 		select {

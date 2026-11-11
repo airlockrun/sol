@@ -3,10 +3,12 @@ package localconfig
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/airlockrun/sol/session"
 )
@@ -125,5 +127,96 @@ func TestSessionRejectsUnknownAndTraversal(t *testing.T) {
 				t.Fatal("invalid session opened")
 			}
 		})
+	}
+}
+
+func TestSessionLeaseContentionAndCancellation(t *testing.T) {
+	for _, canceled := range []bool{false, true} {
+		name := "busy"
+		if canceled {
+			name = "canceled"
+		}
+		t.Run(name, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "sessions")
+			holder, err := OpenSession(t.Context(), root, "", true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer holder.Close()
+			path := filepath.Join(root, holder.Record.ID+".json")
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if canceled {
+				cancel()
+			}
+			contender, err := OpenSession(ctx, root, holder.Record.ID, false)
+			if err == nil {
+				contender.Close()
+				t.Fatal("concurrent session admitted")
+			}
+			if canceled && !errors.Is(err, context.Canceled) {
+				t.Fatalf("caller cancellation lost: %v", err)
+			}
+			if !canceled && errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("lease contention must be reported directly, not as an internal deadline: %v", err)
+			}
+			if !canceled && !errors.Is(err, errFileBusy) {
+				t.Fatalf("expected lease contention: %v", err)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil || string(after) != string(before) {
+				t.Fatalf("rejected contender changed durable session: %v", err)
+			}
+			// Failed acquisition must not release the current owner's lease.
+			if contender, err := OpenSession(t.Context(), root, holder.Record.ID, false); err == nil {
+				contender.Close()
+				t.Fatal("failed contender released owner's lease")
+			}
+		})
+	}
+}
+
+func TestSessionLeaseReleasedOnOpenFailure(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sessions")
+	s, err := OpenSession(t.Context(), root, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := s.Record.ID
+	s.Close()
+	path := filepath.Join(root, id+".json")
+	valid, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("invalid-session"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if s, err := OpenSession(t.Context(), root, id, false); err == nil {
+		s.Close()
+		t.Fatal("corrupt session accepted")
+	}
+	if err := os.WriteFile(path, valid, 0600); err != nil {
+		t.Fatal(err)
+	}
+	s, err = OpenSession(t.Context(), root, id, false)
+	if err != nil {
+		t.Fatalf("failed open retained lease: %v", err)
+	}
+	defer s.Close()
+	ctx, cancel := context.WithDeadline(t.Context(), time.Time{})
+	defer cancel()
+	if contender, err := OpenSession(ctx, root, id, false); !errors.Is(err, context.DeadlineExceeded) {
+		if contender != nil {
+			contender.Close()
+		}
+		t.Fatalf("caller deadline lost: %v", err)
+	}
+	if err := s.Clear(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("clear ignored caller deadline: %v", err)
 	}
 }
