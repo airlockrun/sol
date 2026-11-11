@@ -1,6 +1,6 @@
 module github.com/airlockrun/sol
 
-go 1.26.10
+go 1.26.11
 
 require github.com/airlockrun/goai v0.3.2
 
