@@ -266,6 +266,54 @@ func TestModelCancellationJoinsProducerBeforeReturning(t *testing.T) {
 	}
 }
 
+func TestCancelledLateModelToolOutputNeverDispatches(t *testing.T) {
+	entered, release, stopped := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	model := deadlineTestModel(func(ctx context.Context, _ *stream.CallOptions) (<-chan stream.Event, error) {
+		ch := make(chan stream.Event)
+		go func() {
+			defer close(ch)
+			defer close(stopped)
+			close(entered)
+			<-ctx.Done()
+			<-release
+			// A provider can settle with an otherwise valid tool response after
+			// observed cancellation. It must be drained without remote dispatch.
+			ch <- stream.Event{Data: stream.ToolCallEvent{ToolCallID: "late-edit", ToolName: "edit", Input: json.RawMessage(`{}`)}}
+			ch <- stream.Event{Data: stream.FinishEvent{FinishReason: stream.FinishReasonToolCalls}}
+		}()
+		return ch, nil
+	})
+	calls := 0
+	tools := tool.Set{"edit": tool.New("edit").Execute(func(context.Context, json.RawMessage, tool.CallOptions) (tool.Result, error) {
+		calls++
+		return tool.Result{Output: "edited"}, nil
+	}).Build()}
+	r := NewRunner(RunnerOptions{Agent: testAgent(tools), Model: model, ToolCallExecutionMode: stream.ToolCallExecutionSync, Quiet: true})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, err := r.Run(ctx, "edit"); done <- err }()
+	<-entered
+	cancel()
+	close(release)
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled producer did not join")
+	}
+	select {
+	case <-stopped:
+	default:
+		t.Fatal("producer escaped joined drain")
+	}
+	if calls != 0 {
+		t.Fatal("late model dispatched cancelled edit", calls)
+	}
+}
+
 func TestModelBackpressureDoesNotCountAsProviderSilence(t *testing.T) {
 	model := newMockModel(t, testutil.MockConfig{ID: "backpressure", Stream: func(context.Context, *stream.CallOptions) (<-chan stream.Event, error) {
 		ch := make(chan stream.Event, 1)

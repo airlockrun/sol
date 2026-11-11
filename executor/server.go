@@ -41,6 +41,8 @@ type ToolServer struct {
 	qm             *bus.QuestionManager
 	activeTools    map[string]struct{} // if non-nil, only these tools are exposed
 	attachmentRoot string
+	controller     *controllerSupervisor
+	bootstrap      *WorkspaceBootstrap
 }
 
 // NewToolServer creates a ToolServer with the given executor.
@@ -59,7 +61,11 @@ func NewToolServer(executor tool.Executor) *ToolServer {
 func (s *ToolServer) PermissionManager() *bus.PermissionManager { return s.pm }
 
 // QuestionManager returns the server's question manager.
-func (s *ToolServer) QuestionManager() *bus.QuestionManager { return s.qm }
+func (s *ToolServer) QuestionManager() *bus.QuestionManager {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.qm
+}
 
 // message is the wire format for request/response.
 type message struct {
@@ -83,6 +89,8 @@ type message struct {
 	CancelID       string                     `json:"cancel_id,omitempty"`
 	Attachment     *AttachmentMaterialization `json:"attachment,omitempty"`
 	Materialized   *MaterializedAttachment    `json:"materialized,omitempty"`
+	Controller     *ControllerGrant           `json:"controller,omitempty"`
+	Identity       *ControllerIdentity        `json:"identity,omitempty"`
 	requestCtx     context.Context
 }
 
@@ -111,6 +119,9 @@ func (c *serverConn) writeMsg(ctx context.Context, msg message) error {
 
 // Handler returns an http.Handler for the WebSocket endpoint.
 func (s *ToolServer) Handler() http.Handler {
+	if s.controller != nil {
+		return http.HandlerFunc(s.controlledHandler)
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			InsecureSkipVerify: true, // toolserver runs inside the trusted build container
@@ -119,27 +130,42 @@ func (s *ToolServer) Handler() http.Handler {
 			return
 		}
 		ws.SetReadLimit(maxWSMessageBytes)
-		s.handleConnection(ws)
+		ctx, cancel := context.WithCancel(context.Background())
+		s.handleConnection(ctx, cancel, ws, nil)
 	})
 }
 
 // handleConnection handles a single WebSocket connection. A keepalive ping
 // detects a dead peer; any read error (including a failed ping that cancels
 // the context) ends the loop and closes the socket — there is no reconnect.
-func (s *ToolServer) handleConnection(ws *websocket.Conn) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	defer ws.Close(websocket.StatusNormalClosure, "")
-
+func (s *ToolServer) handleConnection(ctx context.Context, cancel context.CancelFunc, ws *websocket.Conn, controller *controllerConnection) {
 	sc := &serverConn{ws: ws}
+	if controller != nil {
+		s.resetControllerState()
+		identity := s.controller.identity
+		if err := sc.writeMsg(ctx, message{Type: "controller_ready", Controller: &controller.grant, Identity: &identity, Capabilities: []string{ControllerDrainCapability}}); err != nil {
+			cancel()
+			_ = ws.CloseNow()
+			return
+		}
+	}
 	var pendingMu sync.Mutex
 	pending := make(map[string]context.CancelFunc)
-	go s.pingLoop(ctx, ws, cancel)
+	var workers sync.WaitGroup
+	workers.Go(func() { s.pingLoop(ctx, ws, cancel) })
 	messages := make(chan message)
 	dispatches := make(chan message)
-	go queueMessages(ctx, messages, dispatches)
-	go func() {
+	workers.Go(func() { queueMessages(ctx, messages, dispatches) })
+	workers.Go(func() {
 		for msg := range dispatches {
+			if ctx.Err() != nil {
+				return
+			}
+			if controller != nil {
+				if err := s.controller.checkDispatch(controller); err != nil {
+					return
+				}
+			}
 			s.dispatch(ctx, sc, msg)
 			pendingMu.Lock()
 			if stop := pending[msg.ID]; stop != nil {
@@ -147,6 +173,16 @@ func (s *ToolServer) handleConnection(ws *websocket.Conn) {
 				delete(pending, msg.ID)
 			}
 			pendingMu.Unlock()
+		}
+	})
+	defer func() {
+		cancel()
+		_ = ws.CloseNow()
+		workers.Wait()
+		pendingMu.Lock()
+		defer pendingMu.Unlock()
+		for _, stop := range pending {
+			stop()
 		}
 	}()
 
@@ -237,6 +273,9 @@ func (s *ToolServer) pingLoop(ctx context.Context, ws *websocket.Conn, cancel co
 // marshal/dispatch layer (tool panics are already recovered in the executor)
 // from tearing the connection — it becomes an error reply instead.
 func (s *ToolServer) dispatch(ctx context.Context, sc *serverConn, msg message) {
+	if ctx.Err() != nil {
+		return
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			s.sendError(ctx, sc, msg.ID, fmt.Sprintf("internal error: %v", r))
@@ -312,7 +351,7 @@ func (s *ToolServer) handleRequest(ctx context.Context, sc *serverConn, msg mess
 	}
 	execCtx = bus.WithBus(execCtx, s.bus)
 	execCtx = bus.WithPermissionManager(execCtx, s.pm)
-	execCtx = bus.WithQuestionManager(execCtx, s.qm)
+	execCtx = bus.WithQuestionManager(execCtx, s.QuestionManager())
 	if msg.QuestionAnswer != nil {
 		if msg.QuestionAnswer.ToolCallID != msg.Request.ToolCallID {
 			s.sendError(ctx, sc, msg.ID, "question answer does not match tool call")
@@ -362,7 +401,14 @@ func (s *ToolServer) handleToolsRequest(ctx context.Context, sc *serverConn, msg
 		filtered = allTools
 	}
 
-	s.writeMsg(ctx, sc, message{Type: "tools", ID: msg.ID, Tools: filtered, Capabilities: []string{CommandResultsCapability, AttachmentMaterializationCapability, CallQuestionAnswersCapability}})
+	capabilities := []string{CommandResultsCapability, AttachmentMaterializationCapability, CallQuestionAnswersCapability}
+	if s.controller != nil {
+		capabilities = append(capabilities, ControllerDrainCapability)
+	}
+	if _, ok := s.executor.(*GitSnapshotExecutor); ok {
+		capabilities = append(capabilities, GitSnapshotCapability)
+	}
+	s.writeMsg(ctx, sc, message{Type: "tools", ID: msg.ID, Tools: filtered, Capabilities: capabilities})
 }
 
 // handleSetRules sets the permission rules and sends an ack.
@@ -385,7 +431,7 @@ func (s *ToolServer) handleSetActiveTools(ctx context.Context, sc *serverConn, m
 
 // handlePushAnswers pushes pre-loaded answers and sends an ack.
 func (s *ToolServer) handlePushAnswers(ctx context.Context, sc *serverConn, msg message) {
-	s.qm.PushAnswers(msg.Answers)
+	s.QuestionManager().PushAnswers(msg.Answers)
 	s.writeMsg(ctx, sc, message{Type: "push_answers", ID: msg.ID})
 }
 
