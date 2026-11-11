@@ -4,6 +4,8 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -31,6 +33,10 @@ func main() {
 		fmt.Println(executor.CommandResultsCapability)
 		fmt.Println(executor.AttachmentMaterializationCapability)
 		fmt.Println(executor.CallQuestionAnswersCapability)
+		fmt.Println(executor.ControllerDrainCapability)
+		fmt.Println(executor.SignedControllerCapability)
+		fmt.Println(executor.GitSnapshotCapability)
+		fmt.Println(executor.WorkspaceBootstrapCapability)
 		return
 	}
 
@@ -73,11 +79,53 @@ func main() {
 	}
 
 	// Create and start ToolServer
-	server := executor.NewToolServer(wrappedExec)
+	var server *executor.ToolServer
+	var snapshots *executor.GitSnapshotExecutor
+	controllerConfigJSON := os.Getenv("SOL_CONTROLLER_CONFIG")
+	_ = os.Unsetenv("SOL_CONTROLLER_CONFIG")
+	var controllerConfig executor.ControllerServerConfig
+	if controllerConfigJSON != "" {
+		if err := json.Unmarshal([]byte(controllerConfigJSON), &controllerConfig); err != nil {
+			log.Fatalf("controller configuration: %v", err)
+		}
+		authority, err := executor.NewSignedControllerAuthority(controllerConfig)
+		if err != nil {
+			log.Fatal(err)
+		}
+		snapshots = executor.NewGitSnapshotExecutor(wrappedExec, workDir, "/tmp/sol-snapshots")
+		server = executor.NewControlledToolServer(snapshots, controllerConfig.ResourceID, controllerConfig.Incarnation, authority)
+		if controllerConfig.BootstrapSHA256 != "" {
+			if filepath.Base(workDir) != "workspace" {
+				log.Fatal("bootstrap working directory must be named workspace")
+			}
+			server.EnableWorkspaceBootstrap(executor.NewWorkspaceBootstrap(filepath.Dir(workDir), controllerConfig.BootstrapSHA256, controllerConfig.BootstrapCommand))
+		}
+	} else {
+		server = executor.NewToolServer(wrappedExec)
+	}
 
 	// Mux with health endpoint
 	mux := http.NewServeMux()
 	mux.Handle("/ws", requireBearerToken(spaceToken, server.Handler()))
+	if controllerConfigJSON != "" {
+		protect := func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+controllerConfig.ArtifactToken)) != 1 {
+					http.Error(w, "unauthorized", http.StatusUnauthorized)
+					return
+				}
+				next.ServeHTTP(w, r)
+			})
+		}
+		mux.Handle("/controller/identity", protect(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_ = json.NewEncoder(w).Encode(server.ControllerIdentity())
+		})))
+		mux.Handle("/controller/status", server.ControllerStatusHandler())
+		mux.Handle("/snapshots/", protect(snapshots.ArtifactHandler()))
+		if controllerConfig.BootstrapSHA256 != "" {
+			mux.Handle("/bootstrap", server.WorkspaceBootstrapHandler())
+		}
+	}
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
@@ -104,6 +152,11 @@ func main() {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	if controllerConfigJSON != "" {
+		if err := server.ShutdownControllers(shutdownCtx); err != nil {
+			log.Printf("controller shutdown incomplete: %v", err)
+		}
+	}
 	srv.Shutdown(shutdownCtx)
 }
 

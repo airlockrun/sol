@@ -96,6 +96,10 @@ func NewWSTransport(url string, headers ...http.Header) (*WSTransport, error) {
 	}
 	conn.SetReadLimit(maxWSMessageBytes)
 
+	return startWSTransport(ctx, cancel, conn), nil
+}
+
+func startWSTransport(ctx context.Context, cancel context.CancelFunc, conn *websocket.Conn) *WSTransport {
 	t := &WSTransport{
 		conn:    conn,
 		ctx:     ctx,
@@ -107,7 +111,41 @@ func NewWSTransport(url string, headers ...http.Header) (*WSTransport, error) {
 	go t.readLoop()
 	go t.pingLoop()
 
-	return t, nil
+	return t
+}
+
+// NewControlledWSTransport consumes a host-issued admission and waits for the
+// resource's joined-drain acknowledgement before exposing the transport. The
+// expected identity/grant come from trusted host admission, not this endpoint.
+// Handshake failure has an unknown admission outcome. Callers must obtain a fresh
+// admission to reconnect; this constructor never retries or replays commands.
+func NewControlledWSTransport(ctx context.Context, url, credential string, identity ControllerIdentity, grant ControllerGrant) (*WSTransport, error) {
+	if credential == "" || identity.ResourceID == "" || identity.Incarnation == "" || identity.BootID == "" || grant.Epoch == 0 || grant.AdmissionID == "" {
+		return nil, errors.New("executor: controlled transport requires credential, identity and admission")
+	}
+	headers := make(http.Header)
+	headers.Set(ControllerCredentialHeader, credential)
+	conn, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{HTTPHeader: headers})
+	if err != nil {
+		return nil, transportError("controller admission", err)
+	}
+	conn.SetReadLimit(maxWSMessageBytes)
+	_, data, err := conn.Read(ctx)
+	if err != nil {
+		_ = conn.CloseNow()
+		return nil, transportError("controller readiness unknown", err)
+	}
+	var ready message
+	if err := json.Unmarshal(data, &ready); err != nil || ready.Type != "controller_ready" || ready.Identity == nil || *ready.Identity != identity || ready.Controller == nil || !sameAdmission(*ready.Controller, grant) {
+		_ = conn.CloseNow()
+		return nil, transportError("controller readiness", errors.New("resource identity or admission mismatch"))
+	}
+	if len(ready.Capabilities) != 1 || ready.Capabilities[0] != ControllerDrainCapability {
+		_ = conn.CloseNow()
+		return nil, transportError("controller readiness", errors.New("missing joined controller drain capability"))
+	}
+	transportCtx, cancel := context.WithCancel(context.Background())
+	return startWSTransport(transportCtx, cancel, conn), nil
 }
 
 // Send implements Transport.
