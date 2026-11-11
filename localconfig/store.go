@@ -19,6 +19,8 @@ const Version = 3
 const APIKeyMode = "api-key"
 const maxStoreBytes = 1 << 20
 
+var errFileBusy = errors.New("sol config: file is locked")
+
 // OAuthCredential holds refreshable tokens and optional account-routing metadata.
 type OAuthCredential struct {
 	AccessToken  string    `json:"access_token"`
@@ -250,6 +252,10 @@ func (s *FileStore) LockEntry(ctx context.Context, entry string) (func(), error)
 }
 
 func (s *FileStore) lock(ctx context.Context) (func(), error) {
+	return s.lockWith(ctx, lockFile)
+}
+
+func (s *FileStore) lockWith(ctx context.Context, acquire func(context.Context, *os.File) error) (func(), error) {
 	if s == nil || !filepath.IsAbs(s.path) {
 		return nil, errors.New("sol config: use NewFileStore with an absolute path")
 	}
@@ -283,7 +289,7 @@ func (s *FileStore) lock(ctx context.Context) (func(), error) {
 		f.Close()
 		return nil, err
 	}
-	if err := lockFile(ctx, f); err != nil {
+	if err := acquire(ctx, f); err != nil {
 		f.Close()
 		return nil, err
 	}

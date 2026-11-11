@@ -11,7 +11,8 @@ import (
 func lockFile(context.Context, *os.File) error {
 	return errors.New("sol config: file locking unsupported on this platform")
 }
-func unlockFile(*os.File) {}
+func tryLockFile(ctx context.Context, f *os.File) error { return lockFile(ctx, f) }
+func unlockFile(*os.File)                               {}
 func syncDirectory(string) error {
 	return errors.New("sol config: directory sync unsupported on this platform")
 }

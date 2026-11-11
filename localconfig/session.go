@@ -67,9 +67,9 @@ func OpenSession(ctx context.Context, root, id string, create bool) (*SessionFil
 	if err != nil {
 		return nil, err
 	}
-	lockCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
-	defer cancel()
-	unlock, err := f.lock(lockCtx)
+	// A session lease is exclusive for the whole command; reject an active owner
+	// without imposing a filesystem or scheduler deadline on an unheld lease.
+	unlock, err := f.lockWith(ctx, tryLockFile)
 	if err != nil {
 		return nil, fmt.Errorf("session %s is busy or unavailable: %w", id, err)
 	}
