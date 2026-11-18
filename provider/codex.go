@@ -66,7 +66,7 @@ func NewCodexModel(modelID string, opts CodexOptions) (stream.Model, error) {
 			return nil
 		},
 	})
-	return &codexModel{model: model, sessionID: opts.SessionID}, nil
+	return &inputModel{Model: &codexModel{model: model, sessionID: opts.SessionID}, modalities: InputModalities("openai", modelID)}, nil
 }
 
 type codexModel struct {
@@ -76,6 +76,22 @@ type codexModel struct {
 
 func (m *codexModel) ID() string       { return m.model.ID() }
 func (m *codexModel) Provider() string { return m.model.Provider() }
+func (m *codexModel) ValidateFile(role message.Role, file message.FilePart) error {
+	return Validator(m.model).ValidateFile(role, file)
+}
+func (m *codexModel) ValidateMessages(messages []message.Message) error {
+	for _, msg := range messages {
+		if msg.Role != message.RoleSystem && msg.Role != "developer" {
+			continue
+		}
+		for _, part := range msg.Content.Parts {
+			if _, ok := part.(message.TextPart); !ok {
+				return errors.New("codex: system messages must contain only text")
+			}
+		}
+	}
+	return Validator(m.model).ValidateMessages(messages)
+}
 func (m *codexModel) Stream(ctx context.Context, opts *stream.CallOptions) (<-chan stream.Event, error) {
 	if opts == nil {
 		return nil, errors.New("codex: call options are required")

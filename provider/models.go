@@ -383,7 +383,7 @@ func GetModalities(providerID, modelID string) *ModelModalities {
 func SupportsInputModality(providerID, modelID, modality string) bool {
 	modalities := GetModalities(providerID, modelID)
 	if modalities == nil {
-		return true
+		return false
 	}
 	return modalities.SupportsInput(modality)
 }
