@@ -56,7 +56,13 @@ func ParseModel(model string) (providerID, modelID string) {
 
 // Options holds configuration for creating a provider.
 type Options struct {
-	APIKey  string
+	// InputModalities overrides the catalog input declaration for this selected
+	// model. Custom endpoints use their explicitly confirmed vision setting.
+	// Model input declarations do not establish endpoint transport support.
+	InputModalities *ModelModalities
+	APIKey          string
+	// BaseURL selects an explicit provider endpoint. Generic provider construction
+	// panics when neither BaseURL nor the catalog declares an endpoint.
 	BaseURL string
 
 	// HTTPClient sends requests only for the explicit openai-compatible provider.
@@ -81,7 +87,17 @@ type ProxyOptions struct {
 // CreateModel creates a language model from provider and model IDs.
 // This is the main entry point for getting a model instance.
 func CreateModel(providerID, modelID string, opts Options) stream.Model {
-	return createProvider(providerID, opts).Model(modelID)
+	m := createProvider(providerID, opts).Model(modelID)
+	if m == nil {
+		return nil
+	}
+	modalities := opts.InputModalities
+	if modalities == nil {
+		modalities = InputModalities(providerID, modelID)
+	} else {
+		modalities = &ModelModalities{Input: append([]string(nil), modalities.Input...)}
+	}
+	return &inputModel{Model: m, modalities: modalities}
 }
 
 // CreateProxyModel creates a model that proxies LLM calls through an Airlock-compatible endpoint.
@@ -165,7 +181,7 @@ var providerFactories = map[string]providerFactory{
 		// JSON-base64 transcription) differ from OpenAI's.
 		return newOpenAICompatProvider("openrouter", baseURL, o.APIKey,
 			goaiopenrouter.New(provider.Options{APIKey: o.APIKey, BaseURL: baseURL}),
-			openaicompat.Options{SupportsStructuredOutputs: true})
+			openaicompat.Options{SupportsStructuredOutputs: true, FileValidator: openRouterFileValidator(baseURL)})
 	},
 	"openai-compatible": func(o Options) provider.Provider {
 		baseURL := strings.TrimSpace(o.BaseURL)
@@ -221,10 +237,10 @@ func createProvider(providerID string, opts Options) provider.Provider {
 	if f, ok := providerFactories[providerID]; ok {
 		return f(opts)
 	}
-	baseURL := opts.BaseURL
+	baseURL := strings.TrimSpace(opts.BaseURL)
 	if baseURL == "" {
 		if info, ok := GetProviderInfo(providerID); ok {
-			baseURL = strings.TrimRight(info.API, "/")
+			baseURL = info.API
 		}
 	}
 	return newOpenAICompatProvider(providerID, baseURL, opts.APIKey, nil,

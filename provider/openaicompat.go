@@ -1,6 +1,9 @@
 package provider
 
 import (
+	"strings"
+
+	"github.com/airlockrun/goai/message"
 	"github.com/airlockrun/goai/model"
 	"github.com/airlockrun/goai/provider"
 	"github.com/airlockrun/goai/provider/openai"
@@ -11,6 +14,19 @@ import (
 // OpenRouterBaseURL is OpenRouter's OpenAI-compatible API root. Used as the
 // default when a configured provider leaves the base URL blank.
 const OpenRouterBaseURL = "https://openrouter.ai/api/v1"
+
+// The known OpenRouter Chat endpoint declares user image_url transport. Endpoint
+// overrides do not inherit it. Model input intent is checked independently.
+// https://openrouter.ai/docs/guides/features/compatibility
+// https://openrouter.ai/docs/guides/overview/multimodal/image-understanding
+func openRouterFileValidator(baseURL string) func(string, message.Role, message.FilePart) error {
+	return func(modelID string, role message.Role, file message.FilePart) error {
+		if !strings.HasPrefix(file.MimeType, "text/") && strings.TrimRight(baseURL, "/") != OpenRouterBaseURL {
+			return provider.ErrUnsupportedFile
+		}
+		return openaicompat.ValidateUserImageFile(modelID, role, file)
+	}
+}
 
 // openAICompatProvider adapts an OpenAI-compatible endpoint that has no
 // dedicated goai package (gateways like OpenRouter, or any provider the catalog
@@ -35,6 +51,10 @@ type openAICompatProvider struct {
 // "/chat/completions". modalities supplies non-text models; pass nil to default
 // to the OpenAI provider at the same base URL.
 func newOpenAICompatProvider(id, baseURL, apiKey string, modalities provider.Provider, compatOptions openaicompat.Options) *openAICompatProvider {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if baseURL == "" {
+		panic("compatible provider requires an explicit BaseURL or a catalog API endpoint")
+	}
 	if modalities == nil {
 		modalities = openai.New(provider.Options{APIKey: apiKey, BaseURL: baseURL})
 	}

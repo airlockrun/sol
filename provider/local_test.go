@@ -298,6 +298,42 @@ func TestResolveLocalModelCompatibleOverride(t *testing.T) {
 	}
 }
 
+func TestResolveLocalModelFileValidatorForwardsNativeTransport(t *testing.T) {
+	store := localTestStore(t)
+	_, err := store.Update(t.Context(), func(config *localconfig.Config) error {
+		config.Providers["personal/anthropic"] = localconfig.ProviderConfig{Auth: "api-key", Key: "owned-fake"}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	opts := localTestOptions(store)
+	opts.Model = "personal/anthropic/claude-sonnet-4-6"
+	opts.BaseURL = "https://fixture.invalid"
+	opts.HTTPClient = &http.Client{Transport: localRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return nil, errors.New("unexpected provider HTTP")
+	})}
+	model, _, err := provider.ResolveLocalModel(t.Context(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := message.FilePart{MimeType: "image/png", Data: message.FileDataBytes{Data: "cHJlZmxpZ2h0"}}
+	if err := provider.Validator(model).ValidateFile(message.RoleUser, file); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.Validator(model).ValidateFile(message.RoleAssistant, file); err == nil {
+		t.Fatal("unsupported role accepted through local wrapper")
+	}
+	if err := provider.Validator(model).ValidateMessages([]message.Message{message.NewUserMessageWithParts(file)}); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 0 {
+		t.Fatal("preflight made provider HTTP")
+	}
+}
+
 func TestResolveLocalModelNativeAnthropic(t *testing.T) {
 	store := localTestStore(t)
 	_, err := store.Update(t.Context(), func(config *localconfig.Config) error {

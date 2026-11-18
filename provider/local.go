@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/airlockrun/goai/message"
 	"github.com/airlockrun/goai/provider/anthropic"
 	"github.com/airlockrun/goai/provider/baseten"
 	"github.com/airlockrun/goai/provider/cerebras"
@@ -186,7 +187,7 @@ func ResolveLocalModel(ctx context.Context, opts LocalModelOptions) (stream.Mode
 	if err != nil {
 		return nil, session.ModelLimits{}, err
 	}
-	return model, limits, nil
+	return &inputModel{Model: model, modalities: InputModalities(id, modelID)}, limits, nil
 }
 
 // ValidateLocalEntry requires a canonical provider namespace from Sol's catalog.
@@ -363,7 +364,11 @@ func localAPIModel(id, modelID, key string, opts LocalModelOptions) (stream.Mode
 	if err := validateLocalURL(base); err != nil {
 		return nil, err
 	}
-	model := openaicompat.New(openaicompat.Options{ProviderID: id, APIKey: key, BaseURL: base, HTTPClient: &client, SupportsStructuredOutputs: id != "openai-compatible"}).Model(modelID)
+	compatOptions := openaicompat.Options{ProviderID: id, APIKey: key, BaseURL: base, HTTPClient: &client, SupportsStructuredOutputs: id != "openai-compatible"}
+	if id == "openrouter" {
+		compatOptions.FileValidator = openRouterFileValidator(base)
+	}
+	model := openaicompat.New(compatOptions).Model(modelID)
 	return &localHeaderModel{model: model, userAgent: opts.UserAgent, sessionID: opts.SessionID}, nil
 }
 
@@ -374,6 +379,12 @@ type localHeaderModel struct {
 
 func (m *localHeaderModel) ID() string       { return m.model.ID() }
 func (m *localHeaderModel) Provider() string { return m.model.Provider() }
+func (m *localHeaderModel) ValidateFile(role message.Role, file message.FilePart) error {
+	return Validator(m.model).ValidateFile(role, file)
+}
+func (m *localHeaderModel) ValidateMessages(messages []message.Message) error {
+	return Validator(m.model).ValidateMessages(messages)
+}
 func (m *localHeaderModel) Stream(ctx context.Context, opts *stream.CallOptions) (<-chan stream.Event, error) {
 	if opts == nil {
 		return nil, errors.New("local model call options are required")

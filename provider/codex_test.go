@@ -62,6 +62,38 @@ func writeCodexText(w http.ResponseWriter, text string) {
 	fmt.Fprintf(w, "data: %s\n\n", `{"type":"response.completed","response":{"id":"resp","usage":{"input_tokens":10,"output_tokens":2}}}`)
 }
 
+type preflightCodexSource struct{ calls atomic.Int32 }
+
+func (s *preflightCodexSource) Access(context.Context) (codex.Access, error) {
+	s.calls.Add(1)
+	return codex.Access{}, errors.New("unexpected credential access")
+}
+
+func TestCodexForwardsCompleteMessageValidationBeforeCredentials(t *testing.T) {
+	source := &preflightCodexSource{}
+	var requests atomic.Int32
+	model, err := provider.NewCodexModel("gpt-5.3-codex", provider.CodexOptions{
+		Credentials: source, HTTPClient: &http.Client{Transport: localRoundTripFunc(func(*http.Request) (*http.Response, error) {
+			requests.Add(1)
+			return nil, errors.New("unexpected provider HTTP")
+		})},
+		URL: "https://fixture.invalid/codex/responses", UserAgent: "owned-fixture", SessionID: "owned-session",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := message.FilePart{MimeType: "image/png", Data: message.FileDataBytes{Data: "cHJlZmxpZ2h0"}}
+	if err := provider.Validator(model).ValidateMessages([]message.Message{message.NewUserMessageWithParts(file)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.Validator(model).ValidateMessages([]message.Message{{Role: message.RoleSystem, Content: message.Content{Parts: []message.Part{message.ReasoningPart{Text: "not a system directive"}}}}}); err == nil {
+		t.Fatal("Codex system content restriction was not forwarded")
+	}
+	if source.calls.Load() != 0 || requests.Load() != 0 {
+		t.Fatal("message preflight accessed credentials or HTTP")
+	}
+}
+
 func TestCodexWirePolicy(t *testing.T) {
 	for _, routed := range []bool{true, false} {
 		t.Run(fmt.Sprint(routed), func(t *testing.T) {
