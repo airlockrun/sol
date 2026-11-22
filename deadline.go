@@ -7,17 +7,18 @@ import (
 	"time"
 
 	"github.com/airlockrun/goai/tool"
+	"github.com/airlockrun/sol/internal/generation"
 )
 
-const DefaultModelTimeout = 15 * time.Minute
-const DefaultModelIdleTimeout = 5 * time.Minute
+const DefaultModelTimeout = generation.DefaultWall
+const DefaultModelIdleTimeout = generation.DefaultIdle
 const DefaultToolTimeout = 10 * time.Minute
 const DefaultMaintenanceTimeout = 60 * time.Second
 const DefaultSettlementTimeout = 15 * time.Second
 
 // ErrStepDeadline identifies a terminal foreground step deadline. A fresh user
 // turn may proceed after settlement; interrupted effects must not be replayed.
-var ErrStepDeadline = errors.New("foreground step deadline exceeded")
+var ErrStepDeadline = generation.ErrDeadline
 
 type stepExecutorKey struct{}
 

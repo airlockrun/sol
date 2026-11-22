@@ -17,12 +17,18 @@ import (
 // Airlock's runtime resolves search differently — it queries the providers
 // table for any enabled search-capable row. This helper exists for the
 // standalone Sol CLI and the build-time sol runner where there's no DB.
-func WebSearch(llmProvider, llmAPIKey string) (tool.Tool, bool) {
+func WebSearch(llmProvider string, opts solprovider.Options) (tool.Tool, bool) {
 	// 1. Can the LLM provider also do search? Reuse the same key.
 	if backend := solprovider.SearchBackend(llmProvider); backend != "" {
+		if websearch.IsModelBackend(backend) {
+			model := solprovider.CreateModel(llmProvider, websearch.DefaultModel(backend), opts)
+			return websearch.NewTool(websearch.NewModelClient(backend, model)), true
+		}
 		return websearch.NewTool(websearch.NewClient(websearch.Options{
-			Provider: backend,
-			APIKey:   llmAPIKey,
+			Provider:   backend,
+			APIKey:     opts.APIKey,
+			BaseURL:    opts.BaseURL,
+			HTTPClient: opts.HTTPClient,
 		})), true
 	}
 

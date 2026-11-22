@@ -197,6 +197,10 @@ func executeBatch(ctx context.Context, prompt, id, modelRef, agentName, name, mc
 	}
 	if search {
 		searchAuth, searchID, searchKey := auth, providerID, apiKey
+		searchBaseURL := baseURL
+		if proxyURL == "" && searchBaseURL == "" {
+			searchBaseURL = config.Providers[strings.TrimSuffix(modelRef, "/"+modelID)].BaseURL
+		}
 		if searchEntry != "" {
 			if proxyURL != "" {
 				return errors.New("named search accounts require direct local mode")
@@ -209,8 +213,9 @@ func executeBatch(ctx context.Context, prompt, id, modelRef, agentName, name, mc
 				return err
 			}
 			searchAuth = localconfig.APIKeyMode
+			searchBaseURL = config.Providers[searchEntry].BaseURL
 		}
-		t, ok := resolveSearch(searchAuth, searchID, searchKey)
+		t, ok := resolveSearch(searchAuth, searchID, provider.Options{APIKey: searchKey, BaseURL: searchBaseURL, HTTPClient: &http.Client{}})
 		if !ok {
 			return errors.New("--search requires a search-capable API-key account; use --search-provider slug/provider")
 		}

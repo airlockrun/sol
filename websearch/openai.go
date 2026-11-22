@@ -6,7 +6,6 @@ import (
 
 	"github.com/airlockrun/goai"
 	"github.com/airlockrun/goai/message"
-	"github.com/airlockrun/goai/provider"
 	"github.com/airlockrun/goai/provider/openai"
 	"github.com/airlockrun/goai/stream"
 	"github.com/airlockrun/goai/tool"
@@ -18,7 +17,7 @@ import (
 // default reasoning takes 30-60s on terse queries, while nano returns comparable
 // citation coverage in ~10s. Online, pickSearchModel resolves the current nano
 // from the active catalog, so this rarely fires; callers can still override via
-// Options.Model.
+// the model supplied to NewModelClient.
 const defaultOpenAIModel = "gpt-5.4-nano"
 
 // searchOpenAI runs a web-search-grounded generation through goai's
@@ -26,24 +25,14 @@ const defaultOpenAIModel = "gpt-5.4-nano"
 // Citations are extracted from goai's SourceEvent stream — the same
 // mechanism that surfaces url_citation annotations in ai-sdk's
 // generateText.sources.
-func (c *DirectClient) searchOpenAI(ctx context.Context, req Request) (*Response, error) {
-	model := c.model
-	if model == "" {
-		model = pickSearchModel("openai", []string{"nano", "mini"})
-	}
-	if model == "" {
-		model = defaultOpenAIModel
-	}
-
-	p := openai.New(provider.Options{APIKey: c.apiKey})
-
+func (c *modelClient) searchOpenAI(ctx context.Context, model stream.Model, req Request) (*Response, error) {
 	tools := tool.Set{}
 	ws := openai.WebSearch()
 	ws.Name = "openai_web_search"
 	tools.Add(ws)
 
 	result, err := goai.GenerateText(ctx, stream.Input{
-		Model:     p.Responses(model),
+		Model:     model,
 		Tools:     tools,
 		Reasoning: stream.ReasoningEffortLow,
 		Messages: []message.Message{
@@ -76,7 +65,11 @@ func sourcesToResults(sources []stream.SourceEvent) []Result {
 			continue
 		}
 		seen[s.URL] = true
-		out = append(out, Result{Title: s.Title, URL: s.URL})
+		var snippet string
+		if metadata, ok := s.ProviderMetadata["openaiCompat"].(map[string]any); ok {
+			snippet, _ = metadata["content"].(string)
+		}
+		out = append(out, Result{Title: s.Title, URL: s.URL, Snippet: snippet})
 	}
 	return out
 }

@@ -115,7 +115,8 @@ type RunnerOptions struct {
 	ModelTimeout     time.Duration
 	ModelIdleTimeout time.Duration
 	ToolTimeout      time.Duration
-	// MaintenanceTimeout bounds compaction independently of foreground steps.
+	// MaintenanceTimeout bounds compaction checkpoint persistence. Summary
+	// generation uses ModelTimeout and ModelIdleTimeout.
 	// SettlementTimeout bounds a durability-critical append after cancellation.
 	// Zero values use DefaultMaintenanceTimeout and DefaultSettlementTimeout.
 	MaintenanceTimeout time.Duration
@@ -672,8 +673,12 @@ func (r *Runner) Compact(ctx context.Context) (*CompactResult, error) {
 // store. Shared by the overflow path in Run/Continue and the user-triggered
 // Compact() method so the two can't drift.
 func (r *Runner) compactNow(ctx context.Context, systemPrompt string) (int, error) {
-	ctx, cancel := context.WithTimeout(ctx, r.maintenanceTimeout)
-	defer cancel()
+	ctx, cancel := context.WithCancelCause(ctx)
+	boundedModel := &deadlineModel{Model: r.model, Wall: r.modelTimeout, Idle: r.modelIdleTimeout, StopStep: cancel}
+	defer func() {
+		cancel(nil)
+		boundedModel.Producers.Wait()
+	}()
 	preTokens := r.session.Tokens.Input + r.session.Tokens.Cache.Read + r.session.Tokens.Output
 	maxOutputTokens := session.OutputTokenMax
 	if r.session.ModelLimits.Output > 0 {
@@ -694,7 +699,10 @@ func (r *Runner) compactNow(ctx context.Context, systemPrompt string) (int, erro
 			return coalesceConsecutiveUser(redactMessages(filtered, r.agent.Redactor))
 		},
 	}
-	if err := r.session.CompactAndContinue(ctx, r.model, compactOpts); err != nil {
+	if err := r.session.CompactAndContinue(ctx, boundedModel, compactOpts); err != nil {
+		if ctx.Err() != nil {
+			err = errors.Join(err, stepContextError(ctx))
+		}
 		return 0, fmt.Errorf("compaction error: %w", err)
 	}
 
@@ -709,7 +717,9 @@ func (r *Runner) compactNow(ctx context.Context, systemPrompt string) (int, erro
 	tokensFreed := max(0, preTokens-session.EstimateMessagesTokens(r.session.GetMessages()))
 	if r.store != nil {
 		postCheckpoint := r.session.GetMessages()
-		if err := r.store.Compact(ctx, postCheckpoint, tokensFreed); err != nil {
+		storeCtx, storeCancel := context.WithTimeout(ctx, r.maintenanceTimeout)
+		defer storeCancel()
+		if err := r.store.Compact(storeCtx, postCheckpoint, tokensFreed); err != nil {
 			r.canContinue = false
 			return 0, fmt.Errorf("store compact: %w", err)
 		}
@@ -1073,7 +1083,7 @@ func (r *Runner) runStep(ctx context.Context) (result *StepResult, runErr error)
 	}
 	tracked := &stepExecutor{next: executor, timeout: r.toolTimeout, stopStep: cancel, dispatched: make(map[string]bool)}
 	ctx = context.WithValue(ctx, stepExecutorKey{}, tracked)
-	boundedModel := &deadlineModel{Model: r.model, wall: r.modelTimeout, idle: r.modelIdleTimeout, stopStep: cancel}
+	boundedModel := &deadlineModel{Model: r.model, Wall: r.modelTimeout, Idle: r.modelIdleTimeout, StopStep: cancel}
 	input := stream.Input{
 		Model:       boundedModel,
 		Messages:    llmMessages,
@@ -1110,7 +1120,7 @@ func (r *Runner) runStep(ctx context.Context) (result *StepResult, runErr error)
 		}
 		// Setup cancellation can close FullStream before the model adapter has
 		// drained its provider. No new attempts can start after FullStream closes.
-		boundedModel.producers.Wait()
+		boundedModel.Producers.Wait()
 	}()
 
 	// Process stream events
@@ -1272,7 +1282,7 @@ func (r *Runner) runStep(ctx context.Context) (result *StepResult, runErr error)
 				// checkpoints must not commit while that producer still owns work.
 				for range streamResult.FullStream {
 				}
-				boundedModel.producers.Wait()
+				boundedModel.Producers.Wait()
 			}
 			var permErr *bus.ErrPermissionNeeded
 			var questErr *bus.ErrQuestionNeeded
@@ -1385,7 +1395,7 @@ func (r *Runner) runStep(ctx context.Context) (result *StepResult, runErr error)
 		Usage:        usage,
 	}
 	if ctx.Err() != nil {
-		boundedModel.producers.Wait()
+		boundedModel.Producers.Wait()
 	}
 
 	if err := r.appendMessages(ctx, true, assistantParts, toolCalls, toolResults, usage); err != nil {

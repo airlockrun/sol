@@ -4,9 +4,12 @@
 package provider
 
 import (
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 
+	"github.com/airlockrun/goai/message"
 	"github.com/airlockrun/goai/model"
 	"github.com/airlockrun/goai/provider"
 	"github.com/airlockrun/goai/provider/anthropic"
@@ -37,6 +40,7 @@ import (
 	"github.com/airlockrun/goai/provider/togetherai"
 	"github.com/airlockrun/goai/provider/xai"
 	"github.com/airlockrun/goai/stream"
+	"github.com/airlockrun/goai/tool"
 )
 
 // ParseModel parses a "provider/model" string into provider and model IDs.
@@ -65,7 +69,8 @@ type Options struct {
 	// panics when neither BaseURL nor the catalog declares an endpoint.
 	BaseURL string
 
-	// HTTPClient sends requests only for the explicit openai-compatible provider.
+	// HTTPClient sends language requests for OpenAI, Google, xAI, Moonshot and
+	// the explicit openai-compatible provider.
 	HTTPClient *http.Client
 
 	// SupportsStructuredOutputs controls native json_schema response formats for
@@ -126,13 +131,13 @@ type providerFactory func(Options) provider.Provider
 var providerFactories = map[string]providerFactory{
 	// Direct providers (each has its own wire format).
 	"openai": func(o Options) provider.Provider {
-		return openai.New(provider.Options{APIKey: o.APIKey, BaseURL: o.BaseURL})
+		return openai.New(provider.Options{APIKey: o.APIKey, BaseURL: o.BaseURL, HTTPClient: o.HTTPClient})
 	},
 	"anthropic": func(o Options) provider.Provider {
 		return anthropic.New(anthropic.Options{APIKey: o.APIKey, BaseURL: o.BaseURL})
 	},
 	"google": func(o Options) provider.Provider {
-		return google.New(google.Options{APIKey: o.APIKey, BaseURL: o.BaseURL})
+		return google.New(google.Options{APIKey: o.APIKey, BaseURL: o.BaseURL, HTTPClient: o.HTTPClient})
 	},
 	"mistral": func(o Options) provider.Provider {
 		return mistral.New(mistral.Options{APIKey: o.APIKey, BaseURL: o.BaseURL})
@@ -164,7 +169,51 @@ var providerFactories = map[string]providerFactory{
 		return deepinfra.New(deepinfra.Options{APIKey: o.APIKey, BaseURL: o.BaseURL})
 	},
 	"baseten": func(o Options) provider.Provider { return baseten.New(baseten.Options{APIKey: o.APIKey}) }, // baseten.Options has no BaseURL — model deployments embed the URL
-	"xai":     func(o Options) provider.Provider { return xai.New(xai.Options{APIKey: o.APIKey, BaseURL: o.BaseURL}) },
+	"xai": func(o Options) provider.Provider {
+		return xai.New(xai.Options{APIKey: o.APIKey, BaseURL: o.BaseURL, HTTPClient: o.HTTPClient})
+	},
+	"moonshotai": func(o Options) provider.Provider {
+		baseURL := o.BaseURL
+		if baseURL == "" {
+			baseURL = "https://api.moonshot.ai/v1"
+		}
+		return newOpenAICompatProvider("moonshotai", baseURL, o.APIKey, nil, openaicompat.Options{
+			HTTPClient:                o.HTTPClient,
+			SupportsStructuredOutputs: true,
+			MessageConverter: func(_ string, messages []message.Message) ([]any, error) {
+				converted, err := openaicompat.ConvertMessages(messages)
+				if err != nil {
+					return nil, err
+				}
+				index := 0
+				for _, msg := range messages {
+					if msg.Role != message.RoleAssistant {
+						continue
+					}
+					for index < len(converted) && converted[index].(map[string]any)["role"] != "assistant" {
+						index++
+					}
+					var reasoning strings.Builder
+					for _, part := range msg.Content.Parts {
+						if p, ok := part.(message.ReasoningPart); ok {
+							reasoning.WriteString(p.Text)
+						}
+					}
+					if reasoning.Len() > 0 {
+						converted[index].(map[string]any)["reasoning_content"] = reasoning.String()
+					}
+					index++
+				}
+				return converted, nil
+			},
+			ProviderToolConverter: func(t tool.Tool) (json.RawMessage, error) {
+				if t.ProviderID != "moonshotai.web_search" || t.Name != "$web_search" || len(t.Args) != 0 {
+					return nil, fmt.Errorf("moonshotai: unsupported builtin tool %q", t.ProviderID)
+				}
+				return json.RawMessage(`{"type":"builtin_function","function":{"name":"$web_search"}}`), nil
+			},
+		})
+	},
 	"huggingface": func(o Options) provider.Provider {
 		return huggingface.New(huggingface.Options{APIKey: o.APIKey, BaseURL: o.BaseURL})
 	},
