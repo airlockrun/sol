@@ -21,6 +21,7 @@ var searchBackends = map[string]string{
 	"moonshotai": "kimi",
 	"perplexity": "perplexity",
 	"brave":      "brave",
+	"deepseek":   "deepseek",
 }
 
 type reservedProvider struct {

@@ -57,12 +57,36 @@ func (e *GitSnapshotExecutor) Execute(ctx context.Context, request tool.Request)
 func (e *GitSnapshotExecutor) git(ctx context.Context, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = e.workspace
+	cmd.Env = snapshotGitEnv()
 	data, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("snapshot git %s: %w: %s", args[0], err, data)
 	}
 	return strings.TrimSpace(string(data)), nil
 }
+
+// snapshotGitEnv keeps transport and global configuration while removing Git's
+// repository-local environment. Hooks export these coordinates for their own
+// repository; independent workspace commands must resolve from their cwd.
+func snapshotGitEnv() []string {
+	var env []string
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		switch key {
+		case "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+			"GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE",
+			"GIT_GRAFT_FILE", "GIT_INDEX_FILE", "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE",
+			"GIT_PREFIX", "GIT_SHALLOW_FILE", "GIT_COMMON_DIR":
+			continue
+		}
+		if strings.HasPrefix(key, "GIT_CONFIG_KEY_") || strings.HasPrefix(key, "GIT_CONFIG_VALUE_") {
+			continue
+		}
+		env = append(env, entry)
+	}
+	return env
+}
+
 func (e *GitSnapshotExecutor) capture(ctx context.Context) (GitSnapshot, error) {
 	if _, err := e.git(ctx, "add", "-A"); err != nil {
 		return GitSnapshot{}, err

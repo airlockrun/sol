@@ -80,32 +80,37 @@ func (r *Response) Text() string {
 // Options configures a direct search client. Mirrors the LLM provider pattern:
 // single provider, single key, caller reads env.
 type Options struct {
-	Provider string // "brave", "perplexity", "grok", "gemini", "kimi" (required)
-	APIKey   string // provider's API key (required)
-	Model    string // for LLM-based providers; defaults per provider
+	Provider   string       // "brave", "perplexity", "deepseek" (required)
+	APIKey     string       // provider's API key (required)
+	BaseURL    string       // API root override (DeepSeek includes /v1); defaults to the provider API root
+	HTTPClient *http.Client // nil uses a client with the direct-search timeout
 }
 
 // DirectClient calls search provider APIs directly.
 type DirectClient struct {
 	provider string
 	apiKey   string
-	model    string
+	baseURL  string
 	http     *http.Client
 }
 
 // NewClient creates a direct search client from explicit options.
 func NewClient(opts Options) *DirectClient {
+	client := opts.HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: defaultTimeout}
+	}
 	return &DirectClient{
 		provider: opts.Provider,
 		apiKey:   opts.APIKey,
-		model:    opts.Model,
-		http:     &http.Client{Timeout: defaultTimeout},
+		baseURL:  strings.TrimRight(opts.BaseURL, "/"),
+		http:     client,
 	}
 }
 
 // Search implements Client.
 func (c *DirectClient) Search(ctx context.Context, req Request) (*Response, error) {
-	if req.Query == "" {
+	if strings.TrimSpace(req.Query) == "" {
 		return nil, errors.New("websearch: query is required")
 	}
 	if c.apiKey == "" {
@@ -126,15 +131,16 @@ func (c *DirectClient) Search(ctx context.Context, req Request) (*Response, erro
 		return c.searchBrave(ctx, req)
 	case "perplexity":
 		return c.searchPerplexity(ctx, req)
-	case "grok":
-		return c.searchGrok(ctx, req)
-	case "gemini":
-		return c.searchGemini(ctx, req)
-	case "kimi":
-		return c.searchKimi(ctx, req)
-	case "openai":
-		return c.searchOpenAI(ctx, req)
+	case "deepseek":
+		return c.searchDeepSeek(ctx, req)
 	default:
 		return nil, fmt.Errorf("websearch: unknown provider %q", c.provider)
 	}
+}
+
+func (c *DirectClient) endpoint(defaultURL, path string) string {
+	if c.baseURL != "" {
+		return c.baseURL + path
+	}
+	return defaultURL
 }

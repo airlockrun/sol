@@ -437,6 +437,9 @@ func (s *Session) Compact(ctx context.Context, model stream.Model, conversationM
 
 	for range result.FullStream {
 	}
+	if ctx.Err() != nil {
+		return "", fmt.Errorf("compaction stream error: %w", errors.Join(ctx.Err(), context.Cause(ctx)))
+	}
 	summary, err := result.Text()
 	if err != nil {
 		return "", fmt.Errorf("compaction stream error: %w", err)

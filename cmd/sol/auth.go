@@ -179,9 +179,9 @@ func runAuth(ctx context.Context, args []string, output io.Writer, client device
 		return errors.New(usage)
 	}
 }
-func resolveSearch(auth, providerID, apiKey string) (tool.Tool, bool) {
-	if auth != "codex" && apiKey != "" && provider.SearchBackend(providerID) != "" {
-		return tools.WebSearch(providerID, apiKey)
+func resolveSearch(auth, providerID string, opts provider.Options) (tool.Tool, bool) {
+	if auth != "codex" && opts.APIKey != "" && provider.SearchBackend(providerID) != "" {
+		return tools.WebSearch(providerID, opts)
 	}
 	return tool.Tool{}, false
 }

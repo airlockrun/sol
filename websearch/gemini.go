@@ -21,24 +21,14 @@ const defaultGeminiModel = "gemini-3.1-flash-lite"
 // provider with the google_search grounding tool. Citations arrive as
 // SourceEvents from the response's groundingMetadata.groundingChunks
 // (web variant), matching ai-sdk's extractSources behavior.
-func (c *DirectClient) searchGemini(ctx context.Context, req Request) (*Response, error) {
-	model := c.model
-	if model == "" {
-		model = pickSearchModel("google", []string{"flash-lite", "flash"})
-	}
-	if model == "" {
-		model = defaultGeminiModel
-	}
-
-	p := google.New(google.Options{APIKey: c.apiKey})
-
+func (c *modelClient) searchGemini(ctx context.Context, model stream.Model, req Request) (*Response, error) {
 	tools := tool.Set{}
 	gs := google.GoogleSearch()
 	gs.Name = "google_search"
 	tools.Add(gs)
 
 	result, err := goai.GenerateText(ctx, stream.Input{
-		Model: p.Model(model),
+		Model: model,
 		Tools: tools,
 		Messages: []message.Message{
 			message.NewUserMessage(req.Query),

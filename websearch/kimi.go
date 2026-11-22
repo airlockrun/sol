@@ -1,187 +1,74 @@
 package websearch
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
-	"net/http"
+
+	"github.com/airlockrun/goai"
+	"github.com/airlockrun/goai/message"
+	"github.com/airlockrun/goai/stream"
+	"github.com/airlockrun/goai/tool"
 )
 
-const (
-	defaultKimiBaseURL = "https://api.moonshot.ai/v1"
-	// defaultKimiModel is the offline last-resort; online, pickSearchModel
-	// resolves the current kimi-k2 model from the catalog ("moonshotai").
-	defaultKimiModel = "kimi-k2.6"
-	kimiMaxRounds    = 3
-)
+const defaultKimiModel = "kimi-k2.6"
+const kimiMaxRounds = 3
 
-type kimiRequest struct {
-	Model    string        `json:"model"`
-	Messages []kimiMessage `json:"messages"`
-	Tools    []kimiTool    `json:"tools"`
-}
-
-type kimiMessage struct {
-	Role       string         `json:"role"`
-	Content    string         `json:"content,omitempty"`
-	ToolCalls  []kimiToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string         `json:"tool_call_id,omitempty"`
-}
-
-type kimiTool struct {
-	Type     string       `json:"type"`
-	Function kimiFunction `json:"function"`
-}
-
-type kimiFunction struct {
-	Name string `json:"name"`
-}
-
-type kimiToolCall struct {
-	ID       string `json:"id"`
-	Type     string `json:"type"`
-	Function struct {
-		Name      string `json:"name"`
-		Arguments string `json:"arguments"`
-	} `json:"function"`
-}
-
-type kimiResponse struct {
-	Choices []struct {
-		FinishReason string `json:"finish_reason"`
-		Message      struct {
-			Role      string         `json:"role"`
-			Content   string         `json:"content"`
-			ToolCalls []kimiToolCall `json:"tool_calls"`
-		} `json:"message"`
-	} `json:"choices"`
-	SearchResults []struct {
-		Title   string `json:"title"`
-		URL     string `json:"url"`
-		Content string `json:"content"`
-	} `json:"search_results"`
-}
-
-func (c *DirectClient) searchKimi(ctx context.Context, req Request) (*Response, error) {
-	model := c.model
-	if model == "" {
-		// The catalog keys Moonshot under "moonshotai"; "k2" tracks the kimi-k2
-		// line (the -code variants are filtered out by searchExcludeTokens).
-		model = pickSearchModel("moonshotai", []string{"k2"})
-	}
-	if model == "" {
-		model = defaultKimiModel
-	}
-
-	endpoint := defaultKimiBaseURL + "/chat/completions"
-
-	messages := []kimiMessage{{Role: "user", Content: req.Query}}
-	tools := []kimiTool{{
-		Type:     "builtin_function",
-		Function: kimiFunction{Name: "$web_search"},
-	}}
-
+func (c *modelClient) searchKimi(ctx context.Context, model stream.Model, req Request) (*Response, error) {
+	messages := []message.Message{message.NewUserMessage(req.Query)}
+	tools := tool.Set{"$web_search": {Name: "$web_search", Type: "provider", ProviderID: "moonshotai.web_search"}}
 	seen := map[string]bool{}
 	var results []Result
-	var synthesis string
-
 	for round := 0; round < kimiMaxRounds; round++ {
-		body := kimiRequest{
-			Model:    model,
-			Messages: messages,
-			Tools:    tools,
-		}
-
-		payload, err := json.Marshal(body)
+		result, err := goai.GenerateText(ctx, stream.Input{Model: model, Messages: messages, Tools: tools})
 		if err != nil {
 			return nil, fmt.Errorf("websearch/kimi: %w", err)
 		}
-
-		httpReq, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(payload))
-		if err != nil {
-			return nil, fmt.Errorf("websearch/kimi: %w", err)
-		}
-		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
-
-		resp, err := c.http.Do(httpReq)
-		if err != nil {
-			return nil, fmt.Errorf("websearch/kimi: %w", err)
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-			return nil, fmt.Errorf("websearch/kimi: HTTP %d: %s", resp.StatusCode, respBody)
-		}
-
-		var data kimiResponse
-		if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-			return nil, fmt.Errorf("websearch/kimi: %w", err)
-		}
-
-		// Collect citations from search_results.
-		for _, sr := range data.SearchResults {
-			if sr.URL != "" && !seen[sr.URL] {
-				results = append(results, Result{
-					Title:   sr.Title,
-					URL:     sr.URL,
-					Snippet: sr.Content,
-				})
-				seen[sr.URL] = true
+		for _, source := range sourcesToResults(result.Sources) {
+			if !seen[source.URL] {
+				seen[source.URL] = true
+				results = append(results, source)
 			}
 		}
-
-		if len(data.Choices) == 0 {
-			break
+		if result.FinishReason != stream.FinishReasonToolCalls {
+			return &Response{Results: results, Synthesis: result.Text, Provider: "kimi"}, nil
 		}
-
-		choice := data.Choices[0]
-
-		// If finish_reason is not tool_calls, we have the final answer.
-		if choice.FinishReason != "tool_calls" {
-			synthesis = choice.Message.Content
-			break
+		parts := []message.Part{}
+		for _, reasoning := range result.Steps[len(result.Steps)-1].Reasoning() {
+			parts = append(parts, message.ReasoningPart{Text: reasoning.Text, ProviderOptions: reasoning.ProviderOptions})
 		}
-
-		// Continue the multi-round loop: add assistant message + tool results.
-		assistantMsg := kimiMessage{
-			Role:      "assistant",
-			ToolCalls: choice.Message.ToolCalls,
+		if result.Text != "" {
+			parts = append(parts, message.TextPart{Text: result.Text})
 		}
-		messages = append(messages, assistantMsg)
-
-		// Add tool result messages for each tool call.
-		for _, tc := range choice.Message.ToolCalls {
-			// Extract any search results from tool call arguments.
+		for _, tc := range result.ToolCalls {
+			if tc.Name != "$web_search" {
+				return nil, fmt.Errorf("websearch/kimi: unexpected builtin tool %q", tc.Name)
+			}
+			parts = append(parts, message.ToolCallPart{ID: tc.ID, Name: tc.Name, Input: tc.Input})
 			var args struct {
 				SearchResults []struct {
-					URL string `json:"url"`
+					Title   string `json:"title"`
+					URL     string `json:"url"`
+					Content string `json:"content"`
 				} `json:"search_results"`
 			}
-			_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
-			for _, sr := range args.SearchResults {
-				if sr.URL != "" && !seen[sr.URL] {
-					results = append(results, Result{URL: sr.URL})
-					seen[sr.URL] = true
+			if err := json.Unmarshal(tc.Input, &args); err != nil {
+				return nil, fmt.Errorf("websearch/kimi: invalid builtin result: %w", err)
+			}
+			for _, r := range args.SearchResults {
+				if r.URL != "" && !seen[r.URL] {
+					seen[r.URL] = true
+					results = append(results, Result{Title: r.Title, URL: r.URL, Snippet: r.Content})
 				}
 			}
-
-			// Acknowledge the tool call so the model continues.
-			toolMsg := kimiMessage{
-				Role:       "tool",
-				Content:    "ok",
-				ToolCallID: tc.ID,
-			}
-			messages = append(messages, toolMsg)
+		}
+		messages = append(messages, message.Message{Role: message.RoleAssistant, Content: message.Content{Parts: parts}})
+		for _, tc := range result.ToolCalls {
+			// Moonshot executes the builtin; its arguments are the result that the
+			// client echoes verbatim to allow the model to continue.
+			messages = append(messages, message.NewToolMessage(tc.ID, tc.Name, message.TextOutput{Value: string(tc.Input)}))
 		}
 	}
-
-	return &Response{
-		Results:   results,
-		Synthesis: synthesis,
-		Provider:  "kimi",
-	}, nil
+	return nil, errors.New("websearch/kimi: builtin search exceeded round limit")
 }

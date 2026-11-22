@@ -14,6 +14,7 @@ func TestSearchBackends(t *testing.T) {
 		"moonshotai": "kimi",
 		"perplexity": "perplexity",
 		"brave":      "brave",
+		"deepseek":   "deepseek",
 	}
 	for id, backend := range want {
 		if got := SearchBackend(id); got != backend {

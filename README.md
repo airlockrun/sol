@@ -34,7 +34,8 @@ timeout and the caller's deadline can impose shorter bounds. Model generation
 and earlier tools do not consume a tool's allowance. `Run`, `Continue`, and
 permission/question-resumed batches use this policy. Inject `ModelTimeout`,
 `ModelIdleTimeout`, and `ToolTimeout` in `RunnerOptions` to choose other bounds.
-Compaction uses its own `MaintenanceTimeout` (60 seconds by default), and durable
+Compaction generation uses the same model wall and inactivity deadlines. Its
+checkpoint persistence uses `MaintenanceTimeout` (60 seconds by default). Durable
 appends use `SettlementTimeout` (15 seconds by default), including after cancellation.
 Negative durations panic; zero selects the documented default.
 
@@ -52,6 +53,25 @@ is not evidence of completion. Cancellation does not undo effects. Missing
 dispatched results are recorded as unknown; undispatched calls are identified
 separately. Inspect state before retrying unknown effects; never automatically
 replay them. Long operations should return durable task handles promptly.
+
+### Web search
+
+Model-backed search (`openai`, `gemini`, `grok`, `kimi`) accepts a normally
+constructed `stream.Model` through `websearch.NewModelClient(backend, model)`.
+`websearch.DefaultModel(backend)` selects the search model; authentication,
+endpoint overrides and HTTP transport belong to the caller's normal provider
+construction. Search uses the same per-attempt wall/inactivity deadlines and
+cooperative producer joining as runner and compaction generation. Kimi uses its
+native `builtin_function` search declaration and echoes builtin results through
+the bounded continuation loop.
+
+`websearch.NewClient(websearch.Options{Provider: backend, APIKey: key})` calls
+Brave, Perplexity or DeepSeek directly. Options also accepts `BaseURL` and
+`HTTPClient`; a DeepSeek base URL includes `/v1`. DeepSeek uses
+`POST /v1/tools/search`, accepts queries of 1–128 Unicode characters, and returns
+raw results without synthesis. Sol requests at most ten results. See the
+[DeepSeek search documentation](https://api-docs.deepseek.com/guides/search/)
+for direct API billing; these calls do not generate LLM token usage.
 
 ## CLI
 

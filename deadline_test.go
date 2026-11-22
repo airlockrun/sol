@@ -119,7 +119,7 @@ func TestPermissionBatchDeadlineSettlesUnknownAndUndispatched(t *testing.T) {
 	}
 }
 
-func TestModelAndMaintenanceDeadlines(t *testing.T) {
+func TestModelDeadlines(t *testing.T) {
 	for _, operation := range []string{"model", "compaction"} {
 		t.Run(operation, func(t *testing.T) {
 			model := newMockModel(t, testutil.MockConfig{ID: "blocked-model", Stream: func(ctx context.Context, _ *stream.CallOptions) (<-chan stream.Event, error) {
@@ -137,9 +137,147 @@ func TestModelAndMaintenanceDeadlines(t *testing.T) {
 			if !errors.Is(err, context.DeadlineExceeded) {
 				t.Fatalf("error = %v", err)
 			}
-			if operation == "model" && !errors.Is(err, ErrStepDeadline) {
+			if !errors.Is(err, ErrStepDeadline) {
 				t.Fatalf("missing foreground deadline identity: %v", err)
 			}
 		})
+	}
+}
+
+func TestCompactionModelBudgets(t *testing.T) {
+	for _, name := range []string{"progress", "wall", "idle", "caller"} {
+		t.Run(name, func(t *testing.T) {
+			model := newMockModel(t, testutil.MockConfig{ID: "summary", Stream: func(ctx context.Context, _ *stream.CallOptions) (<-chan stream.Event, error) {
+				ch := make(chan stream.Event)
+				go func() {
+					defer close(ch)
+					ticker := time.NewTicker(10 * time.Millisecond)
+					defer ticker.Stop()
+					for i := 0; i < 10; i++ {
+						select {
+						case <-ctx.Done():
+							return
+						case <-ticker.C:
+						}
+						if name == "idle" {
+							continue
+						}
+						select {
+						case ch <- stream.Event{Data: stream.TextDeltaEvent{Text: "summary "}}:
+						case <-ctx.Done():
+							return
+						}
+					}
+					select {
+					case ch <- stream.Event{Data: stream.FinishEvent{FinishReason: stream.FinishReasonStop}}:
+					case <-ctx.Done():
+					}
+				}()
+				return ch, nil
+			}})
+			store := &testStore{messages: []session.Message{{Role: "user", Content: "older"}, {Role: "user", Content: "latest"}}}
+			wall, idle := time.Second, time.Second
+			if name == "wall" {
+				wall = 40 * time.Millisecond
+			}
+			if name == "idle" {
+				idle = 40 * time.Millisecond
+			}
+			ctx := t.Context()
+			if name == "caller" {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, 40*time.Millisecond)
+				defer cancel()
+			}
+			r := NewRunner(RunnerOptions{Agent: testAgent(nil), Model: model, SessionStore: store, ModelTimeout: wall, ModelIdleTimeout: idle, MaintenanceTimeout: time.Millisecond, Quiet: true})
+			_, err := r.Compact(ctx)
+			if name == "progress" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !store.messages[0].Summary {
+					t.Fatal("summary not persisted")
+				}
+				return
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("error = %v", err)
+			}
+			if name != "caller" && !errors.Is(err, ErrStepDeadline) {
+				t.Fatalf("missing model deadline identity: %v", err)
+			}
+			if len(store.messages) != 2 || store.messages[0].Content != "older" {
+				t.Fatal("failed compaction changed history")
+			}
+		})
+	}
+}
+
+type deadlineCompactionStore struct {
+	testStore
+}
+
+func (s *deadlineCompactionStore) Compact(ctx context.Context, _ []session.Message, _ int) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestCompactionCheckpointDeadline(t *testing.T) {
+	store := &deadlineCompactionStore{testStore: testStore{messages: []session.Message{{Role: "user", Content: "older"}, {Role: "user", Content: "latest"}}}}
+	model := newMockModel(t, testutil.MockConfig{ID: "summary", Default: &testutil.MockResponse{Text: "summary"}})
+	r := NewRunner(RunnerOptions{Agent: testAgent(nil), Model: model, SessionStore: store, MaintenanceTimeout: 10 * time.Millisecond, Quiet: true})
+	if _, err := r.Compact(t.Context()); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("checkpoint error = %v", err)
+	}
+	if r.canContinue {
+		t.Fatal("runner may continue after checkpoint failure")
+	}
+	if store.messages[0].Content != "older" {
+		t.Fatal("failed checkpoint replaced durable history")
+	}
+}
+
+func TestCompactionCancellationJoinsProducer(t *testing.T) {
+	entered, release, stopped := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	model := deadlineTestModel(func(ctx context.Context, _ *stream.CallOptions) (<-chan stream.Event, error) {
+		ch := make(chan stream.Event)
+		go func() {
+			defer close(ch)
+			defer close(stopped)
+			close(entered)
+			<-ctx.Done()
+			<-release
+		}()
+		return ch, nil
+	})
+	store := &testStore{messages: []session.Message{{Role: "user", Content: "older"}, {Role: "user", Content: "latest"}}}
+	r := NewRunner(RunnerOptions{Agent: testAgent(nil), Model: model, SessionStore: store, Quiet: true})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, err := r.Compact(ctx); done <- err }()
+	<-entered
+	cancel()
+	select {
+	case err := <-done:
+		t.Fatalf("released ownership before producer settled: %v", err)
+	default:
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("compaction did not settle")
+	}
+	select {
+	case <-stopped:
+	default:
+		t.Fatal("producer still running")
+	}
+	if store.messages[0].Content != "older" {
+		t.Fatal("cancelled compaction changed history")
 	}
 }

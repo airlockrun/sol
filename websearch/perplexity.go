@@ -57,7 +57,7 @@ func (c *DirectClient) searchPerplexity(ctx context.Context, req Request) (*Resp
 		return nil, fmt.Errorf("websearch/perplexity: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", perplexityEndpoint, bytes.NewReader(payload))
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.endpoint(perplexityEndpoint, "/search"), bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("websearch/perplexity: %w", err)
 	}

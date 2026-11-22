@@ -12,6 +12,7 @@ import (
 	"github.com/airlockrun/goai/testutil"
 	"github.com/airlockrun/goai/tool"
 	"github.com/airlockrun/sol/bus"
+	"github.com/airlockrun/sol/internal/generation"
 	"github.com/airlockrun/sol/session"
 )
 
@@ -323,7 +324,7 @@ func TestModelBackpressureDoesNotCountAsProviderSilence(t *testing.T) {
 	}})
 	ctx, stop := context.WithCancelCause(t.Context())
 	defer stop(nil)
-	m := deadlineModel{Model: model, wall: time.Second, idle: 40 * time.Millisecond, stopStep: stop}
+	m := deadlineModel{Model: model, Wall: time.Second, Idle: 40 * time.Millisecond, StopStep: stop}
 	events, err := m.Stream(ctx, &stream.CallOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -358,7 +359,7 @@ func TestModelProducerJoinDoesNotRequireDownstreamConsumption(t *testing.T) {
 		})
 		ctx, cancel := context.WithCancelCause(t.Context())
 		defer cancel(nil)
-		bounded := &deadlineModel{Model: model, wall: time.Minute, idle: time.Minute, stopStep: cancel}
+		bounded := &deadlineModel{Model: model, Wall: time.Minute, Idle: time.Minute, StopStep: cancel}
 		output, err := bounded.Stream(ctx, &stream.CallOptions{})
 		if err != nil {
 			t.Fatal(err)
@@ -367,7 +368,7 @@ func TestModelProducerJoinDoesNotRequireDownstreamConsumption(t *testing.T) {
 		cancel(nil)
 		<-cancelled
 		joined := make(chan struct{})
-		go func() { bounded.producers.Wait(); close(joined) }()
+		go func() { bounded.Producers.Wait(); close(joined) }()
 		synctest.Wait()
 		select {
 		case <-joined:
@@ -389,7 +390,7 @@ func TestModelProducerJoinDoesNotRequireDownstreamConsumption(t *testing.T) {
 }
 
 func TestModelProgressIgnoresFraming(t *testing.T) {
-	if modelProgress(stream.Event{Data: stream.StartEvent{}}) || modelProgress(stream.Event{Data: stream.TextDeltaEvent{}}) || modelProgress(stream.Event{Data: stream.RawChunkEvent{}}) || modelProgress(stream.Event{Data: stream.ReasoningEndEvent{}}) {
+	if generation.Progress(stream.Event{Data: stream.StartEvent{}}) || generation.Progress(stream.Event{Data: stream.TextDeltaEvent{}}) || generation.Progress(stream.Event{Data: stream.RawChunkEvent{}}) || generation.Progress(stream.Event{Data: stream.ReasoningEndEvent{}}) {
 		t.Fatal("empty framing is not meaningful model progress")
 	}
 }

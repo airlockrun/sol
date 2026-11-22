@@ -47,7 +47,7 @@ func (c *DirectClient) searchBrave(ctx context.Context, req Request) (*Response,
 		}
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "GET", braveEndpoint+"?"+params.Encode(), nil)
+	httpReq, err := http.NewRequestWithContext(ctx, "GET", c.endpoint(braveEndpoint, "/res/v1/web/search")+"?"+params.Encode(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("websearch/brave: %w", err)
 	}

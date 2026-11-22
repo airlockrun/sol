@@ -2,6 +2,7 @@ package websearch
 
 import (
 	"context"
+	"github.com/airlockrun/sol/provider"
 	"os"
 	"testing"
 )
@@ -62,7 +63,7 @@ func TestIntegrationGrok(t *testing.T) {
 		t.Skip("XAI_API_KEY not set")
 	}
 
-	client := NewClient(Options{Provider: "grok", APIKey: key})
+	client := NewModelClient("grok", provider.CreateModel("xai", DefaultModel("grok"), provider.Options{APIKey: key}))
 	resp, err := client.Search(context.Background(), Request{Query: "Go programming language"})
 	if err != nil {
 		t.Fatalf("search failed: %v", err)
@@ -85,7 +86,7 @@ func TestIntegrationGemini(t *testing.T) {
 		t.Skip("GEMINI_API_KEY not set")
 	}
 
-	client := NewClient(Options{Provider: "gemini", APIKey: key})
+	client := NewModelClient("gemini", provider.CreateModel("google", DefaultModel("gemini"), provider.Options{APIKey: key}))
 	resp, err := client.Search(context.Background(), Request{Query: "Go programming language"})
 	if err != nil {
 		t.Fatalf("search failed: %v", err)
@@ -111,7 +112,7 @@ func TestIntegrationKimi(t *testing.T) {
 		t.Skip("KIMI_API_KEY/MOONSHOT_API_KEY not set")
 	}
 
-	client := NewClient(Options{Provider: "kimi", APIKey: key})
+	client := NewModelClient("kimi", provider.CreateModel("moonshotai", DefaultModel("kimi"), provider.Options{APIKey: key}))
 	resp, err := client.Search(context.Background(), Request{Query: "Go programming language"})
 	if err != nil {
 		t.Fatalf("search failed: %v", err)
